@@ -1,0 +1,7 @@
+name: telegram-rich-buttons
+version: 0.1.0
+description: "Telegram Bot API 10.1 rich messages with link, copy and choice buttons; choice presses return to the originating Hermes conversation. No Hermes source changes."
+author: "Alan Chen"
+kind: standalone
+provides_tools:
+  - telegram_rich_send
