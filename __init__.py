@@ -434,7 +434,7 @@ def _draft_loop(rec: dict[str, Any]) -> None:
            and getattr(sys, "_hte_draft_generation", None) is _GENERATION):
         payload = {"chat_id": int(rec["chat_id"]), "draft_id": rec["draft_id"],
                    "can_stop": bool(_setting("stop_button_can_stop", True)),
-                   "rich_message": {"markdown": DRAFT_TEXT}}
+                   "rich_message": {"html": _render_draft(rec)}}
         if rec.get("thread_id"):
             payload["message_thread_id"] = int(rec["thread_id"])
         with rec["draft_lock"]:  # _stop_end waits on this so no draft lands after the final reply
@@ -445,7 +445,114 @@ def _draft_loop(rec: dict[str, Any]) -> None:
             logger.info("telegram-enhanced: draft refresh failed: %s", res.get("description"))
             if "draft" in str(res.get("description") or "").lower():
                 break
-        rec["cancel"].wait(DRAFT_REFRESH_SECONDS)
+        # Sleep until the periodic refresh or a tool event, but at most ~1 update/s.
+        wake: threading.Event = rec.setdefault("wake", threading.Event())
+        wake.wait(DRAFT_REFRESH_SECONDS)
+        wake.clear()
+        if rec["cancel"].wait(0.8):
+            break
+
+
+_TOOL_LABELS: list[tuple[tuple[str, ...], str, str]] = [
+    (("terminal", "process"), "💻", "运行命令"),
+    (("read_file",), "📖", "读取文件"),
+    (("write_file", "patch"), "✏️", "修改文件"),
+    (("search_files",), "🗂️", "查找文件"),
+    (("web_search", "_search"), "🔎", "搜索"),
+    (("web_extract", "fetch", "scrape", "_contents", "crawl"), "🌐", "读取网页"),
+    (("browser",), "🧭", "操作浏览器"),
+    (("execute_code",), "🐍", "运行代码"),
+    (("delegate_task",), "🤖", "派给子代理"),
+    (("telegram_",), "💬", "发 Telegram 消息"),
+    (("skill",), "📚", "查看技能"),
+    (("memory", "honcho"), "🧠", "查记忆"),
+    (("vision", "image"), "🖼️", "看图片"),
+    (("clarify",), "❓", "等你选择"),
+]
+
+
+def _tool_label(tool_name: str, args: Any) -> str:
+    name = tool_name or "tool"
+    if name == "tool_call" and isinstance(args, dict):  # deferred tools: show the inner one
+        calls = args.get("calls") or []
+        if calls and isinstance(calls[0], dict):
+            inner = str(calls[0].get("name") or name)
+            return _tool_label(inner, calls[0].get("arguments") or {}) + (f" 等 {len(calls)} 个" if len(calls) > 1 else "")
+    icon, verb = "⚙️", name.split("__")[-1]
+    for keys, ic, vb in _TOOL_LABELS:
+        if any(k in name for k in keys):
+            icon, verb = ic, vb
+            break
+    detail = ""
+    try:
+        from agent.display import build_tool_preview
+        detail = build_tool_preview(name, args if isinstance(args, dict) else {}, 48) or ""
+    except Exception:
+        pass
+    detail = " ".join(str(detail).split())
+    if len(detail) > 48:
+        detail = detail[:47] + "…"
+    return f"{icon} {verb}" + (f"：{detail}" if detail else "")
+
+
+def _render_draft(rec: dict[str, Any]) -> str:
+    import html as _html
+    lines = ["小助手处理中…"]
+    if _setting("show_tool_progress", True):
+        steps = list(rec.get("steps") or [])
+        hidden = max(0, len(steps) - int(_setting("tool_progress_lines", 5)))
+        if hidden:
+            lines.append(f"…（前面还有 {hidden} 步）")
+        now = time.time()
+        for st in steps[hidden:]:
+            if st["status"] == "running":
+                lines.append(f"⏳ {st['label']} · {now - st['t0']:.0f}s")
+            else:
+                mark = "✅" if st["status"] == "ok" else "⚠️"
+                lines.append(f"{mark} {st['label']} · {st['dur']:.1f}s")
+    return "<tg-thinking>" + "\n".join(_html.escape(x, quote=False) for x in lines) + "</tg-thinking>"
+
+
+def _rec_for_tool(turn_id: Any, session_id: str) -> dict[str, Any] | None:
+    with _state["turns_lock"]:
+        if turn_id and str(turn_id) in _state["stops"]:
+            return _state["stops"][str(turn_id)]
+        return next((r for r in _state["stops"].values() if session_id and r["session_id"] == session_id), None)
+
+
+def _on_pre_tool_call(tool_name: str = "", args: Any = None, session_id: str = "", turn_id: Any = "",
+                      tool_call_id: str = "", **_kw: Any) -> None:
+    try:
+        rec = _rec_for_tool(turn_id, session_id)
+        if rec is None or not rec.get("draft"):
+            return None
+        step = {"id": tool_call_id or f"{tool_name}:{time.time()}", "label": _tool_label(tool_name, args),
+                "status": "running", "t0": time.time(), "dur": 0.0}
+        with _state["turns_lock"]:
+            rec.setdefault("steps", []).append(step)
+            del rec["steps"][:-30]
+        rec.setdefault("wake", threading.Event()).set()
+    except Exception:
+        logger.debug("telegram-enhanced: pre_tool_call progress failed", exc_info=True)
+    return None
+
+
+def _on_post_tool_call(tool_name: str = "", session_id: str = "", turn_id: Any = "", tool_call_id: str = "",
+                       status: str = "", duration_ms: int = 0, **_kw: Any) -> None:
+    try:
+        rec = _rec_for_tool(turn_id, session_id)
+        if rec is None or not rec.get("steps"):
+            return
+        with _state["turns_lock"]:
+            step = next((st for st in reversed(rec["steps"]) if st["status"] == "running"
+                         and (st["id"] == tool_call_id or not tool_call_id)), None)
+            if step is None:
+                return
+            step["status"] = "ok" if str(status or "ok").lower() in ("ok", "success", "") else "error"
+            step["dur"] = (duration_ms / 1000.0) if duration_ms else time.time() - step["t0"]
+        rec.setdefault("wake", threading.Event()).set()
+    except Exception:
+        logger.debug("telegram-enhanced: post_tool_call progress failed", exc_info=True)
 
 
 def _stop_fire(rec: dict[str, Any], confirm: bool = False) -> None:
@@ -495,6 +602,8 @@ def _stop_end(rec: dict[str, Any], why: str = "") -> None:
     with _state["turns_lock"]:
         rec["ended"] = True
         rec["cancel"].set()
+        if rec.get("wake") is not None:
+            rec["wake"].set()
         mid = rec.get("message_id_sent")
         _state["stops"].pop(rec["key"], None)
     # Let an in-flight draft request finish before the final reply goes out, else it reappears after it.
@@ -526,7 +635,8 @@ def _stop_begin(session_id: str, turn_id: str, parent_session_id: str) -> None:
            "user_name": _session("HERMES_SESSION_USER_NAME"),
            "message_id": _session("HERMES_SESSION_MESSAGE_ID"),
            "token": secrets.token_hex(6), "cancel": threading.Event(), "ended": False,
-           "draft": draft, "draft_id": _draft_id(key), "draft_lock": threading.Lock()}
+           "draft": draft, "draft_id": _draft_id(key), "draft_lock": threading.Lock(),
+           "wake": threading.Event(), "steps": []}
     with _state["turns_lock"]:
         _state["stops"][key] = rec
     logger.info("telegram-enhanced: indicator begin key=%s session=%s draft=%s state=%x",
@@ -1049,6 +1159,8 @@ def register(ctx: Any) -> None:
 
     ctx.register_hook("pre_llm_call", _on_pre_llm_call)
     ctx.register_hook("post_llm_call", _on_post_llm_call)
+    ctx.register_hook("pre_tool_call", _on_pre_tool_call)
+    ctx.register_hook("post_tool_call", _on_post_tool_call)
     ctx.register_hook("on_session_end", _on_session_end)
     ctx.register_hook("agent_loop_stopped", _on_loop_stopped)
     ctx.register_hook("transform_llm_output", _on_transform_output)
@@ -1076,6 +1188,8 @@ def register(ctx: Any) -> None:
             recs = list(_state["stops"].values())
         for rec in recs:
             rec["cancel"].set()
+            if rec.get("wake") is not None:
+                rec["wake"].set()
             mid = rec.get("message_id_sent")
             if mid:  # don't leave this generation's confirm/💬 message behind
                 try:
