@@ -912,7 +912,7 @@ def _confirm_after_grace(rec: dict[str, Any], epoch: int) -> None:
 
 def _resume_after_prompt(rec: dict[str, Any], epoch: int) -> None:
     """The prompt is up but the user neither pressed it nor steered: bring the bubble back after a short
-    pause (the prompt stays until the turn ends or the user steers)."""
+    pause and remove the prompt."""
     delay = float(_setting("stop_prompt_resume_seconds", 5.0))
     with rec["cv"]:
         rec["cv"].wait_for(lambda: not _alive(rec) or rec["stop_epoch"] != epoch or rec["draft_on"], delay)
@@ -920,8 +920,11 @@ def _resume_after_prompt(rec: dict[str, Any], epoch: int) -> None:
             return
         rec["draft_on"] = True
         rec["draft_id"] = _draft_id(rec["key"])
+        mid = rec.pop("confirm_mid", None)
         rec["cv"].notify_all()
-    logger.info("telegram-enhanced: no action on the stop prompt -> resume draft")
+    logger.info("telegram-enhanced: no action on the stop prompt -> resume draft, delete prompt %s", mid)
+    if mid:
+        _stop_delete(rec["chat_id"], mid)
 
 
 def _on_user_message(chat_id: str, thread_id: str) -> None:
