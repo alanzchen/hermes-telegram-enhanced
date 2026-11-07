@@ -1279,9 +1279,11 @@ _LEGACY_LIST_PATCH_MARK = "_hte_native_lists"
 # Wrappers resolve helpers at call time, so a plugin reload updates the behaviour of an already-patched
 # live adapter class instead of leaving the first generation's code bound in.
 def _list_needs_rich(content: Any) -> bool:
-    # Telegram clients play a type-in animation for every rich message, so plain lists stay on
-    # MarkdownV2 (with bullet glyphs). Tables, task lists and <details> still go rich via core.
-    return bool(_setting("rich_lists", False)) and has_markdown_list(content)
+    # Every non-empty reply goes rich (Alan's choice, accepting the client's type-in animation).
+    # ``rich_replies: false`` limits rich to lists (``rich_lists``) plus core's tables/tasks/details.
+    if _setting("rich_replies", True):
+        return bool(isinstance(content, str) and content.strip())
+    return bool(_setting("rich_lists", True)) and has_markdown_list(content)
 
 
 sys._hte_list_helpers = (_list_needs_rich, bulletize_plain)
