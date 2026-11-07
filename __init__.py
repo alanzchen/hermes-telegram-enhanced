@@ -490,6 +490,9 @@ def _tool_label(tool_name: str, args: Any) -> str:
         if any(k in name for k in keys):
             icon, verb = ic, vb
             break
+    code = _command_text(name, args)
+    if code:  # commands keep their own line breaks; long lines wrap instead of being cut
+        return f"{icon} {verb}\n" + "\n".join(_wrap_command(code))
     detail = ""
     try:
         from agent.display import build_tool_preview
@@ -500,6 +503,39 @@ def _tool_label(tool_name: str, args: Any) -> str:
     if len(detail) > 48:
         detail = detail[:47] + "…"
     return f"{icon} {verb}" + (f"：{detail}" if detail else "")
+
+
+_CMD_WIDTH = 48
+_CMD_MAX_LINES = 4
+
+
+def _command_text(name: str, args: Any) -> str:
+    if not isinstance(args, dict):
+        return ""
+    if "terminal" in name:
+        return str(args.get("command") or "")
+    if "execute_code" in name or name == "browser_exec" or name.endswith("__browser_exec"):
+        return str(args.get("code") or "")
+    return ""
+
+
+def _wrap_command(code: str) -> list[str]:
+    """Split a command into display lines: keep its newlines, wrap long lines, cap the count."""
+    out: list[str] = []
+    src = [ln.rstrip() for ln in code.strip().splitlines() if ln.strip()]
+    for ln in src:
+        ln = ln.replace("\t", "    ")
+        while ln:
+            out.append(ln[:_CMD_WIDTH])
+            ln = ln[_CMD_WIDTH:]
+            if len(out) > _CMD_MAX_LINES:
+                break
+        if len(out) > _CMD_MAX_LINES:
+            break
+    if len(out) > _CMD_MAX_LINES:
+        out = out[:_CMD_MAX_LINES]
+        out[-1] = out[-1][: _CMD_WIDTH - 1] + "…"
+    return out
 
 
 def _render_draft(rec: dict[str, Any]) -> str:
@@ -513,11 +549,13 @@ def _render_draft(rec: dict[str, Any]) -> str:
             lines.append(f"…（前面还有 {hidden} 步）")
         now = time.time()
         for st in steps[hidden:]:
+            head, *body = str(st["label"]).split("\n")
             if st["status"] == "running":
-                lines.append(f"⏳ {st['label']} · {now - st['t0']:.0f}s")
+                lines.append(f"⏳ {head} · {now - st['t0']:.0f}s")
             else:
                 mark = "✅" if st["status"] == "ok" else "⚠️"
-                lines.append(f"{mark} {st['label']} · {st['dur']:.1f}s")
+                lines.append(f"{mark} {head} · {st['dur']:.1f}s")
+            lines.extend("      " + b for b in body)
     return "<tg-thinking>" + "\n".join(_html.escape(x, quote=False) for x in lines) + "</tg-thinking>"
 
 
@@ -608,17 +646,18 @@ def _draft_worker(rec: dict[str, Any]) -> None:
             rec["inflight"] = False
             rec["cv"].notify_all()
             late = rec["ended"] and rec.get("end_released") and res.get("ok")
+            if not late:
+                if not res.get("ok"):
+                    logger.info("telegram-enhanced: draft refresh failed: %s", res.get("description"))
+                # Wait for the periodic refresh or a state change (tool event, stop, steer, end) ...
+                if _alive(rec):
+                    rec["cv"].wait(DRAFT_REFRESH_SECONDS)
+                # ... but send at most ~1 update/s.
+                while _alive(rec) and time.time() - last_sent < 0.8:
+                    rec["cv"].wait(0.8 - (time.time() - last_sent))
         if late:
             _clear_late_draft(rec)
             return
-            if not res.get("ok"):
-                logger.info("telegram-enhanced: draft refresh failed: %s", res.get("description"))
-            # Wait for the periodic refresh or a state change (tool event, stop, steer, end) ...
-            if _alive(rec):
-                rec["cv"].wait(DRAFT_REFRESH_SECONDS)
-            # ... but send at most ~1 update/s.
-            while _alive(rec) and time.time() - last_sent < 0.8:
-                rec["cv"].wait(0.8 - (time.time() - last_sent))
 
 
 def _clear_late_draft(rec: dict[str, Any]) -> None:
@@ -868,6 +907,21 @@ def _confirm_after_grace(rec: dict[str, Any], epoch: int) -> None:
             return
     logger.info("telegram-enhanced: native stop for chat %s thread %s -> confirm prompt", rec["chat_id"], rec["thread_id"])
     _send_stop_message(rec, confirm=True)
+    _resume_after_prompt(rec, epoch)
+
+
+def _resume_after_prompt(rec: dict[str, Any], epoch: int) -> None:
+    """The prompt is up but the user neither pressed it nor steered: bring the bubble back after a short
+    pause (the prompt stays until the turn ends or the user steers)."""
+    delay = float(_setting("stop_prompt_resume_seconds", 5.0))
+    with rec["cv"]:
+        rec["cv"].wait_for(lambda: not _alive(rec) or rec["stop_epoch"] != epoch or rec["draft_on"], delay)
+        if not _alive(rec) or rec["stop_epoch"] != epoch or rec["draft_on"]:
+            return
+        rec["draft_on"] = True
+        rec["draft_id"] = _draft_id(rec["key"])
+        rec["cv"].notify_all()
+    logger.info("telegram-enhanced: no action on the stop prompt -> resume draft")
 
 
 def _on_user_message(chat_id: str, thread_id: str) -> None:
@@ -879,7 +933,12 @@ def _on_user_message(chat_id: str, thread_id: str) -> None:
     for r in recs:
         with r["cv"]:
             r["user_msg_ts"] = time.time()
-            if r["ended"] or not r["draft"] or r["draft_on"]:
+            if r["ended"] or not r["draft"]:
+                continue
+            if r["draft_on"]:
+                mid = r.pop("confirm_mid", None)
+                if mid:
+                    drop.append((r, mid))
                 continue
             r["steer_used_ts"] = r["user_msg_ts"]
             r["draft_on"] = True
