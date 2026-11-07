@@ -411,7 +411,7 @@ def _on_pre_llm_call(session_id: str = "", platform: str = "", **_kw: Any) -> No
     except Exception:
         logger.debug("telegram-enhanced: list patch failed", exc_info=True)
     try:
-        if not _setting("stop_button", True) or (platform or "").lower() != "telegram" or not session_id:
+        if not _setting("stop_button", False) or (platform or "").lower() != "telegram" or not session_id:
             return None
         chat_id = _session("HERMES_SESSION_CHAT_ID")
         thread_id = _session("HERMES_SESSION_THREAD_ID")
