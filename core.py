@@ -1,5 +1,6 @@
-"""Pure helpers for telegram-rich-buttons: button rendering, callback data, and pending-choice state.
+"""Pure helpers for Hermes Telegram Enhanced.
 
+Button rendering, callback data, time placeholders, map/gallery blocks and small JSON stores.
 Nothing here imports Hermes or python-telegram-bot, so it is unit-testable on its own.
 """
 from __future__ import annotations
@@ -12,8 +13,10 @@ import re
 import secrets
 import time
 from contextlib import contextmanager
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterator
+from zoneinfo import ZoneInfo
 
 CALLBACK_PREFIX = "rb:"
 CALLBACK_RE = re.compile(r"^rb:([0-9a-f]{10}):(\d{1,3})$")
@@ -26,11 +29,17 @@ MAX_LABEL = 64
 MAX_COPY_TEXT = 256
 PENDING_TTL_SECONDS = 7 * 24 * 3600
 MAX_PENDING = 500
+DEFAULT_TZ = "America/Chicago"
+TIME_FORMAT_RE = re.compile(r"^(r|w?[dD]?[tT]?)$")
+TIME_PLACEHOLDER_RE = re.compile(r"\{\{time:([^{}|]+?)(?:\|([^{}|]*))?(?:\|([^{}|]*))?\}\}")
+WEEKDAYS_ZH = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
 
 
 class ButtonSpecError(ValueError):
-    """Invalid button specification supplied by the model."""
+    """Invalid specification supplied by the model."""
 
+
+# ---------------------------------------------------------------- buttons
 
 def new_request_id() -> str:
     return secrets.token_hex(5)
@@ -48,12 +57,12 @@ def parse_callback_data(data: str) -> tuple[str, int] | None:
     return (m.group(1), int(m.group(2))) if m else None
 
 
-def _attr(value: str) -> str:
+def _attr(value: Any) -> str:
     return html.escape(str(value), quote=True)
 
 
 def normalize_buttons(rows: Any) -> list[list[dict[str, Any]]]:
-    """Validate the tool's ``buttons`` argument into rows of normalized button dicts.
+    """Validate the ``buttons`` argument into rows of normalized button dicts.
 
     Accepts a list of rows (each a list of buttons) or a flat list of buttons (one row).
     """
@@ -141,14 +150,6 @@ def render_rows(rows: list[list[dict[str, Any]]], request_id: str | None, *,
     return "\n".join(parts)
 
 
-def compose_markdown(body: str, rows: list[list[dict[str, Any]]], request_id: str | None, *,
-                     include_choices: bool = True, footer: str = "", align: str | None = None) -> str:
-    body = (body or "").rstrip()
-    buttons = render_rows(rows, request_id, include_choices=include_choices, align=align)
-    chunks = [c for c in (body, footer.strip(), buttons) if c]
-    return "\n\n".join(chunks)
-
-
 def choice_injection_text(entry: dict[str, Any], choice: dict[str, str], who: str) -> str:
     """Neutral, data-only description of a button press for the conversation."""
     lines = [f"[Telegram 按钮] {who} 点击了「{choice['label']}」。"]
@@ -160,12 +161,111 @@ def choice_injection_text(entry: dict[str, Any], choice: dict[str, str], who: st
     return "\n".join(lines)
 
 
-class PendingStore:
-    """Small JSON store of outstanding choice prompts, guarded by an flock for cross-process safety."""
+# ---------------------------------------------------------------- time entities
 
-    def __init__(self, root: Path):
+def parse_when(value: str, tz_name: str | None) -> datetime:
+    """Parse an ISO-8601 date-time (or unix seconds); naive values use ``tz_name``."""
+    raw = (value or "").strip()
+    tz = ZoneInfo(tz_name or DEFAULT_TZ)
+    if re.fullmatch(r"\d{9,11}", raw):
+        return datetime.fromtimestamp(int(raw), tz)
+    try:
+        dt = datetime.fromisoformat(raw)
+    except ValueError as exc:
+        raise ButtonSpecError(f"bad time {raw!r}: use ISO like 2026-11-07T09:30") from exc
+    return dt.replace(tzinfo=tz) if dt.tzinfo is None else dt
+
+
+def time_fallback(dt: datetime, display_tz: str) -> str:
+    local = dt.astimezone(ZoneInfo(display_tz))
+    return f"{local.month}/{local.day} {WEEKDAYS_ZH[local.weekday()]} {local:%H:%M} {local.tzname()}"
+
+
+def time_entity(value: str, tz_name: str | None = None, fmt: str | None = None,
+                display_tz: str = DEFAULT_TZ) -> str:
+    """Rich-markdown date-time entity: rendered in the reader's own timezone and locale."""
+    fmt = (fmt or "wDT").strip()
+    if not TIME_FORMAT_RE.match(fmt):
+        raise ButtonSpecError("time format must match r|w?[dD]?[tT]?")
+    dt = parse_when(value, (tz_name or "").strip() or None)
+    fallback = time_fallback(dt, display_tz).replace("]", ")").replace("[", "(")
+    return f"![{fallback}](tg://time?unix={int(dt.timestamp())}&format={fmt})"
+
+
+def expand_time_placeholders(text: str, display_tz: str = DEFAULT_TZ) -> str:
+    """Replace ``{{time:ISO|TZ|FORMAT}}`` placeholders with date-time entities."""
+    def repl(m: re.Match) -> str:
+        return time_entity(m.group(1), m.group(2), m.group(3), display_tz)
+    return TIME_PLACEHOLDER_RE.sub(repl, text or "")
+
+
+# ---------------------------------------------------------------- maps & galleries
+
+def render_maps(maps: Any) -> str:
+    if not maps:
+        return ""
+    if not isinstance(maps, list):
+        raise ButtonSpecError("maps must be a list")
+    out = []
+    for m in maps[:10]:
+        try:
+            lat, lon = float(m["lat"]), float(m.get("long", m.get("lon")))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ButtonSpecError("each map needs numeric lat and long") from exc
+        if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+            raise ButtonSpecError("map coordinates out of range")
+        zoom = max(1, min(int(m.get("zoom") or 15), 20))
+        block = f'<tg-map lat="{lat:.6f}" long="{lon:.6f}" zoom="{zoom}"/>'
+        caption = str(m.get("caption") or "").strip()
+        out.append(f"{block}\n\n*{caption}*" if caption else block)
+    return "\n\n".join(out)
+
+
+def render_gallery(gallery: Any) -> str:
+    if not gallery:
+        return ""
+    if not isinstance(gallery, dict):
+        raise ButtonSpecError("gallery must be an object")
+    kind = str(gallery.get("type") or "collage").lower()
+    if kind not in {"collage", "slideshow"}:
+        raise ButtonSpecError("gallery type must be collage or slideshow")
+    items = gallery.get("items") or []
+    if not isinstance(items, list) or not items:
+        raise ButtonSpecError("gallery needs items")
+    lines = []
+    for it in items[:50]:
+        url = str((it or {}).get("url") or "").strip()
+        if not re.match(r"^https?://\S+$", url):
+            raise ButtonSpecError("gallery items need http(s) urls")
+        cap = str(it.get("caption") or "").replace('"', "'").strip()
+        lines.append(f'![]({url} "{cap}")' if cap else f"![]({url})")
+    return f"<tg-{kind}>\n" + "\n".join(lines) + f"\n</tg-{kind}>"
+
+
+def compose_markdown(body: str, rows: list[list[dict[str, Any]]], request_id: str | None, *,
+                     include_choices: bool = True, footer: str = "", align: str | None = None,
+                     maps: Any = None, gallery: Any = None, display_tz: str = DEFAULT_TZ) -> str:
+    body = expand_time_placeholders((body or "").rstrip(), display_tz)
+    chunks = [body, render_gallery(gallery), render_maps(maps), footer.strip(),
+              render_rows(rows, request_id, include_choices=include_choices, align=align)]
+    return "\n\n".join(c for c in chunks if c)
+
+
+def card_key(chat_id: str, thread_id: str | None, key: str) -> str:
+    slug = re.sub(r"[^a-z0-9_-]+", "-", (key or "").strip().lower()).strip("-")
+    if not slug or len(slug) > 64:
+        raise ButtonSpecError("status card key must be 1-64 chars of letters, digits, - or _")
+    return f"{chat_id}:{thread_id or '-'}:{slug}"
+
+
+# ---------------------------------------------------------------- stores
+
+class JsonStore:
+    """Small JSON dict persisted atomically under an flock (safe across processes)."""
+
+    def __init__(self, root: Path, name: str):
         self.root = Path(root)
-        self.path = self.root / "pending.json"
+        self.path = self.root / name
         self.lock_path = self.root / ".lock"
 
     def ensure(self) -> None:
@@ -176,7 +276,7 @@ class PendingStore:
             pass
 
     @contextmanager
-    def _locked(self) -> Iterator[dict[str, Any]]:
+    def locked(self) -> Iterator[dict[str, Any]]:
         self.ensure()
         with open(self.lock_path, "a+") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
@@ -202,6 +302,26 @@ class PendingStore:
             json.dump(data, fh, ensure_ascii=False)
         os.replace(tmp, self.path)
 
+    def get(self, key: str) -> dict[str, Any] | None:
+        with self.locked() as data:
+            entry = data.get(key)
+            return dict(entry) if entry else None
+
+    def set(self, key: str, value: dict[str, Any]) -> None:
+        with self.locked() as data:
+            data[key] = value
+
+    def pop(self, key: str) -> dict[str, Any] | None:
+        with self.locked() as data:
+            return data.pop(key, None)
+
+
+class PendingStore(JsonStore):
+    """Outstanding choice prompts."""
+
+    def __init__(self, root: Path):
+        super().__init__(root, "pending.json")
+
     @staticmethod
     def _prune(data: dict[str, Any], now: float) -> None:
         for key in [k for k, v in data.items() if now - float(v.get("created_at", 0)) > PENDING_TTL_SECONDS]:
@@ -212,19 +332,14 @@ class PendingStore:
 
     def put(self, entry: dict[str, Any], now: float | None = None) -> None:
         now = time.time() if now is None else now
-        with self._locked() as data:
+        with self.locked() as data:
             self._prune(data, now)
             data[entry["id"]] = entry
 
     def update(self, request_id: str, **fields: Any) -> None:
-        with self._locked() as data:
+        with self.locked() as data:
             if request_id in data:
                 data[request_id].update(fields)
-
-    def get(self, request_id: str) -> dict[str, Any] | None:
-        with self._locked() as data:
-            entry = data.get(request_id)
-            return dict(entry) if entry else None
 
     def claim(self, request_id: str, index: int, user_id: str, now: float | None = None
               ) -> tuple[str, dict[str, Any] | None, dict[str, str] | None]:
@@ -233,7 +348,7 @@ class PendingStore:
         status: ok | expired | unauthorized | used | invalid
         """
         now = time.time() if now is None else now
-        with self._locked() as data:
+        with self.locked() as data:
             entry = data.get(request_id)
             if not entry or now - float(entry.get("created_at", 0)) > PENDING_TTL_SECONDS:
                 return "expired", None, None

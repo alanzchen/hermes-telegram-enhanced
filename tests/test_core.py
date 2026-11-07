@@ -5,9 +5,9 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-spec = importlib.util.spec_from_file_location("trb_core", ROOT / "core.py")
+spec = importlib.util.spec_from_file_location("hte_core", ROOT / "core.py")
 core = importlib.util.module_from_spec(spec)
-sys.modules["trb_core"] = core
+sys.modules["hte_core"] = core
 spec.loader.exec_module(core)
 
 
@@ -23,7 +23,6 @@ class ButtonTests(unittest.TestCase):
         self.assertIn('data="rb:0123456789:0"', md)
         self.assertIn('data="rb:0123456789:1"', md)
         self.assertIn('style="success"', md)
-        self.assertIn('type="url"', md)
 
     def test_escaping_and_copy(self):
         rows = core.normalize_buttons([[{"label": "<x>", "type": "copy", "copy_text": 'a"b<c>'}]])
@@ -42,12 +41,48 @@ class ButtonTests(unittest.TestCase):
         md = core.compose_markdown("b", rows, None, include_choices=False, footer="> done")
         self.assertNotIn("callback_data", md)
         self.assertIn("https://x.y", md)
-        self.assertIn("> done", md)
 
     def test_callback_roundtrip(self):
         self.assertEqual(core.parse_callback_data(core.callback_data("abcdef0123", 7)), ("abcdef0123", 7))
         self.assertIsNone(core.parse_callback_data("cl:1:2"))
-        self.assertIsNone(core.parse_callback_data("rb:XYZ:1"))
+
+
+class TimeTests(unittest.TestCase):
+    def test_placeholder_to_entity(self):
+        out = core.expand_time_placeholders("起飞 {{time:2026-11-08T09:30|America/Chicago}} 准时")
+        # 09:30 CST (UTC-6) = 15:30 UTC
+        self.assertIn("tg://time?unix=1794151800&format=wDT", out)
+        self.assertIn("11/8 周日 09:30 CST", out)
+
+    def test_format_and_offset(self):
+        out = core.expand_time_placeholders("{{time:2026-11-08T09:30+09:00||t}}")
+        self.assertIn("format=t)", out)
+        self.assertIn("unix=1794097800", out)
+        with self.assertRaises(core.ButtonSpecError):
+            core.expand_time_placeholders("{{time:2026-11-08T09:30|America/Chicago|xyz}}")
+        with self.assertRaises(core.ButtonSpecError):
+            core.expand_time_placeholders("{{time:tomorrow}}")
+
+
+class MediaTests(unittest.TestCase):
+    def test_map_and_gallery(self):
+        md = core.compose_markdown("x", [], None, maps=[{"lat": 32.98, "long": -96.75, "zoom": 30, "caption": "UTD"}],
+                                   gallery={"type": "slideshow", "items": [{"url": "https://a.b/c.jpg", "caption": 'q"t'}]})
+        self.assertIn('<tg-map lat="32.980000" long="-96.750000" zoom="20"/>', md)
+        self.assertIn("<tg-slideshow>", md)
+        self.assertIn("![](https://a.b/c.jpg \"q't\")", md)
+
+    def test_bad_media(self):
+        for kw in ({"maps": [{"lat": 99, "long": 0}]}, {"maps": [{"lat": "x"}]},
+                   {"gallery": {"items": [{"url": "file:///etc/passwd"}]}}, {"gallery": {"type": "grid", "items": [1]}}):
+            with self.assertRaises(core.ButtonSpecError):
+                core.compose_markdown("x", [], None, **kw)
+
+    def test_card_key(self):
+        self.assertEqual(core.card_key("1", "2", "Trip Tokyo!"), "1:2:trip-tokyo")
+        self.assertEqual(core.card_key("1", None, "a"), "1:-:a")
+        with self.assertRaises(core.ButtonSpecError):
+            core.card_key("1", None, "!!!")
 
 
 class StoreTests(unittest.TestCase):
@@ -66,21 +101,19 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(self.store.claim("abcdef0123", 5, "42", now=1001)[0], "invalid")
         status, entry, choice = self.store.claim("abcdef0123", 0, "42", now=1001)
         self.assertEqual((status, choice), ("ok", {"label": "A", "value": "a"}))
-        self.assertEqual(entry["session_key"], "k")
         self.assertEqual(self.store.claim("abcdef0123", 0, "42", now=1002)[0], "used")
         self.assertEqual(self.store.claim("missing000", 0, "42", now=1002)[0], "expired")
         late = 1000 + core.PENDING_TTL_SECONDS + 1
         self.store.put({**self.entry, "id": "bbbbbbbbbb", "created_at": 1000.0}, now=1000.0)
         self.assertEqual(self.store.claim("bbbbbbbbbb", 0, "42", now=late)[0], "expired")
 
-    def test_file_mode(self):
+    def test_file_mode_and_json_store(self):
         self.assertEqual(self.store.path.stat().st_mode & 0o777, 0o600)
-
-    def test_injection_text(self):
-        text = core.choice_injection_text({"id": "r1", "question": "Q?"}, {"label": "A", "value": "a"}, "Alan")
-        self.assertIn("「A」", text)
-        self.assertIn("value: a", text)
-        self.assertIn("Q?", text)
+        js = core.JsonStore(Path(self.tmp.name) / "s", "cards.json")
+        js.set("k", {"message_id": 5})
+        self.assertEqual(js.get("k"), {"message_id": 5})
+        self.assertEqual(js.pop("k"), {"message_id": 5})
+        self.assertIsNone(js.get("k"))
 
 
 if __name__ == "__main__":

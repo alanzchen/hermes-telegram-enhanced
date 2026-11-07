@@ -1,7 +1,15 @@
-name: telegram-rich-buttons
-version: 0.1.0
-description: "Telegram Bot API 10.1 rich messages with link, copy and choice buttons; choice presses return to the originating Hermes conversation. No Hermes source changes."
+name: hermes-telegram-enhanced
+version: 0.2.0
+description: "Hermes Telegram Enhanced: Bot API 10.x rich messages with buttons, pinned edit-in-place status cards, local-time entities, maps and galleries, a native Stop button, and Guest Mode cross-chat calls. No Hermes source changes."
 author: "Alan Chen"
 kind: standalone
 provides_tools:
   - telegram_rich_send
+  - telegram_status_card
+  - telegram_guest_reply
+provides_hooks:
+  - pre_llm_call
+  - post_llm_call
+  - on_session_end
+  - agent_loop_stopped
+  - transform_llm_output
