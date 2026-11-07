@@ -564,9 +564,10 @@ def _stop_fire(rec: dict[str, Any]) -> None:
         base["message_thread_id"] = int(rec["thread_id"])
     markdown = (str(_setting("stop_message_markdown", STOP_MESSAGE_MARKDOWN)) + "\n\n<tg-button-row>\n"
                 f'<tg-button type="callback_data" style="danger" data="{data}">⏹ 停止</tg-button>\n</tg-button-row>')
-    res = _api("sendRichMessage", {**base, "rich_message": {"markdown": markdown}})
+    res: dict[str, Any] = {"ok": False}
+    if _setting("stop_message_rich", False):  # Alan preferred the plain inline-keyboard look
+        res = _api("sendRichMessage", {**base, "rich_message": {"markdown": markdown}})
     if not res.get("ok"):
-        logger.info("telegram-enhanced: rich stop message failed (%s); falling back", res.get("description"))
         res = _api("sendMessage", {**base, "text": STOP_MESSAGE_TEXT, "reply_markup": {
             "inline_keyboard": [[{"text": "⏹ 停止", "callback_data": data}]]}})
     if not res.get("ok"):
