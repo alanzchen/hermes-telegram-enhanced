@@ -490,7 +490,8 @@ def _stop_fire(rec: dict[str, Any], confirm: bool = False) -> None:
         _stop_delete(rec["chat_id"], mid)
 
 
-def _stop_end(rec: dict[str, Any]) -> None:
+def _stop_end(rec: dict[str, Any], why: str = "") -> None:
+    logger.info("telegram-enhanced: indicator end key=%s draft=%s why=%s", rec.get("key"), rec.get("draft_id"), why)
     with _state["turns_lock"]:
         rec["ended"] = True
         rec["cancel"].set()
@@ -518,7 +519,7 @@ def _stop_begin(session_id: str, turn_id: str, parent_session_id: str) -> None:
         stale = [r for r in _state["stops"].values()
                  if r["chat_id"] == chat_id and r["thread_id"] == thread_id]
     for r in stale:  # a new top-level turn here means earlier ones are over (interrupted/steered/rotated)
-        _stop_end(r)
+        _stop_end(r, "new turn")
     key = turn_id or session_id
     rec = {"key": key, "session_id": session_id, "chat_id": chat_id, "thread_id": thread_id,
            "user_id": _session("HERMES_SESSION_USER_ID") or chat_id,
@@ -528,6 +529,8 @@ def _stop_begin(session_id: str, turn_id: str, parent_session_id: str) -> None:
            "draft": draft, "draft_id": _draft_id(key), "draft_lock": threading.Lock()}
     with _state["turns_lock"]:
         _state["stops"][key] = rec
+    logger.info("telegram-enhanced: indicator begin key=%s session=%s draft=%s state=%x",
+                key, session_id, rec["draft_id"], id(_state))
 
     def run() -> None:
         _stop_cleanup_leftovers(chat_id, thread_id)
@@ -545,7 +548,7 @@ def _stop_finish(turn_id: str = "", session_id: str = "", chat_thread: tuple[lis
         if (turn_id and r["key"] == turn_id) or (session_id and r["session_id"] == session_id) or (
                 chat_thread is not None and r["chat_id"] in chat_thread[0]
                 and (not r["thread_id"] or r["thread_id"] in chat_thread[0])):
-            _stop_end(r)
+            _stop_end(r, f"finish turn={turn_id} session={session_id} chat={bool(chat_thread)}")
 
 
 def _on_pre_llm_call(session_id: str = "", platform: str = "", turn_id: Any = "",
@@ -590,7 +593,10 @@ async def _on_stopped_generation(update: Any, _context: Any) -> None:
         if rec is not None:
             rec["draft_off"] = True
     if rec is None:
-        logger.info("telegram-enhanced: native stop for unknown/ended draft %s", draft_id)
+        with _state["turns_lock"]:
+            known = [(r.get("key"), r.get("draft_id")) for r in _state["stops"].values()]
+        logger.info("telegram-enhanced: native stop for unknown/ended draft %s (%s) known=%s state=%x",
+                    draft_id, type(draft_id).__name__, known, id(_state))
         return
     logger.info("telegram-enhanced: native stop -> confirm prompt for chat %s thread %s", rec["chat_id"], rec["thread_id"])
     threading.Thread(target=_stop_fire, args=(rec, True), name="tg-enhanced-confirm", daemon=True).start()
