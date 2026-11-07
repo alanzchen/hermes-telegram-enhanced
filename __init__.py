@@ -587,7 +587,10 @@ async def _on_stopped_generation(update: Any, _context: Any) -> None:
     data = (getattr(update, "api_kwargs", None) or {}).get("stopped_message_generation")
     if not isinstance(data, dict):
         return
-    draft_id = data.get("draft_id")
+    try:  # raw api_kwargs carry draft_id as a string
+        draft_id = int(data.get("draft_id"))
+    except (TypeError, ValueError):
+        return
     with _state["turns_lock"]:
         rec = next((r for r in _state["stops"].values() if r.get("draft_id") == draft_id), None)
         if rec is not None:
