@@ -629,6 +629,14 @@ def _confirm_after_grace(rec: dict[str, Any]) -> None:
                 "follow-up message arrived, no prompt" if followed else "confirm prompt")
     if not followed:
         _stop_fire(rec, True)
+        return
+    # The user steered: bring the bubble (and its Stop) back for the rest of the turn.
+    with _state["turns_lock"]:
+        if rec["ended"] or rec["cancel"].is_set():
+            return
+        rec["draft_off"] = False
+        rec["draft_id"] = _draft_id(rec["key"])  # fresh draft; the stopped one may be ignored by the client
+    _draft_loop(rec)
 
 
 def _note_user_message(update: Any) -> None:
