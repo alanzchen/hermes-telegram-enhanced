@@ -513,6 +513,7 @@ async def _on_stopped_generation(update: Any, _context: Any) -> None:
 STOP_PREFIX = "hs:"
 _STOP_DATA_RE = re.compile(r"^hs:([0-9a-f]{12})$")
 STOP_MESSAGE_TEXT = "⏳ 小助手处理中, 需要时点「停止」"
+STOP_MESSAGE_MARKDOWN = "_Thinking…_"
 
 
 def _stop_store() -> JsonStore | None:
@@ -555,12 +556,19 @@ def _stop_cleanup_leftovers(chat_id: str, thread_id: str, keep: int | None = Non
 def _stop_fire(rec: dict[str, Any]) -> None:
     if rec["cancel"].wait(float(_setting("stop_message_delay_seconds", 6))):
         return
-    payload: dict[str, Any] = {
-        "chat_id": int(rec["chat_id"]), "text": STOP_MESSAGE_TEXT, "disable_notification": True,
-        "reply_markup": {"inline_keyboard": [[{"text": "⏹ 停止", "callback_data": STOP_PREFIX + rec["token"]}]]}}
+    # <tg-thinking> is accepted only by sendRichMessageDraft, and any draft makes clients queue the user's
+    # messages, so a regular rich message imitates it: muted italic text plus a red Stop button.
+    data = STOP_PREFIX + rec["token"]
+    base: dict[str, Any] = {"chat_id": int(rec["chat_id"]), "disable_notification": True}
     if rec["thread_id"]:
-        payload["message_thread_id"] = int(rec["thread_id"])
-    res = _api("sendMessage", payload)
+        base["message_thread_id"] = int(rec["thread_id"])
+    markdown = (str(_setting("stop_message_markdown", STOP_MESSAGE_MARKDOWN)) + "\n\n<tg-button-row>\n"
+                f'<tg-button type="callback_data" style="danger" data="{data}">⏹ 停止</tg-button>\n</tg-button-row>')
+    res = _api("sendRichMessage", {**base, "rich_message": {"markdown": markdown}})
+    if not res.get("ok"):
+        logger.info("telegram-enhanced: rich stop message failed (%s); falling back", res.get("description"))
+        res = _api("sendMessage", {**base, "text": STOP_MESSAGE_TEXT, "reply_markup": {
+            "inline_keyboard": [[{"text": "⏹ 停止", "callback_data": data}]]}})
     if not res.get("ok"):
         logger.info("telegram-enhanced: stop message send failed: %s", res.get("description"))
         return
