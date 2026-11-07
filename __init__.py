@@ -565,9 +565,22 @@ def _on_pre_llm_call(session_id: str = "", platform: str = "", turn_id: Any = ""
     return None
 
 
-def _on_post_llm_call(session_id: str = "", turn_id: Any = "", **_kw: Any) -> None:
+def _on_post_llm_call(session_id: str = "", turn_id: Any = "", parent_session_id: str = "", **_kw: Any) -> None:
     # turn_id survives session rotation (compression); fall back to session_id only without it.
     _stop_finish(turn_id=str(turn_id or ""), session_id="" if turn_id else session_id)
+    if parent_session_id:
+        return
+    # A plugin reload mid-turn orphans the old generation's record; sweep this topic's stored messages.
+    try:
+        chat_id = _session("HERMES_SESSION_CHAT_ID")
+        thread_id = _session("HERMES_SESSION_THREAD_ID")
+        if chat_id.lstrip("-").isdigit():
+            with _state["turns_lock"]:
+                busy = any(r["chat_id"] == chat_id and r["thread_id"] == thread_id for r in _state["stops"].values())
+            if not busy:
+                _stop_cleanup_leftovers(chat_id, thread_id if thread_id.isdigit() else "")
+    except Exception:
+        logger.debug("telegram-enhanced: post-turn sweep failed", exc_info=True)
 
 
 def _on_session_end(session_id: str = "", **_kw: Any) -> None:
@@ -1010,4 +1023,10 @@ def register(ctx: Any) -> None:
             recs = list(_state["stops"].values())
         for rec in recs:
             rec["cancel"].set()
+            mid = rec.get("message_id_sent")
+            if mid:  # don't leave this generation's confirm/💬 message behind
+                try:
+                    _stop_delete(rec["chat_id"], mid)
+                except Exception:
+                    pass
     ctx.on_unload(_cleanup)
