@@ -492,7 +492,7 @@ def _tool_label(tool_name: str, args: Any) -> str:
             break
     code = _command_text(name, args)
     if code:  # commands keep their own line breaks; long lines wrap instead of being cut
-        return f"{icon} {verb}\n" + "\n".join(_wrap_command(code))
+        return f"{verb}\n" + "\n".join(_wrap_command(code))
     detail = ""
     try:
         from agent.display import build_tool_preview
@@ -502,7 +502,7 @@ def _tool_label(tool_name: str, args: Any) -> str:
     detail = " ".join(str(detail).split())
     if len(detail) > 48:
         detail = detail[:47] + "…"
-    return f"{icon} {verb}" + (f"：{detail}" if detail else "")
+    return verb + (f"：{detail}" if detail else "")
 
 
 _CMD_WIDTH = 48
@@ -551,12 +551,13 @@ def _render_draft(rec: dict[str, Any]) -> str:
         for st in steps[hidden:]:
             head, *body = str(st["label"]).split("\n")
             if st["status"] == "running":
-                lines.append(f"⏳ {head} · {now - st['t0']:.0f}s")
+                lines.append(f"… {head} · {now - st['t0']:.0f}s")
             else:
-                mark = "✅" if st["status"] == "ok" else "⚠️"
+                mark = "✓" if st["status"] == "ok" else "✗"
                 lines.append(f"{mark} {head} · {st['dur']:.1f}s")
-            lines.extend("      " + b for b in body)
-    return "<tg-thinking>" + "\n".join(_html.escape(x, quote=False) for x in lines) + "</tg-thinking>"
+            lines.extend("\u2003\u2003" + b for b in body)  # em spaces: rich HTML collapses ASCII runs
+    # Rich HTML collapses newlines like a browser; <br> is the documented line break.
+    return "<tg-thinking>" + "<br>".join(_html.escape(x, quote=False) for x in lines) + "</tg-thinking>"
 
 
 def _rec_for_tool(turn_id: Any, session_id: str) -> dict[str, Any] | None:
