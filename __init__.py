@@ -622,6 +622,20 @@ def _patch_telegram_lists() -> None:
     pre_llm_call because the platform plugin may (re)load after this plugin registers.
     """
     candidates = []
+    if not _state.get("gc_scanned"):
+        # A plugin reload re-imports the adapter module, so the instance that actually sends can be an
+        # orphaned class. Find live instances once per plugin load.
+        _state["gc_scanned"] = True
+        import gc
+        for obj in gc.get_objects():
+            try:
+                if type(obj).__name__ == "TelegramAdapter" and hasattr(obj, "format_message"):
+                    candidates.append(type(obj))
+                    logger.info("telegram-enhanced: found live adapter %s id=%x patched=%s",
+                                type(obj).__module__, id(type(obj)),
+                                bool(type(obj).__dict__.get(_LIST_PATCH_MARK)))
+            except Exception:
+                continue
     live = _state.get("adapter")
     if live is not None:  # the instance actually sending; after a plugin reload its class may no
         candidates.append(type(live))  # longer be the one sys.modules points at
@@ -630,6 +644,9 @@ def _patch_telegram_lists() -> None:
             candidates.append(getattr(mod, "TelegramAdapter", None))
         except Exception:
             continue
+    if live is not None:
+        logger.info("telegram-enhanced: live adapter class %s.%s id=%x patched=%s", type(live).__module__,
+                    type(live).__name__, id(type(live)), bool(type(live).__dict__.get(_LIST_PATCH_MARK)))
     for cls in candidates:
         if (not isinstance(cls, type) or cls.__dict__.get(_LIST_PATCH_MARK)
                 or not hasattr(cls, "_needs_rich_rendering") or not hasattr(cls, "format_message")):
