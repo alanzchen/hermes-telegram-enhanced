@@ -646,10 +646,21 @@ def _note_user_message(update: Any) -> None:
     chat_id = str(getattr(msg, "chat_id", "") or "")
     thread_id = str(getattr(msg, "message_thread_id", "") or "")
     now = time.time()
+    resume = []
     with _state["turns_lock"]:
         for r in _state["stops"].values():
             if r["chat_id"] == chat_id and (r["thread_id"] or "") == thread_id:
                 r["user_msg_ts"] = now
+                # A steer after the "really stop?" prompt: drop the prompt and bring the bubble back.
+                if r.get("draft_off") and r.get("message_id_sent") and not r["ended"]:
+                    resume.append((r, r.pop("message_id_sent")))
+                    r["sending"] = False
+                    r["draft_off"] = False
+                    r["draft_id"] = _draft_id(r["key"])
+    for r, mid in resume:
+        logger.info("telegram-enhanced: steer after confirm prompt -> delete %s, resume draft", mid)
+        threading.Thread(target=_stop_delete, args=(r["chat_id"], mid), daemon=True).start()
+        threading.Thread(target=_draft_loop, args=(r,), name="tg-enhanced-draft", daemon=True).start()
 
 
 async def _route_new_updates(update: Any, context: Any) -> None:
