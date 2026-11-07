@@ -651,6 +651,7 @@ async def _stop_button_dispatch(update: Any, context: Any) -> None:
     """Wired once into PTB; resolves the CURRENT plugin generation's handler, because a plugin reload
     does not re-run native handler factories."""
     handler = getattr(sys, "_hte_stop_button", None)
+    logger.info("telegram-enhanced: stop-button press received (handler=%s)", handler is not None)
     if handler is not None:
         await handler(update, context)
 
@@ -677,6 +678,7 @@ async def _on_stop_button(update: Any, _context: Any) -> None:
     with _state["turns_lock"]:
         rec = next((r for r in _state["stops"].values() if m and r["token"] == m.group(1)), None)
     if rec is None:
+        logger.info("telegram-enhanced: stop press for unknown/ended turn")
         await query.answer(text="这一轮已经结束了")
         try:
             msg = getattr(query, "message", None)
