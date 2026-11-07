@@ -646,6 +646,10 @@ def _note_user_message(update: Any) -> None:
     chat_id = str(getattr(msg, "chat_id", "") or "")
     thread_id = str(getattr(msg, "message_thread_id", "") or "")
     now = time.time()
+    sent = getattr(msg, "date", None)
+    if sent is not None and hasattr(sent, "timestamp"):
+        logger.info("telegram-enhanced: user message %s received %.1fs after send",
+                    getattr(msg, "message_id", "?"), now - sent.timestamp())
     resume = []
     with _state["turns_lock"]:
         for r in _state["stops"].values():
