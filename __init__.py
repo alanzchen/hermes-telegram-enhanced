@@ -386,6 +386,7 @@ _STOP_DATA_RE = re.compile(r"^hs:([0-9a-f]{12})$")
 STOP_MESSAGE_TEXT = "💬"  # a lone emoji renders large and animated for every user
 STOP_BUTTON_LABEL = "⏹"
 STOP_MESSAGE_MARKDOWN = "_Thinking…_"
+THINKING_EMOJI_ID = "5573473356579078196"  # AI Actions #46: rising stars
 DRAFT_HTTP_TIMEOUT = 4
 STOPMSG_MAX_AGE = 47 * 3600  # bots cannot delete messages older than 48h
 
@@ -635,7 +636,13 @@ def _render_draft(rec: dict[str, Any]) -> str:
             _verb, what = _step_parts(st, lang)
             lines.append(f"{i18n.t('now', lang, what=what)} · {_fmt_secs(now - st['t0'])}")
     # Rich HTML collapses newlines like a browser; <br> is the documented line break.
-    return "<tg-thinking>" + "<br>".join(_html.escape(x, quote=False) for x in lines) + "</tg-thinking>"
+    body = "<br>".join(_html.escape(x, quote=False) for x in lines)
+    # Animated icon from Telegram's official "AI Actions" custom-emoji set (t.me/addemoji/AIActions);
+    # ``thinking_emoji_id: ""`` turns it off.
+    emoji_id = str(_setting("thinking_emoji_id", THINKING_EMOJI_ID) or "")
+    if emoji_id.isdigit():
+        body = f'<tg-emoji emoji-id="{emoji_id}">✨</tg-emoji> ' + body
+    return "<tg-thinking>" + body + "</tg-thinking>"
 
 
 def _rec_for_tool(turn_id: Any, session_id: str) -> dict[str, Any] | None:
