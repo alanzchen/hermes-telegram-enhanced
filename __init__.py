@@ -621,11 +621,16 @@ def _patch_telegram_lists() -> None:
     Hermes core is read-only, so wrap the live TelegramAdapter class(es). Idempotent; re-run from
     pre_llm_call because the platform plugin may (re)load after this plugin registers.
     """
+    candidates = []
+    live = _state.get("adapter")
+    if live is not None:  # the instance actually sending; after a plugin reload its class may no
+        candidates.append(type(live))  # longer be the one sys.modules points at
     for mod in list(sys.modules.values()):
         try:
-            cls = getattr(mod, "TelegramAdapter", None)
+            candidates.append(getattr(mod, "TelegramAdapter", None))
         except Exception:
             continue
+    for cls in candidates:
         if (not isinstance(cls, type) or cls.__dict__.get(_LIST_PATCH_MARK)
                 or not hasattr(cls, "_needs_rich_rendering") or not hasattr(cls, "format_message")):
             continue
@@ -707,6 +712,10 @@ def register(ctx: Any) -> None:
         from telegram import Update
         from telegram.ext import CallbackQueryHandler, TypeHandler
         _state["adapter"] = adapter
+        try:
+            _patch_telegram_lists()
+        except Exception:
+            logger.debug("telegram-enhanced: list patch failed", exc_info=True)
         token = getattr(getattr(native, "bot", None), "token", None)
         if token:
             _state["token"] = token
