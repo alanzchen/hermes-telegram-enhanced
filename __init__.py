@@ -370,18 +370,33 @@ def _draft_id(session_id: str) -> int:
     return int(hashlib.sha256(f"{session_id}:{time.time()}".encode()).hexdigest()[:8], 16) or 1
 
 
+_GENERATION = object()
+sys._hte_draft_generation = _GENERATION  # a plugin reload retires the previous module's draft threads
+
+
 def _draft_loop(rec: dict[str, Any]) -> None:
     stop: threading.Event = rec["stop"]
     started = time.time()
     logger.info("telegram-enhanced: stop-button draft started for chat %s thread %s", rec["chat_id"], rec["thread_id"])
-    while not stop.is_set() and time.time() - started < DRAFT_MAX_SECONDS:
+    try:
+        _draft_loop_body(rec, stop, started)
+    finally:
+        rec["alive"] = False
+        with _state["turns_lock"]:
+            if _state["turns"].get(rec["session_id"]) is rec:
+                _state["turns"].pop(rec["session_id"], None)
+
+
+def _draft_loop_body(rec: dict[str, Any], stop: threading.Event, started: float) -> None:
+    while (not stop.is_set() and time.time() - started < DRAFT_MAX_SECONDS
+           and getattr(sys, "_hte_draft_generation", None) is _GENERATION):
         payload = {"chat_id": int(rec["chat_id"]), "draft_id": rec["draft_id"], "can_stop": True,
                    "rich_message": {"markdown": "<tg-thinking>小助手处理中…</tg-thinking>"}}
         if rec.get("thread_id"):
             payload["message_thread_id"] = int(rec["thread_id"])
         res = _api("sendRichMessageDraft", payload)
         if not res.get("ok"):
-            logger.debug("telegram-enhanced: draft refresh failed: %s", res.get("description"))
+            logger.info("telegram-enhanced: draft refresh failed: %s", res.get("description"))
             if "draft" in str(res.get("description") or "").lower():
                 break
         stop.wait(DRAFT_REFRESH_SECONDS)
@@ -402,9 +417,14 @@ def _on_pre_llm_call(session_id: str = "", platform: str = "", **_kw: Any) -> No
         if thread_id and not thread_id.isdigit():
             thread_id = ""
         with _state["turns_lock"]:
-            # One draft per chat/topic: subagents and nested turns share the parent's draft.
-            if session_id in _state["turns"] or any(
-                    r["chat_id"] == chat_id and r["thread_id"] == thread_id for r in _state["turns"].values()):
+            # A session reuses its session_id every turn: a leftover record means the previous turn ended
+            # without post_llm_call (interrupted/steered), so retire it and start fresh.
+            old = _state["turns"].pop(session_id, None)
+            if old:
+                old["stop"].set()
+            # One draft per chat/topic: a subagent shares its live parent's draft.
+            if any(r["chat_id"] == chat_id and r["thread_id"] == thread_id and r.get("alive", True)
+                   for r in _state["turns"].values()):
                 return None
             rec = {"session_id": session_id, "chat_id": chat_id, "thread_id": thread_id,
                    "user_id": _session("HERMES_SESSION_USER_ID") or chat_id,
