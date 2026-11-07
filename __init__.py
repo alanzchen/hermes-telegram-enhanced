@@ -36,7 +36,7 @@ logger = logging.getLogger("hermes_plugins.telegram_enhanced")
 TOOLSET = "telegram_enhanced"
 RICH_MAX_CHARS = 32768
 _HTTP_TIMEOUT = 30
-DRAFT_REFRESH_SECONDS = 20
+DRAFT_REFRESH_SECONDS = 8  # any bot message clears the draft; re-show it quickly
 DRAFT_MAX_SECONDS = 45 * 60
 GUEST_TTL_SECONDS = 24 * 3600
 
