@@ -17,6 +17,8 @@ import hashlib
 import json
 import logging
 import os
+import re
+import secrets
 import sys
 import threading
 import time
@@ -43,7 +45,8 @@ GUEST_TTL_SECONDS = 24 * 3600
 _state: dict[str, Any] = {
     "ctx": None, "token": None, "adapter": None, "loop": None,
     "pending": None, "cards": None, "guests": None, "meta": None,
-    "turns": {},           # session_id -> turn record (stop button)
+    "turns": {},           # session_id -> turn record (processing draft)
+    "stops": {},           # turn_id -> stop-message record
     "turns_lock": threading.Lock(),
 }
 
@@ -405,11 +408,17 @@ def _draft_loop_body(rec: dict[str, Any], stop: threading.Event, started: float)
         stop.wait(DRAFT_REFRESH_SECONDS)
 
 
-def _on_pre_llm_call(session_id: str = "", platform: str = "", **_kw: Any) -> None:
+def _on_pre_llm_call(session_id: str = "", platform: str = "", turn_id: Any = "",
+                     parent_session_id: str = "", **_kw: Any) -> None:
     try:
         _patch_telegram_lists()
     except Exception:
         logger.debug("telegram-enhanced: list patch failed", exc_info=True)
+    if (platform or "").lower() == "telegram" and session_id:
+        try:
+            _stop_begin(session_id, str(turn_id or ""), parent_session_id or "")
+        except Exception:
+            logger.debug("telegram-enhanced: stop message begin failed", exc_info=True)
     try:
         if not _setting("stop_button", False) or (platform or "").lower() != "telegram" or not session_id:
             return None
@@ -448,12 +457,14 @@ def _end_turn(session_id: str) -> None:
         rec["stop"].set()
 
 
-def _on_post_llm_call(session_id: str = "", **_kw: Any) -> None:
+def _on_post_llm_call(session_id: str = "", turn_id: Any = "", **_kw: Any) -> None:
     _end_turn(session_id)
+    _stop_finish(turn_id=str(turn_id or ""))
 
 
 def _on_session_end(session_id: str = "", **_kw: Any) -> None:
     _end_turn(session_id)
+    _stop_finish(session_id=session_id)
 
 
 def _on_loop_stopped(session_key: str = "", **_kw: Any) -> None:
@@ -464,6 +475,8 @@ def _on_loop_stopped(session_key: str = "", **_kw: Any) -> None:
                   if r["chat_id"] in parts and (not r["thread_id"] or r["thread_id"] in parts)]
     for sid in doomed:
         _end_turn(sid)
+    if parts:
+        _stop_finish(chat_thread=(parts, None))
 
 
 async def _on_stopped_generation(update: Any, _context: Any) -> None:
@@ -491,6 +504,171 @@ async def _on_stopped_generation(update: Any, _context: Any) -> None:
         logger.info("telegram-enhanced: Stop button -> /stop for chat %s thread %s", rec["chat_id"], rec["thread_id"])
     except Exception:
         logger.warning("telegram-enhanced: could not dispatch /stop", exc_info=True)
+
+
+# ---------------------------------------------------------------- stop message (inline button)
+# A processing draft makes Telegram clients queue the user's messages (no mid-turn steering), so the
+# Stop affordance is an ordinary silent message with an inline button, deleted when the turn ends.
+
+STOP_PREFIX = "hs:"
+_STOP_DATA_RE = re.compile(r"^hs:([0-9a-f]{12})$")
+STOP_MESSAGE_TEXT = "⏳ 小助手处理中, 需要时点「停止」"
+
+
+def _stop_store() -> JsonStore | None:
+    return _state.get("stopmsgs")
+
+
+def _stop_forget(message_id: int) -> None:
+    store = _stop_store()
+    if store is not None:
+        try:
+            with store.locked() as data:
+                data.pop(str(message_id), None)
+        except Exception:
+            logger.debug("telegram-enhanced: stop store update failed", exc_info=True)
+
+
+def _stop_delete(chat_id: str, message_id: int) -> None:
+    res = _api("deleteMessage", {"chat_id": int(chat_id), "message_id": int(message_id)})
+    if not res.get("ok"):
+        logger.info("telegram-enhanced: stop message %s delete failed: %s", message_id, res.get("description"))
+    _stop_forget(message_id)
+
+
+def _stop_cleanup_leftovers(chat_id: str, thread_id: str, keep: int | None = None) -> None:
+    """Delete stop messages a previous turn/plugin generation left behind in this chat/topic."""
+    store = _stop_store()
+    if store is None:
+        return
+    try:
+        with store.locked() as data:
+            doomed = [int(mid) for mid, v in data.items()
+                      if v.get("chat_id") == chat_id and (v.get("thread_id") or "") == (thread_id or "")
+                      and int(mid) != (keep or 0)]
+    except Exception:
+        return
+    for mid in doomed:
+        _stop_delete(chat_id, mid)
+
+
+def _stop_fire(rec: dict[str, Any]) -> None:
+    if rec["cancel"].wait(float(_setting("stop_message_delay_seconds", 6))):
+        return
+    payload: dict[str, Any] = {
+        "chat_id": int(rec["chat_id"]), "text": STOP_MESSAGE_TEXT, "disable_notification": True,
+        "reply_markup": {"inline_keyboard": [[{"text": "⏹ 停止", "callback_data": STOP_PREFIX + rec["token"]}]]}}
+    if rec["thread_id"]:
+        payload["message_thread_id"] = int(rec["thread_id"])
+    res = _api("sendMessage", payload)
+    if not res.get("ok"):
+        logger.info("telegram-enhanced: stop message send failed: %s", res.get("description"))
+        return
+    mid = int(res["result"]["message_id"])
+    store = _stop_store()
+    if store is not None:
+        try:
+            store.set(str(mid), {"chat_id": rec["chat_id"], "thread_id": rec["thread_id"], "ts": time.time()})
+        except Exception:
+            pass
+    with _state["turns_lock"]:
+        rec["message_id_sent"] = mid
+        ended = rec["ended"]
+    if ended:  # the turn finished while we were sending
+        _stop_delete(rec["chat_id"], mid)
+
+
+def _stop_end(rec: dict[str, Any]) -> None:
+    with _state["turns_lock"]:
+        rec["ended"] = True
+        rec["cancel"].set()
+        mid = rec.get("message_id_sent")
+        _state["stops"].pop(rec["key"], None)
+    if mid:
+        _stop_delete(rec["chat_id"], mid)
+
+
+def _stop_begin(session_id: str, turn_id: str, parent_session_id: str) -> None:
+    if not _setting("stop_message", True) or parent_session_id:
+        return  # subagents share the parent's button
+    chat_id = _session("HERMES_SESSION_CHAT_ID")
+    thread_id = _session("HERMES_SESSION_THREAD_ID")
+    if _session("HERMES_SESSION_CHAT_TYPE") != "dm" or not chat_id.lstrip("-").isdigit():
+        return
+    if thread_id and not thread_id.isdigit():
+        thread_id = ""
+    with _state["turns_lock"]:
+        stale = [r for r in _state["stops"].values()
+                 if r["chat_id"] == chat_id and r["thread_id"] == thread_id]
+    for r in stale:  # a new top-level turn here means earlier ones are over (interrupted/steered)
+        _stop_end(r)
+    key = turn_id or session_id
+    rec = {"key": key, "session_id": session_id, "chat_id": chat_id, "thread_id": thread_id,
+           "user_id": _session("HERMES_SESSION_USER_ID") or chat_id,
+           "user_name": _session("HERMES_SESSION_USER_NAME"),
+           "message_id": _session("HERMES_SESSION_MESSAGE_ID"),
+           "token": secrets.token_hex(6), "cancel": threading.Event(), "ended": False}
+    with _state["turns_lock"]:
+        _state["stops"][key] = rec
+
+    def run() -> None:
+        _stop_cleanup_leftovers(chat_id, thread_id)
+        _stop_fire(rec)
+    threading.Thread(target=run, name="tg-enhanced-stopmsg", daemon=True).start()
+
+
+def _stop_finish(turn_id: str = "", session_id: str = "", chat_thread: tuple[list[str], None] | None = None) -> None:
+    with _state["turns_lock"]:
+        recs = list(_state["stops"].values())
+    for r in recs:
+        if (turn_id and r["key"] == turn_id) or (session_id and r["session_id"] == session_id) or (
+                chat_thread is not None and r["chat_id"] in chat_thread[0]
+                and (not r["thread_id"] or r["thread_id"] in chat_thread[0])):
+            _stop_end(r)
+
+
+async def _dispatch_stop(rec: dict[str, Any]) -> bool:
+    adapter = _state.get("adapter")
+    if adapter is None:
+        return False
+    try:
+        from gateway.platforms.event import MessageEvent, MessageType
+        source = adapter.build_source(chat_id=rec["chat_id"], chat_type="dm", user_id=rec["user_id"],
+                                      user_name=rec.get("user_name") or None, thread_id=rec["thread_id"] or None,
+                                      message_id=rec.get("message_id") or None)
+        event = MessageEvent(text="/stop", message_type=MessageType.COMMAND, source=source,
+                             user_id=rec["user_id"], user_name=rec.get("user_name") or None,
+                             message_id=rec.get("message_id") or None)
+        await adapter.handle_message(event)
+        logger.info("telegram-enhanced: Stop -> /stop for chat %s thread %s", rec["chat_id"], rec["thread_id"])
+        return True
+    except Exception:
+        logger.warning("telegram-enhanced: could not dispatch /stop", exc_info=True)
+        return False
+
+
+async def _on_stop_button(update: Any, _context: Any) -> None:
+    query = getattr(update, "callback_query", None)
+    if query is None:
+        return
+    m = _STOP_DATA_RE.match(getattr(query, "data", "") or "")
+    with _state["turns_lock"]:
+        rec = next((r for r in _state["stops"].values() if m and r["token"] == m.group(1)), None)
+    if rec is None:
+        await query.answer(text="这一轮已经结束了")
+        try:
+            msg = getattr(query, "message", None)
+            if msg is not None:
+                _stop_delete(str(msg.chat_id), int(msg.message_id))
+        except Exception:
+            pass
+        return
+    if str(getattr(getattr(query, "from_user", None), "id", "")) != str(rec["user_id"]):
+        await query.answer(text="这个按钮不是给你的")
+        return
+    await query.answer(text="已停止")
+    _stop_end(rec)
+    await _dispatch_stop(rec)
 
 
 # ---------------------------------------------------------------- guest mode
@@ -737,6 +915,7 @@ def register(ctx: Any) -> None:
     _state["cards"] = JsonStore(root, "cards.json")
     _state["guests"] = JsonStore(root, "guests.json")
     _state["meta"] = JsonStore(root, "meta.json")
+    _state["stopmsgs"] = JsonStore(root, "stopmsgs.json")
     try:
         _state["pending"].ensure()
     except OSError:
@@ -773,6 +952,7 @@ def register(ctx: Any) -> None:
         if token:
             _state["token"] = token
         native.add_handler(CallbackQueryHandler(_make_callback(ctx), pattern=r"^" + CALLBACK_PREFIX))
+        native.add_handler(CallbackQueryHandler(_on_stop_button, pattern=r"^" + STOP_PREFIX))
 
         async def _route_new_updates(update: Any, context: Any) -> None:
             kw = getattr(update, "api_kwargs", None) or {}
