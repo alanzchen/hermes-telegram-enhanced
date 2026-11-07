@@ -652,10 +652,35 @@ def _rec_for_tool(turn_id: Any, session_id: str) -> dict[str, Any] | None:
         return next((r for r in _state["stops"].values() if session_id and r["session_id"] == session_id), None)
 
 
+ADOPT_WINDOW = 3600  # seconds after a plugin load during which orphaned turns are picked up
+
+
+def _adopt_turn(session_id: str, turn_id: Any) -> dict[str, Any] | None:
+    """A plugin reload ends the in-flight turn's record ("plugin unload") and the new generation never
+    sees that turn's pre_llm_call. Restart its bubble at the turn's next tool call — only for a
+    Telegram DM topic with no live record (a subagent's tools land where the parent's record lives)."""
+    if not turn_id or not session_id or time.time() - _state.get("loaded_at", 0) > ADOPT_WINDOW:
+        return None
+    if _session("HERMES_SESSION_PLATFORM").lower() != "telegram":
+        return None
+    chat_id = _session("HERMES_SESSION_CHAT_ID")
+    thread_id = _session("HERMES_SESSION_THREAD_ID")
+    thread_id = thread_id if thread_id.isdigit() else ""
+    with _state["turns_lock"]:
+        if str(turn_id) in _state.setdefault("finished_turns", set()):
+            return None
+        if any(r["chat_id"] == chat_id and (r["thread_id"] or "") == thread_id and not r["ended"]
+               for r in _state["stops"].values()):
+            return None
+    logger.info("telegram-enhanced: adopting in-flight turn %s after plugin load", turn_id)
+    _stop_begin(session_id, str(turn_id), "")
+    return _rec_for_tool(turn_id, session_id)
+
+
 def _on_pre_tool_call(tool_name: str = "", args: Any = None, session_id: str = "", turn_id: Any = "",
                       tool_call_id: str = "", **_kw: Any) -> None:
     try:
-        rec = _rec_for_tool(turn_id, session_id)
+        rec = _rec_for_tool(turn_id, session_id) or _adopt_turn(session_id, turn_id)
         if rec is None or not rec["draft"]:
             return None
         step = {"id": tool_call_id or f"{tool_name}:{time.time()}", **_tool_step(tool_name, args),
@@ -930,6 +955,12 @@ def _on_pre_llm_call(session_id: str = "", platform: str = "", turn_id: Any = ""
 
 
 def _on_post_llm_call(session_id: str = "", turn_id: Any = "", parent_session_id: str = "", **_kw: Any) -> None:
+    if turn_id:
+        with _state["turns_lock"]:
+            done = _state.setdefault("finished_turns", set())
+            done.add(str(turn_id))
+            if len(done) > 500:
+                done.clear()
     # turn_id survives session rotation (compression); fall back to session_id only without it.
     _stop_finish(turn_id=str(turn_id or ""), session_id=session_id)
     if parent_session_id:
@@ -1433,6 +1464,7 @@ def _extend_allowed_updates() -> None:
 
 def register(ctx: Any) -> None:
     _state["ctx"] = ctx
+    _state["loaded_at"] = time.time()
     try:
         _patch_telegram_lists()
     except Exception:
