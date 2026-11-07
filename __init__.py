@@ -390,7 +390,10 @@ def _draft_loop(rec: dict[str, Any]) -> None:
 def _draft_loop_body(rec: dict[str, Any], stop: threading.Event, started: float) -> None:
     while (not stop.is_set() and time.time() - started < DRAFT_MAX_SECONDS
            and getattr(sys, "_hte_draft_generation", None) is _GENERATION):
-        payload = {"chat_id": int(rec["chat_id"]), "draft_id": rec["draft_id"], "can_stop": True,
+        # can_stop=True makes Telegram clients swap Send for Stop and queue the user's messages, which
+        # breaks mid-turn steering; off by default (config: stop_button_can_stop).
+        payload = {"chat_id": int(rec["chat_id"]), "draft_id": rec["draft_id"],
+                   "can_stop": bool(_setting("stop_button_can_stop", False)),
                    "rich_message": {"markdown": "<tg-thinking>小助手处理中…</tg-thinking>"}}
         if rec.get("thread_id"):
             payload["message_thread_id"] = int(rec["thread_id"])
