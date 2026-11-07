@@ -367,11 +367,17 @@ def _make_callback(ctx: Any):
 
 
 # ---------------------------------------------------------------- processing indicator + stop
-# Default (stop_button: true): a native <tg-thinking> draft with Telegram's own Stop button. While a draft
-# is up, the client swaps Send for Stop and queues the user's messages, so pressing Stop is hijacked: it
-# only retires this turn's draft (the agent keeps working, the input box frees up so the next message is
-# a normal steer) and posts a silent "really stop?" message whose inline button sends /stop.
-# Fallback (stop_button: false): no draft; after a few seconds a lone 💬 with an inline ⏹ button.
+# Default (stop_button: true): a native <tg-thinking> draft with Telegram's own Stop button, listing what
+# each tool is doing. While a draft is up the client swaps Send for Stop and queues the user's messages,
+# so pressing Stop is hijacked: it only pauses this turn's draft (the agent keeps working and the input box
+# frees up). A message within the grace window is a steer and the draft resumes; otherwise a silent
+# "really stop?" message appears whose inline button sends /stop, and a later steer removes it again.
+# Fallback (stop_button: false, or the update router isn't installed): after a few seconds a lone 💬 with
+# an inline ⏹ button.
+#
+# Concurrency model: one record per top-level turn, guarded by its own Condition ``rec["cv"]``. Exactly one
+# worker thread per record sends drafts; other paths only flip state and notify. Blocking HTTP never runs
+# on the PTB event loop (handlers hand it to threads).
 
 STOP_PREFIX = "hs:"
 _STOP_DATA_RE = re.compile(r"^hs:([0-9a-f]{12})$")
@@ -380,15 +386,22 @@ STOP_BUTTON_LABEL = "⏹"
 STOP_CONFIRM_TEXT = "要停止这一轮吗？不停的话，直接发消息就是插话"
 STOP_CONFIRM_LABEL = "⏹ 停止"
 STOP_MESSAGE_MARKDOWN = "_Thinking…_"
-DRAFT_TEXT = "<tg-thinking>小助手处理中…</tg-thinking>"
+DRAFT_HTTP_TIMEOUT = 6
+STOPMSG_MAX_AGE = 47 * 3600  # bots cannot delete messages older than 48h
 
 _GENERATION = object()
 sys._hte_draft_generation = _GENERATION  # per process (one gateway process per profile)
 
 
 def _draft_id(seed: str) -> int:
-    return int(hashlib.sha256(f"{seed}:{time.time()}".encode()).hexdigest()[:8], 16) or 1
+    return int(hashlib.sha256(f"{seed}:{time.time()}:{secrets.token_hex(4)}".encode()).hexdigest()[:8], 16) or 1
 
+
+def _spawn(target: Any, *args: Any, name: str = "tg-enhanced") -> None:
+    threading.Thread(target=target, args=args, name=name, daemon=True).start()
+
+
+# ---- stop-message bookkeeping (stopmsgs.json)
 
 def _stop_store() -> JsonStore | None:
     return _state.get("stopmsgs")
@@ -404,54 +417,47 @@ def _stop_forget(message_id: int) -> None:
             logger.debug("telegram-enhanced: stop store update failed", exc_info=True)
 
 
+def _stop_remember(message_id: int, chat_id: str, thread_id: str) -> None:
+    store = _stop_store()
+    if store is not None:
+        try:
+            store.set(str(message_id), {"chat_id": chat_id, "thread_id": thread_id, "ts": time.time()})
+        except Exception:
+            pass
+
+
 def _stop_delete(chat_id: str, message_id: int) -> None:
+    """Blocking. Forget the record only when the message is really gone, so a later sweep can retry."""
     res = _api("deleteMessage", {"chat_id": int(chat_id), "message_id": int(message_id)})
-    if not res.get("ok"):
-        logger.info("telegram-enhanced: stop message %s delete failed: %s", message_id, res.get("description"))
-    _stop_forget(message_id)
+    desc = str(res.get("description") or "").lower()
+    if res.get("ok") or "not found" in desc or "can't be deleted" in desc or "message_id_invalid" in desc:
+        _stop_forget(message_id)
+    else:
+        logger.info("telegram-enhanced: stop message %s delete failed (will retry): %s", message_id, desc)
 
 
-def _stop_cleanup_leftovers(chat_id: str, thread_id: str, keep: int | None = None) -> None:
-    """Delete stop messages a previous turn/plugin generation left behind in this chat/topic."""
+def _stop_cleanup_leftovers(chat_id: str, thread_id: str) -> None:
+    """Delete stop/confirm messages earlier turns or plugin generations left in this chat/topic."""
     store = _stop_store()
     if store is None:
         return
+    now = time.time()
+    with _state["turns_lock"]:
+        live = {r.get("confirm_mid") for r in _state["stops"].values()} | {r.get("bubble_mid") for r in _state["stops"].values()}
     try:
         with store.locked() as data:
+            for mid in [m for m, v in data.items() if now - float(v.get("ts") or 0) > STOPMSG_MAX_AGE]:
+                data.pop(mid, None)
             doomed = [int(mid) for mid, v in data.items()
                       if v.get("chat_id") == chat_id and (v.get("thread_id") or "") == (thread_id or "")
-                      and int(mid) != (keep or 0)]
+                      and int(mid) not in live]
     except Exception:
         return
     for mid in doomed:
         _stop_delete(chat_id, mid)
 
 
-def _draft_loop(rec: dict[str, Any]) -> None:
-    started = time.time()
-    logger.info("telegram-enhanced: processing draft started for chat %s thread %s", rec["chat_id"], rec["thread_id"])
-    while (not rec["cancel"].is_set() and not rec.get("draft_off") and time.time() - started < DRAFT_MAX_SECONDS
-           and getattr(sys, "_hte_draft_generation", None) is _GENERATION):
-        payload = {"chat_id": int(rec["chat_id"]), "draft_id": rec["draft_id"],
-                   "can_stop": bool(_setting("stop_button_can_stop", True)),
-                   "rich_message": {"html": _render_draft(rec)}}
-        if rec.get("thread_id"):
-            payload["message_thread_id"] = int(rec["thread_id"])
-        with rec["draft_lock"]:  # _stop_end waits on this so no draft lands after the final reply
-            if rec["cancel"].is_set() or rec.get("draft_off"):
-                break
-            res = _api("sendRichMessageDraft", payload)
-        if not res.get("ok"):
-            logger.info("telegram-enhanced: draft refresh failed: %s", res.get("description"))
-            if "draft" in str(res.get("description") or "").lower():
-                break
-        # Sleep until the periodic refresh or a tool event, but at most ~1 update/s.
-        wake: threading.Event = rec.setdefault("wake", threading.Event())
-        wake.wait(DRAFT_REFRESH_SECONDS)
-        wake.clear()
-        if rec["cancel"].wait(0.8):
-            break
-
+# ---- tool progress inside the draft
 
 _TOOL_LABELS: list[tuple[tuple[str, ...], str, str]] = [
     (("terminal", "process"), "💻", "运行命令"),
@@ -477,7 +483,8 @@ def _tool_label(tool_name: str, args: Any) -> str:
         calls = args.get("calls") or []
         if calls and isinstance(calls[0], dict):
             inner = str(calls[0].get("name") or name)
-            return _tool_label(inner, calls[0].get("arguments") or {}) + (f" 等 {len(calls)} 个" if len(calls) > 1 else "")
+            more = f" 等 {len(calls)} 个" if len(calls) > 1 else ""
+            return _tool_label(inner, calls[0].get("arguments") or {}) + more
     icon, verb = "⚙️", name.split("__")[-1]
     for keys, ic, vb in _TOOL_LABELS:
         if any(k in name for k in keys):
@@ -496,10 +503,11 @@ def _tool_label(tool_name: str, args: Any) -> str:
 
 
 def _render_draft(rec: dict[str, Any]) -> str:
+    """Caller holds rec["cv"]."""
     import html as _html
     lines = ["小助手处理中…"]
     if _setting("show_tool_progress", True):
-        steps = list(rec.get("steps") or [])
+        steps = list(rec["steps"])
         hidden = max(0, len(steps) - int(_setting("tool_progress_lines", 5)))
         if hidden:
             lines.append(f"…（前面还有 {hidden} 步）")
@@ -524,14 +532,14 @@ def _on_pre_tool_call(tool_name: str = "", args: Any = None, session_id: str = "
                       tool_call_id: str = "", **_kw: Any) -> None:
     try:
         rec = _rec_for_tool(turn_id, session_id)
-        if rec is None or not rec.get("draft"):
+        if rec is None or not rec["draft"]:
             return None
         step = {"id": tool_call_id or f"{tool_name}:{time.time()}", "label": _tool_label(tool_name, args),
                 "status": "running", "t0": time.time(), "dur": 0.0}
-        with _state["turns_lock"]:
-            rec.setdefault("steps", []).append(step)
+        with rec["cv"]:
+            rec["steps"].append(step)
             del rec["steps"][:-30]
-        rec.setdefault("wake", threading.Event()).set()
+            rec["cv"].notify_all()
     except Exception:
         logger.debug("telegram-enhanced: pre_tool_call progress failed", exc_info=True)
     return None
@@ -541,27 +549,108 @@ def _on_post_tool_call(tool_name: str = "", session_id: str = "", turn_id: Any =
                        status: str = "", duration_ms: int = 0, **_kw: Any) -> None:
     try:
         rec = _rec_for_tool(turn_id, session_id)
-        if rec is None or not rec.get("steps"):
+        if rec is None or not rec["draft"]:
             return
-        with _state["turns_lock"]:
+        with rec["cv"]:
             step = next((st for st in reversed(rec["steps"]) if st["status"] == "running"
                          and (st["id"] == tool_call_id or not tool_call_id)), None)
             if step is None:
                 return
             step["status"] = "ok" if str(status or "ok").lower() in ("ok", "success", "") else "error"
             step["dur"] = (duration_ms / 1000.0) if duration_ms else time.time() - step["t0"]
-        rec.setdefault("wake", threading.Event()).set()
+            rec["cv"].notify_all()
     except Exception:
         logger.debug("telegram-enhanced: post_tool_call progress failed", exc_info=True)
 
 
-def _stop_fire(rec: dict[str, Any], confirm: bool = False) -> None:
-    if not confirm and rec["cancel"].wait(float(_setting("stop_message_delay_seconds", 6))):
-        return
-    with _state["turns_lock"]:
-        if rec["ended"] or rec.get("message_id_sent") or rec.get("sending"):
+# ---- the per-turn worker
+
+def _alive(rec: dict[str, Any]) -> bool:
+    return not rec["ended"] and getattr(sys, "_hte_draft_generation", None) is _GENERATION
+
+
+def _indicator_worker(rec: dict[str, Any]) -> None:
+    try:
+        _stop_cleanup_leftovers(rec["chat_id"], rec["thread_id"])
+        if rec["draft"]:
+            _draft_worker(rec)
+        else:
+            _bubble_worker(rec)
+    except Exception:
+        logger.warning("telegram-enhanced: indicator worker crashed", exc_info=True)
+    finally:
+        with rec["cv"]:
+            rec["inflight"] = False
+            rec["cv"].notify_all()
+
+
+def _draft_worker(rec: dict[str, Any]) -> None:
+    started = time.time()
+    last_sent = 0.0
+    logger.info("telegram-enhanced: processing draft started for chat %s thread %s", rec["chat_id"], rec["thread_id"])
+    while time.time() - started < DRAFT_MAX_SECONDS:
+        with rec["cv"]:
+            if not _alive(rec):
+                return
+            if not rec["draft_on"]:
+                rec["cv"].wait(DRAFT_REFRESH_SECONDS)
+                continue
+            # Build the payload under the lock so the draft_id can't be swapped out from under it.
+            payload: dict[str, Any] = {"chat_id": int(rec["chat_id"]), "draft_id": rec["draft_id"],
+                                       "can_stop": bool(_setting("stop_button_can_stop", True)),
+                                       "rich_message": {"html": _render_draft(rec)}}
+            if rec["thread_id"]:
+                payload["message_thread_id"] = int(rec["thread_id"])
+            rec["inflight"] = True
+        res = _api_timeout("sendRichMessageDraft", payload, DRAFT_HTTP_TIMEOUT)
+        last_sent = time.time()
+        with rec["cv"]:
+            rec["inflight"] = False
+            rec["cv"].notify_all()
+            if not res.get("ok"):
+                logger.info("telegram-enhanced: draft refresh failed: %s", res.get("description"))
+            # Wait for the periodic refresh or a state change (tool event, stop, steer, end) ...
+            if _alive(rec):
+                rec["cv"].wait(DRAFT_REFRESH_SECONDS)
+            # ... but send at most ~1 update/s.
+            while _alive(rec) and time.time() - last_sent < 0.8:
+                rec["cv"].wait(0.8 - (time.time() - last_sent))
+
+
+def _bubble_worker(rec: dict[str, Any]) -> None:
+    with rec["cv"]:
+        rec["cv"].wait_for(lambda: not _alive(rec), float(_setting("stop_message_delay_seconds", 6)))
+        if not _alive(rec):
             return
-        rec["sending"] = True
+    _send_stop_message(rec, confirm=False)
+
+
+def _api_timeout(method: str, payload: dict[str, Any], timeout: float) -> dict[str, Any]:
+    token = _token()
+    if not token:
+        return {"ok": False, "description": "Telegram bot token unavailable"}
+    req = urllib.request.Request(f"https://api.telegram.org/bot{token}/{method}", data=json.dumps(payload).encode(),
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.load(resp)
+    except urllib.error.HTTPError as exc:
+        try:
+            return json.load(exc)
+        except Exception:
+            return {"ok": False, "description": f"HTTP {exc.code}"}
+    except Exception as exc:
+        return {"ok": False, "description": type(exc).__name__}
+
+
+def _send_stop_message(rec: dict[str, Any], confirm: bool) -> None:
+    """Blocking. Sends the 💬 bubble (fallback mode) or the "really stop?" prompt (draft mode)."""
+    slot = "confirm_mid" if confirm else "bubble_mid"
+    with rec["cv"]:
+        if not _alive(rec) or rec.get(slot) or rec.get(slot + "_sending"):
+            return
+        rec[slot + "_sending"] = True
+        stop_epoch = rec["stop_epoch"]
     data = STOP_PREFIX + rec["token"]
     base: dict[str, Any] = {"chat_id": int(rec["chat_id"]), "disable_notification": True}
     if rec["thread_id"]:
@@ -579,86 +668,97 @@ def _stop_fire(rec: dict[str, Any], confirm: bool = False) -> None:
     if not res.get("ok"):
         res = _api("sendMessage", {**base, "text": text, "reply_markup": {
             "inline_keyboard": [[{"text": label, "callback_data": data}]]}})
+    with rec["cv"]:
+        rec[slot + "_sending"] = False
     if not res.get("ok"):
         logger.info("telegram-enhanced: stop message send failed: %s", res.get("description"))
-        rec["sending"] = False
         return
     mid = int(res["result"]["message_id"])
-    store = _stop_store()
-    if store is not None:
-        try:
-            store.set(str(mid), {"chat_id": rec["chat_id"], "thread_id": rec["thread_id"], "ts": time.time()})
-        except Exception:
-            pass
-    with _state["turns_lock"]:
-        rec["message_id_sent"] = mid
-        ended = rec["ended"]
-    if ended:  # the turn finished while we were sending
+    _stop_remember(mid, rec["chat_id"], rec["thread_id"])
+    with rec["cv"]:
+        # Re-check after the send: the turn may have ended, or (for the prompt) the user steered meanwhile.
+        stale = not _alive(rec) or (confirm and (rec["stop_epoch"] != stop_epoch or rec["draft_on"]))
+        if not stale:
+            rec[slot] = mid
+    if stale:
+        logger.info("telegram-enhanced: %s %s became stale while sending; deleting", slot, mid)
         _stop_delete(rec["chat_id"], mid)
 
+
+# ---- turn lifecycle
 
 def _stop_end(rec: dict[str, Any], why: str = "") -> None:
-    logger.info("telegram-enhanced: indicator end key=%s draft=%s why=%s", rec.get("key"), rec.get("draft_id"), why)
+    """Blocking (never call on the event loop). Ends the record, waits for an in-flight draft request so
+    nothing lands after the final reply, then deletes this turn's stop messages."""
+    logger.info("telegram-enhanced: indicator end key=%s why=%s", rec.get("key"), why)
     with _state["turns_lock"]:
+        if _state["stops"].get(rec["key"]) is rec:
+            _state["stops"].pop(rec["key"], None)
+    with rec["cv"]:
         rec["ended"] = True
-        rec["cancel"].set()
-        if rec.get("wake") is not None:
-            rec["wake"].set()
-        mid = rec.get("message_id_sent")
-        _state["stops"].pop(rec["key"], None)
-    # Let an in-flight draft request finish before the final reply goes out, else it reappears after it.
-    lock = rec.get("draft_lock")
-    if lock is not None and lock.acquire(timeout=5):
-        lock.release()
-    if mid:
+        rec["cv"].notify_all()
+        rec["cv"].wait_for(lambda: not rec["inflight"], DRAFT_HTTP_TIMEOUT + 2)
+        mids = [m for m in (rec.pop("confirm_mid", None), rec.pop("bubble_mid", None)) if m]
+    for mid in mids:
         _stop_delete(rec["chat_id"], mid)
+
+
+def _router_ready() -> bool:
+    return bool(_state.get("router_ready")) and bool(_state.get("stop_handler_ready"))
 
 
 def _stop_begin(session_id: str, turn_id: str, parent_session_id: str) -> None:
-    draft = bool(_setting("stop_button", True))
-    if parent_session_id or not (draft or _setting("stop_message", True)):
+    if parent_session_id:
         return  # subagents share the parent's indicator
+    draft = bool(_setting("stop_button", True))
+    if not (draft or _setting("stop_message", True)):
+        return
     chat_id = _session("HERMES_SESSION_CHAT_ID")
     thread_id = _session("HERMES_SESSION_THREAD_ID")
     if _session("HERMES_SESSION_CHAT_TYPE") != "dm" or not chat_id.lstrip("-").isdigit():
         return
     if thread_id and not thread_id.isdigit():
         thread_id = ""
+    if draft and not _router_ready():
+        # Without the update router a native Stop would go nowhere and the draft would just block input.
+        logger.info("telegram-enhanced: update router not ready; using the 💬 fallback this turn")
+        draft = False
     with _state["turns_lock"]:
-        stale = [r for r in _state["stops"].values()
-                 if r["chat_id"] == chat_id and r["thread_id"] == thread_id]
+        stale = [r for r in _state["stops"].values() if r["chat_id"] == chat_id and r["thread_id"] == thread_id]
     for r in stale:  # a new top-level turn here means earlier ones are over (interrupted/steered/rotated)
-        _stop_end(r, "new turn")
+        _spawn(_stop_end, r, "new turn")
     key = turn_id or session_id
-    rec = {"key": key, "session_id": session_id, "chat_id": chat_id, "thread_id": thread_id,
+    lock = threading.Lock()
+    rec = {"key": key, "session_id": session_id, "session_key": _session("HERMES_SESSION_KEY"),
+           "chat_id": chat_id, "thread_id": thread_id,
            "user_id": _session("HERMES_SESSION_USER_ID") or chat_id,
            "user_name": _session("HERMES_SESSION_USER_NAME"),
            "message_id": _session("HERMES_SESSION_MESSAGE_ID"),
-           "token": secrets.token_hex(6), "cancel": threading.Event(), "ended": False,
-           "draft": draft, "draft_id": _draft_id(key), "draft_lock": threading.Lock(),
-           "wake": threading.Event(), "steps": []}
+           "token": secrets.token_hex(6), "cv": threading.Condition(lock), "ended": False, "inflight": False,
+           "draft": draft, "draft_on": True, "draft_id": _draft_id(key), "steps": [],
+           "stop_epoch": 0, "stop_ts": 0.0, "user_msg_ts": 0.0}
     with _state["turns_lock"]:
         _state["stops"][key] = rec
-    logger.info("telegram-enhanced: indicator begin key=%s session=%s draft=%s state=%x",
-                key, session_id, rec["draft_id"], id(_state))
-
-    def run() -> None:
-        _stop_cleanup_leftovers(chat_id, thread_id)
-        if draft:
-            _draft_loop(rec)
-        else:
-            _stop_fire(rec)
-    threading.Thread(target=run, name="tg-enhanced-indicator", daemon=True).start()
+    logger.info("telegram-enhanced: indicator begin key=%s draft=%s", key, draft)
+    _spawn(_indicator_worker, rec, name="tg-enhanced-indicator")
 
 
-def _stop_finish(turn_id: str = "", session_id: str = "", chat_thread: tuple[list[str], None] | None = None) -> None:
+def _stop_finish(turn_id: str = "", session_id: str = "", session_key: str = "") -> None:
     with _state["turns_lock"]:
         recs = list(_state["stops"].values())
     for r in recs:
-        if (turn_id and r["key"] == turn_id) or (session_id and r["session_id"] == session_id) or (
-                chat_thread is not None and r["chat_id"] in chat_thread[0]
-                and (not r["thread_id"] or r["thread_id"] in chat_thread[0])):
-            _stop_end(r, f"finish turn={turn_id} session={session_id} chat={bool(chat_thread)}")
+        if (turn_id and r["key"] == turn_id) or (not turn_id and session_id and r["session_id"] == session_id) \
+                or (session_key and _same_route(r, session_key)):
+            _stop_end(r, f"finish turn={turn_id} session={session_id} key={session_key}")
+
+
+def _same_route(rec: dict[str, Any], session_key: str) -> bool:
+    if rec.get("session_key"):
+        return rec["session_key"] == session_key
+    parts = session_key.split(":")  # agent:<profile>:telegram:dm:<chat>[:<thread>]
+    if rec["thread_id"]:
+        return len(parts) >= 2 and parts[-1] == rec["thread_id"] and parts[-2] == rec["chat_id"]
+    return bool(parts) and parts[-1] == rec["chat_id"]
 
 
 def _on_pre_llm_call(session_id: str = "", platform: str = "", turn_id: Any = "",
@@ -677,11 +777,10 @@ def _on_pre_llm_call(session_id: str = "", platform: str = "", turn_id: Any = ""
 
 def _on_post_llm_call(session_id: str = "", turn_id: Any = "", parent_session_id: str = "", **_kw: Any) -> None:
     # turn_id survives session rotation (compression); fall back to session_id only without it.
-    _stop_finish(turn_id=str(turn_id or ""), session_id="" if turn_id else session_id)
+    _stop_finish(turn_id=str(turn_id or ""), session_id=session_id)
     if parent_session_id:
         return
-    # A plugin reload mid-turn orphans the old generation's record; sweep this topic's stored messages.
-    try:
+    try:  # a plugin reload mid-turn orphans the old generation's messages; sweep this topic
         chat_id = _session("HERMES_SESSION_CHAT_ID")
         thread_id = _session("HERMES_SESSION_THREAD_ID")
         if chat_id.lstrip("-").isdigit():
@@ -693,20 +792,20 @@ def _on_post_llm_call(session_id: str = "", turn_id: Any = "", parent_session_id
         logger.debug("telegram-enhanced: post-turn sweep failed", exc_info=True)
 
 
-def _on_session_end(session_id: str = "", **_kw: Any) -> None:
-    _stop_finish(session_id=session_id)
+def _on_session_end(session_id: str = "", turn_id: Any = "", **_kw: Any) -> None:
+    _stop_finish(turn_id=str(turn_id or ""), session_id=session_id)
 
 
 def _on_loop_stopped(session_key: str = "", **_kw: Any) -> None:
-    # session_key is not the session_id: stop every turn in the same chat/thread.
-    parts = (session_key or "").split(":")
-    if parts:
-        _stop_finish(chat_thread=(parts, None))
+    if session_key:
+        _stop_finish(session_key=session_key)
 
+
+# ---- native Stop on the draft, steering, and the inline stop button
 
 async def _on_stopped_generation(update: Any, _context: Any) -> None:
-    """Telegram's native Stop on the draft: do NOT stop the agent. Retire the draft (frees the input box
-    so the next message is a steer) and ask, with a real stop button, whether to stop."""
+    """Telegram's native Stop: do NOT stop the agent. Pause the draft (frees the input box), then either
+    treat a quick follow-up as a steer or ask, with a real stop button, whether to stop."""
     data = (getattr(update, "api_kwargs", None) or {}).get("stopped_message_generation")
     if not isinstance(data, dict):
         return
@@ -715,73 +814,74 @@ async def _on_stopped_generation(update: Any, _context: Any) -> None:
     except (TypeError, ValueError):
         return
     with _state["turns_lock"]:
-        rec = next((r for r in _state["stops"].values() if r.get("draft_id") == draft_id), None)
-        if rec is not None:
-            rec["draft_off"] = True
+        rec = next((r for r in _state["stops"].values() if r["draft_id"] == draft_id), None)
     if rec is None:
-        with _state["turns_lock"]:
-            known = [(r.get("key"), r.get("draft_id")) for r in _state["stops"].values()]
-        logger.info("telegram-enhanced: native stop for unknown/ended draft %s (%s) known=%s state=%x",
-                    draft_id, type(draft_id).__name__, known, id(_state))
+        logger.info("telegram-enhanced: native stop for unknown/ended draft %s", draft_id)
         return
-    rec["native_stop_ts"] = time.time()
-    threading.Thread(target=_confirm_after_grace, args=(rec,), name="tg-enhanced-confirm", daemon=True).start()
-
-
-def _confirm_after_grace(rec: dict[str, Any]) -> None:
-    """Pressing Stop releases any message the client had queued. If one arrives within the grace window
-    the user was steering, so skip the "really stop?" prompt."""
-    grace = float(_setting("stop_confirm_grace_seconds", 1.0))
-    if rec["cancel"].wait(grace):
-        return
-    followed = rec.get("user_msg_ts", 0) >= rec["native_stop_ts"] - 0.5
-    logger.info("telegram-enhanced: native stop for chat %s thread %s -> %s", rec["chat_id"], rec["thread_id"],
-                "follow-up message arrived, no prompt" if followed else "confirm prompt")
-    if not followed:
-        _stop_fire(rec, True)
-        return
-    # The user steered: bring the bubble (and its Stop) back for the rest of the turn.
-    with _state["turns_lock"]:
-        if rec["ended"] or rec["cancel"].is_set():
+    with rec["cv"]:
+        if rec["ended"] or rec["draft_id"] != draft_id:
             return
-        rec["draft_off"] = False
-        rec["draft_id"] = _draft_id(rec["key"])  # fresh draft; the stopped one may be ignored by the client
-    _draft_loop(rec)
+        rec["draft_on"] = False
+        rec["stop_epoch"] += 1
+        rec["stop_ts"] = time.time()
+        epoch = rec["stop_epoch"]
+        rec["cv"].notify_all()
+    _spawn(_confirm_after_grace, rec, epoch, name="tg-enhanced-confirm")
 
 
-def _note_user_message(update: Any) -> None:
-    msg = getattr(update, "message", None)
-    if msg is None or getattr(getattr(msg, "from_user", None), "is_bot", False):
-        return
-    chat_id = str(getattr(msg, "chat_id", "") or "")
-    thread_id = str(getattr(msg, "message_thread_id", "") or "")
-    now = time.time()
-    sent = getattr(msg, "date", None)
-    if sent is not None and hasattr(sent, "timestamp"):
-        logger.info("telegram-enhanced: user message %s received %.1fs after send",
-                    getattr(msg, "message_id", "?"), now - sent.timestamp())
-    resume = []
+def _confirm_after_grace(rec: dict[str, Any], epoch: int) -> None:
+    grace = float(_setting("stop_confirm_grace_seconds", 1.0))
+    with rec["cv"]:
+        rec["cv"].wait_for(lambda: not _alive(rec) or rec["stop_epoch"] != epoch or rec["draft_on"], grace)
+        if not _alive(rec) or rec["stop_epoch"] != epoch or rec["draft_on"]:
+            return  # ended, stopped again, or a steer already resumed the draft
+    logger.info("telegram-enhanced: native stop for chat %s thread %s -> confirm prompt", rec["chat_id"], rec["thread_id"])
+    _send_stop_message(rec, confirm=True)
+
+
+def _on_user_message(chat_id: str, thread_id: str) -> None:
+    """A user message reached this chat/topic (normalized by the gateway). If the draft is paused by a
+    native Stop, this is a steer: resume the draft and drop the "really stop?" prompt."""
+    drop: list[tuple[dict[str, Any], int]] = []
     with _state["turns_lock"]:
-        for r in _state["stops"].values():
-            if r["chat_id"] == chat_id and (r["thread_id"] or "") == thread_id:
-                r["user_msg_ts"] = now
-                # A steer after the "really stop?" prompt: drop the prompt and bring the bubble back.
-                if r.get("draft_off") and r.get("message_id_sent") and not r["ended"]:
-                    resume.append((r, r.pop("message_id_sent")))
-                    r["sending"] = False
-                    r["draft_off"] = False
-                    r["draft_id"] = _draft_id(r["key"])
-    for r, mid in resume:
-        logger.info("telegram-enhanced: steer after confirm prompt -> delete %s, resume draft", mid)
-        threading.Thread(target=_stop_delete, args=(r["chat_id"], mid), daemon=True).start()
-        threading.Thread(target=_draft_loop, args=(r,), name="tg-enhanced-draft", daemon=True).start()
+        recs = [r for r in _state["stops"].values() if r["chat_id"] == chat_id and (r["thread_id"] or "") == thread_id]
+    for r in recs:
+        with r["cv"]:
+            r["user_msg_ts"] = time.time()
+            if r["ended"] or not r["draft"] or r["draft_on"]:
+                continue
+            r["draft_on"] = True
+            r["draft_id"] = _draft_id(r["key"])  # fresh draft; the stopped one may be ignored by the client
+            mid = r.pop("confirm_mid", None)
+            r["cv"].notify_all()
+        logger.info("telegram-enhanced: steer in chat %s thread %s -> resume draft%s", chat_id, thread_id,
+                    f", delete prompt {mid}" if mid else "")
+        if mid:
+            drop.append((r, mid))
+    for r, mid in drop:
+        _spawn(_stop_delete, r["chat_id"], mid)
+
+
+def _on_pre_gateway_dispatch(event: Any = None, **_kw: Any) -> None:
+    try:
+        src = getattr(event, "source", None)
+        platform = str(getattr(getattr(src, "platform", None), "value", getattr(src, "platform", "")) or "")
+        if src is None or platform.lower() != "telegram" or getattr(src, "is_bot", False):
+            return None
+        chat_id = str(getattr(src, "chat_id", "") or "")
+        thread_id = str(getattr(src, "thread_id", "") or "")
+        if chat_id:
+            _on_user_message(chat_id, thread_id if thread_id.isdigit() else "")
+    except Exception:
+        logger.debug("telegram-enhanced: pre_gateway_dispatch observer failed", exc_info=True)
+    return None
 
 
 async def _route_new_updates(update: Any, context: Any) -> None:
-    try:
-        _note_user_message(update)
-    except Exception:
-        logger.debug("telegram-enhanced: note user message failed", exc_info=True)
+    msg = getattr(update, "message", None)
+    if msg is not None and getattr(msg, "date", None) is not None and hasattr(msg.date, "timestamp"):
+        logger.info("telegram-enhanced: user message %s received %.1fs after send",
+                    getattr(msg, "message_id", "?"), time.time() - msg.date.timestamp())
     kw = getattr(update, "api_kwargs", None) or {}
     if "stopped_message_generation" in kw:
         await _on_stopped_generation(update, context)
@@ -826,11 +926,11 @@ def _ensure_stop_handler(native: Any) -> None:
     _ensure_update_router(native)
     group0 = handlers.setdefault(0, [])
     # PTB handlers use __slots__, so identify ours by callback name (any plugin generation).
-    if any(getattr(getattr(h, "callback", None), "__name__", "") == "_stop_button_dispatch" for h in group0):
-        return
-    from telegram.ext import CallbackQueryHandler
-    group0.insert(0, CallbackQueryHandler(_stop_button_dispatch, pattern=r"^" + STOP_PREFIX))
-    logger.info("telegram-enhanced: stop-button callback handler installed")
+    if not any(getattr(getattr(h, "callback", None), "__name__", "") == "_stop_button_dispatch" for h in group0):
+        from telegram.ext import CallbackQueryHandler
+        group0.insert(0, CallbackQueryHandler(_stop_button_dispatch, pattern=r"^" + STOP_PREFIX))
+        logger.info("telegram-enhanced: stop-button callback handler installed")
+    _state["stop_handler_ready"] = True
 
 
 async def _new_updates_dispatch(update: Any, context: Any) -> None:
@@ -852,13 +952,13 @@ def _ensure_update_router(native: Any) -> None:
             native.remove_handler(h, group=-7)
         except Exception:
             pass
-    if any(getattr(getattr(h, "callback", None), "__name__", "") == "_new_updates_dispatch"
-           for h in handlers.get(-7, [])):
-        return
-    from telegram import Update
-    from telegram.ext import TypeHandler
-    native.add_handler(TypeHandler(Update, _new_updates_dispatch), group=-7)
-    logger.info("telegram-enhanced: update router installed")
+    if not any(getattr(getattr(h, "callback", None), "__name__", "") == "_new_updates_dispatch"
+               for h in handlers.get(-7, [])):
+        from telegram import Update
+        from telegram.ext import TypeHandler
+        native.add_handler(TypeHandler(Update, _new_updates_dispatch), group=-7)
+        logger.info("telegram-enhanced: update router installed")
+    _state["router_ready"] = True
 
 
 async def _on_stop_button(update: Any, _context: Any) -> None:
@@ -868,22 +968,22 @@ async def _on_stop_button(update: Any, _context: Any) -> None:
     m = _STOP_DATA_RE.match(getattr(query, "data", "") or "")
     with _state["turns_lock"]:
         rec = next((r for r in _state["stops"].values() if m and r["token"] == m.group(1)), None)
-    if rec is None:
+    msg = getattr(query, "message", None)
+    if rec is None or rec["ended"]:
         logger.info("telegram-enhanced: stop press for unknown/ended turn")
         await query.answer(text="这一轮已经结束了")
-        try:
-            msg = getattr(query, "message", None)
-            if msg is not None:
-                _stop_delete(str(msg.chat_id), int(msg.message_id))
-        except Exception:
-            pass
+        if msg is not None:
+            _spawn(_stop_delete, str(msg.chat_id), int(msg.message_id))
         return
     if str(getattr(getattr(query, "from_user", None), "id", "")) != str(rec["user_id"]):
         await query.answer(text="这个按钮不是给你的")
         return
-    await query.answer(text="已停止")
-    _stop_end(rec)
-    await _dispatch_stop(rec)
+    # Re-validate right before dispatching: /stop targets the chat, so never send it for a stale turn.
+    with _state["turns_lock"]:
+        current = _state["stops"].get(rec["key"]) is rec and not rec["ended"]
+    ok = current and await _dispatch_stop(rec)
+    await query.answer(text="已停止" if ok else ("这一轮已经结束了" if not current else "停止失败，请发 /stop"))
+    _spawn(_stop_end, rec, "stop button")
 
 
 # ---------------------------------------------------------------- guest mode
@@ -1042,7 +1142,8 @@ def _patch_telegram_lists() -> None:
     pre_llm_call because the platform plugin may (re)load after this plugin registers.
     """
     candidates = []
-    if not _state.get("gc_scanned"):
+    if not _state.get("gc_scanned") or (not _router_ready() and time.time() - _state.get("gc_scanned_at", 0) > 60):
+        _state["gc_scanned_at"] = time.time()
         # A plugin reload re-imports the adapter module, so the instance that actually sends can be an
         # orphaned class. Find live instances once per plugin load.
         _state["gc_scanned"] = True
@@ -1160,6 +1261,7 @@ def register(ctx: Any) -> None:
     ctx.register_hook("pre_llm_call", _on_pre_llm_call)
     ctx.register_hook("post_llm_call", _on_post_llm_call)
     ctx.register_hook("pre_tool_call", _on_pre_tool_call)
+    ctx.register_hook("pre_gateway_dispatch", _on_pre_gateway_dispatch)
     ctx.register_hook("post_tool_call", _on_post_tool_call)
     ctx.register_hook("on_session_end", _on_session_end)
     ctx.register_hook("agent_loop_stopped", _on_loop_stopped)
@@ -1186,14 +1288,6 @@ def register(ctx: Any) -> None:
     def _cleanup() -> None:
         with _state["turns_lock"]:
             recs = list(_state["stops"].values())
-        for rec in recs:
-            rec["cancel"].set()
-            if rec.get("wake") is not None:
-                rec["wake"].set()
-            mid = rec.get("message_id_sent")
-            if mid:  # don't leave this generation's confirm/💬 message behind
-                try:
-                    _stop_delete(rec["chat_id"], mid)
-                except Exception:
-                    pass
+        for rec in recs:  # same terminal transition as a normal turn end, off the caller's thread
+            _spawn(_stop_end, rec, "plugin unload")
     ctx.on_unload(_cleanup)
