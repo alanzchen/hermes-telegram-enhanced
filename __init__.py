@@ -491,8 +491,9 @@ def _tool_label(tool_name: str, args: Any) -> str:
             icon, verb = ic, vb
             break
     code = _command_text(name, args)
-    if code:  # commands keep their own line breaks; long lines wrap instead of being cut
-        return f"{verb}\n" + "\n".join(_wrap_command(code))
+    if code:  # say what the command is for, not the command itself
+        purpose = _command_purpose(code)
+        return f"{verb}：{purpose}" if purpose else verb
     detail = ""
     try:
         from agent.display import build_tool_preview
@@ -516,6 +517,36 @@ def _command_text(name: str, args: Any) -> str:
         return str(args.get("command") or "")
     if "execute_code" in name or name == "browser_exec" or name.endswith("__browser_exec"):
         return str(args.get("code") or "")
+    return ""
+
+
+_CMD_HINTS: list[tuple[tuple[str, ...], str]] = [
+    (("git push",), "推送代码"), (("git commit",), "提交代码"), (("git ",), "查看代码版本"),
+    (("unittest", "pytest", "sim.py", "py_compile"), "跑测试"),
+    (("reload_gateway_plugins", "gateway restart"), "重新加载 bot"),
+    (("paseo",), "在 Mac Studio 上操作"), (("op read",), "读取密码库"),
+    (("curl ", "wget ", "api.telegram.org"), "访问网络"),
+    (("grep ", "rg ", "awk "), "搜索文件内容"), (("find ", "ls "), "查看目录"),
+    (("cat ", "sed -n", "head ", "tail "), "读取文件"), (("sleep ",), "等待"),
+    (("pip ", "uv ", "npm ", "apt"), "安装依赖"), (("cp ", "mv ", "mkdir "), "整理文件"),
+    (("python", "node "), "运行脚本"),
+]
+
+
+def _command_purpose(code: str) -> str:
+    """The model's own one-line '# purpose' comment if present, else a rough guess from the command."""
+    for ln in code.strip().splitlines():
+        ln = ln.strip()
+        if not ln:
+            continue
+        if ln.startswith("#") and not ln.startswith("#!"):
+            text = ln.lstrip("#").strip()
+            return text[:40] + ("…" if len(text) > 40 else "")
+        break
+    low = code.lower()
+    for keys, label in _CMD_HINTS:
+        if any(k in low for k in keys):
+            return label
     return ""
 
 
@@ -574,7 +605,9 @@ def _render_draft(rec: dict[str, Any]) -> str:
             errs = sum(1 for st in done if st["status"] != "ok")
             lines.append(" · ".join(parts) + (f"（{errs} 次出错）" if errs else ""))
         for st in [st for st in steps if st["status"] == "running"][-2:]:
-            lines.append(f"正在{_step_verb(st['label'])} · {_fmt_secs(now - st['t0'])}")
+            head = str(st["label"]).split("\n", 1)[0]
+            what = head.split("：", 1)[1] if "：" in head else head
+            lines.append(f"正在{what} · {_fmt_secs(now - st['t0'])}")
     # Rich HTML collapses newlines like a browser; <br> is the documented line break.
     return "<tg-thinking>" + "<br>".join(_html.escape(x, quote=False) for x in lines) + "</tg-thinking>"
 
