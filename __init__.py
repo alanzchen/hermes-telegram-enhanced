@@ -661,12 +661,11 @@ def _ensure_stop_handler(native: Any) -> None:
     if not isinstance(handlers, dict):
         return
     group0 = handlers.setdefault(0, [])
-    if any(getattr(h, "_hte_stop", False) for h in group0):
+    # PTB handlers use __slots__, so identify ours by callback name (any plugin generation).
+    if any(getattr(getattr(h, "callback", None), "__name__", "") == "_stop_button_dispatch" for h in group0):
         return
     from telegram.ext import CallbackQueryHandler
-    h = CallbackQueryHandler(_stop_button_dispatch, pattern=r"^" + STOP_PREFIX)
-    h._hte_stop = True
-    group0.insert(0, h)
+    group0.insert(0, CallbackQueryHandler(_stop_button_dispatch, pattern=r"^" + STOP_PREFIX))
     logger.info("telegram-enhanced: stop-button callback handler installed")
 
 
@@ -863,7 +862,10 @@ def _patch_telegram_lists() -> None:
                     if app is not None:
                         if _state.get("adapter") is None:
                             _state["adapter"] = obj
-                        _ensure_stop_handler(app)
+                        try:
+                            _ensure_stop_handler(app)
+                        except Exception:
+                            logger.warning("telegram-enhanced: stop handler install failed", exc_info=True)
                     logger.info("telegram-enhanced: found live adapter %s id=%x patched=%s",
                                 type(obj).__module__, id(type(obj)),
                                 bool(type(obj).__dict__.get(_LIST_PATCH_MARK)))
