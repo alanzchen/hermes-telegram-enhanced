@@ -123,11 +123,12 @@ class BulletTests(unittest.TestCase):
         self.assertEqual(core.bulletize_plain(src),
                          "看这里:\n• **一**: a\n• 二\n  ◦ 子项\n• 三\n**粗体** 不动\n---\n1. 编号不动")
 
-    def test_code_and_rich_untouched(self):
-        code = "```\n- keep\n```\n- go"
-        self.assertEqual(core.bulletize_plain(code), "```\n- keep\n```\n• go")
-        for rich in ("- [ ] task\n- other", "| a | b |\n|---|---|\n| 1 | 2 |\n- x", "<details>\n- x\n</details>"):
-            self.assertEqual(core.bulletize_plain(rich), rich)
+    def test_code_untouched_and_rich_shapes_still_bulletized(self):
+        self.assertEqual(core.bulletize_plain("```\n- keep\n```\n- go"), "```\n- keep\n```\n• go")
+        self.assertEqual(core.bulletize_plain("YAML: ```yaml\n- keep\n```\n- go"), "YAML: ```yaml\n- keep\n```\n• go")
+        self.assertEqual(core.bulletize_plain("```\n~~~\n- keep\n```"), "```\n~~~\n- keep\n```")
+        self.assertEqual(core.bulletize_plain("- [ ] task\n- other"), "- [ ] task\n• other")
+        self.assertEqual(core.bulletize_plain("| a | b |\n|---|---|\n- x"), "| a | b |\n|---|---|\n• x")
         self.assertEqual(core.bulletize_plain("no list"), "no list")
 
 

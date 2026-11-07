@@ -201,54 +201,47 @@ def expand_time_placeholders(text: str, display_tz: str = DEFAULT_TZ) -> str:
 
 # ---------------------------------------------------------------- maps & galleries
 
-_FENCE_RE = re.compile(r"^\s*(```|~~~)")
+_CODE_SPLIT_RE = re.compile(r"(```[\s\S]*?```|~~~[\s\S]*?~~~)")  # same fence notion as the adapter
 _LIST_ITEM_RE = re.compile(r"^([ \t]*)[-*+][ \t]+(?!\[[ xX]\][ \t])(\S.*)$")
-_RICH_TABLE_SEP_RE = re.compile(r"^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$")
-_RICH_TASK_RE = re.compile(r"(?m)^\s*[-*]\s+\[[ xX]\]\s+")
-_RICH_DETAILS_RE = re.compile(r"(?m)^</?(details|summary)\b")
-
-
-def likely_rich(text: str) -> bool:
-    """Mirror of the adapter's rich gate: these replies go via sendRichMessage, which renders real lists."""
-    return bool(any(_RICH_TABLE_SEP_RE.match(line) for line in text.splitlines())
-                or _RICH_TASK_RE.search(text) or _RICH_DETAILS_RE.search(text) or "$$" in text)
-
-
 _ANY_LIST_RE = re.compile(r"^[ \t]*(?:[-*+]|\d{1,3}[.)])[ \t]+\S")
+
+
+def _prose_lines(text: str):
+    """Yield (segment_index, line_index, line, is_line_start) for text outside code fences."""
+    for si, seg in enumerate(_CODE_SPLIT_RE.split(text or "")):
+        if si % 2:
+            continue
+        for li, line in enumerate(seg.split("\n")):
+            # the first line of a segment that follows a fence is the tail of the fence line
+            yield si, li, line, not (si > 0 and li == 0)
 
 
 def has_markdown_list(text: str) -> bool:
     """True when a Markdown list item appears outside code fences (rich messages render real lists)."""
-    in_fence = False
-    for line in (text or "").split("\n"):
-        if _FENCE_RE.match(line):
-            in_fence = not in_fence
-        elif not in_fence and _ANY_LIST_RE.match(line):
-            return True
-    return False
+    return any(start and _ANY_LIST_RE.match(line) for _, _, line, start in _prose_lines(text))
 
 
 def bulletize_plain(text: str) -> str:
     """MarkdownV2 has no list syntax: ``- item`` arrives as a literal hyphen. Use real bullet glyphs.
 
-    Top-level items become ``• ``, indented ones ``  ◦ ``. Code fences and replies bound for the rich
-    endpoint are left untouched.
+    Top-level items become ``• ``, indented ones ``  ◦ ``. Code fences and task-list items are untouched.
     """
-    if not text or likely_rich(text):
+    if not text:
         return text
-    out, in_fence, changed = [], False, False
-    for line in text.split("\n"):
-        if _FENCE_RE.match(line):
-            in_fence = not in_fence
-            out.append(line)
-            continue
-        m = None if in_fence else _LIST_ITEM_RE.match(line)
-        if m:
-            indent = len(m.group(1).expandtabs(4))
-            line = ("  ◦ " if indent >= 2 else "• ") + m.group(2)
-            changed = True
-        out.append(line)
-    return "\n".join(out) if changed else text
+    parts = _CODE_SPLIT_RE.split(text)
+    changed = False
+    for si in range(0, len(parts), 2):
+        lines = parts[si].split("\n")
+        for li, line in enumerate(lines):
+            if si > 0 and li == 0:
+                continue
+            m = _LIST_ITEM_RE.match(line)
+            if m:
+                indent = len(m.group(1).expandtabs(4))
+                lines[li] = ("  ◦ " if indent >= 2 else "• ") + m.group(2)
+                changed = True
+        parts[si] = "\n".join(lines)
+    return "".join(parts) if changed else text
 
 
 def render_maps(maps: Any) -> str:

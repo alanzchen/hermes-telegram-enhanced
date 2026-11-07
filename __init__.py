@@ -634,7 +634,11 @@ def _on_transform_output(response_text: str = "", platform: str = "", **_kw: Any
 
 # ---------------------------------------------------------------- native lists
 
-_LIST_PATCH_MARK = "_hte_native_lists"
+_LIST_PATCH_MARK = "_hte_native_lists_v2"
+_LEGACY_LIST_PATCH_MARK = "_hte_native_lists"
+# Wrappers resolve helpers at call time, so a plugin reload updates the behaviour of an already-patched
+# live adapter class instead of leaving the first generation's code bound in.
+sys._hte_list_helpers = (has_markdown_list, bulletize_plain)
 
 
 def _patch_telegram_lists() -> None:
@@ -674,13 +678,22 @@ def _patch_telegram_lists() -> None:
         if (not isinstance(cls, type) or cls.__dict__.get(_LIST_PATCH_MARK)
                 or not hasattr(cls, "_needs_rich_rendering") or not hasattr(cls, "format_message")):
             continue
-        orig_need, orig_fmt = cls._needs_rich_rendering, cls.format_message
+        need, fmt = cls._needs_rich_rendering, cls.format_message
+        if cls.__dict__.get(_LEGACY_LIST_PATCH_MARK):  # wrapped by an earlier generation: unwrap once
+            need, fmt = need.__defaults__[0], fmt.__defaults__[0]
+        cls._hte_orig_needs_rich = cls.__dict__.get("_hte_orig_needs_rich", need)
+        cls._hte_orig_format = cls.__dict__.get("_hte_orig_format", fmt)
 
-        def _needs_rich(self, content, _orig=orig_need):
-            return bool(_orig(self, content) or has_markdown_list(content))
+        def _needs_rich(self, content):
+            helpers = getattr(sys, "_hte_list_helpers", None)
+            base = type(self)._hte_orig_needs_rich(self, content)
+            return bool(base or (helpers and helpers[0](content)))
 
-        def _format(self, content, _orig=orig_fmt):
-            return _orig(self, bulletize_plain(content) if isinstance(content, str) else content)
+        def _format(self, content):
+            helpers = getattr(sys, "_hte_list_helpers", None)
+            if helpers and isinstance(content, str):
+                content = helpers[1](content)
+            return type(self)._hte_orig_format(self, content)
 
         cls._needs_rich_rendering, cls.format_message = _needs_rich, _format
         setattr(cls, _LIST_PATCH_MARK, True)
