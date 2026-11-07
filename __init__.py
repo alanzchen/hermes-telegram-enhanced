@@ -647,6 +647,29 @@ async def _dispatch_stop(rec: dict[str, Any]) -> bool:
         return False
 
 
+async def _stop_button_dispatch(update: Any, context: Any) -> None:
+    """Wired once into PTB; resolves the CURRENT plugin generation's handler, because a plugin reload
+    does not re-run native handler factories."""
+    handler = getattr(sys, "_hte_stop_button", None)
+    if handler is not None:
+        await handler(update, context)
+
+
+def _ensure_stop_handler(native: Any) -> None:
+    """Put an ``hs:`` CallbackQueryHandler ahead of core's catch-all in group 0 (once per PTB app)."""
+    handlers = getattr(native, "handlers", None)
+    if not isinstance(handlers, dict):
+        return
+    group0 = handlers.setdefault(0, [])
+    if any(getattr(h, "_hte_stop", False) for h in group0):
+        return
+    from telegram.ext import CallbackQueryHandler
+    h = CallbackQueryHandler(_stop_button_dispatch, pattern=r"^" + STOP_PREFIX)
+    h._hte_stop = True
+    group0.insert(0, h)
+    logger.info("telegram-enhanced: stop-button callback handler installed")
+
+
 async def _on_stop_button(update: Any, _context: Any) -> None:
     query = getattr(update, "callback_query", None)
     if query is None:
@@ -836,6 +859,11 @@ def _patch_telegram_lists() -> None:
             try:
                 if type(obj).__name__ == "TelegramAdapter" and hasattr(obj, "format_message"):
                     candidates.append(type(obj))
+                    app = getattr(obj, "_app", None)
+                    if app is not None:
+                        if _state.get("adapter") is None:
+                            _state["adapter"] = obj
+                        _ensure_stop_handler(app)
                     logger.info("telegram-enhanced: found live adapter %s id=%x patched=%s",
                                 type(obj).__module__, id(type(obj)),
                                 bool(type(obj).__dict__.get(_LIST_PATCH_MARK)))
@@ -916,6 +944,7 @@ def register(ctx: Any) -> None:
     _state["guests"] = JsonStore(root, "guests.json")
     _state["meta"] = JsonStore(root, "meta.json")
     _state["stopmsgs"] = JsonStore(root, "stopmsgs.json")
+    sys._hte_stop_button = _on_stop_button
     try:
         _state["pending"].ensure()
     except OSError:
@@ -952,7 +981,7 @@ def register(ctx: Any) -> None:
         if token:
             _state["token"] = token
         native.add_handler(CallbackQueryHandler(_make_callback(ctx), pattern=r"^" + CALLBACK_PREFIX))
-        native.add_handler(CallbackQueryHandler(_on_stop_button, pattern=r"^" + STOP_PREFIX))
+        _ensure_stop_handler(native)
 
         async def _route_new_updates(update: Any, context: Any) -> None:
             kw = getattr(update, "api_kwargs", None) or {}
