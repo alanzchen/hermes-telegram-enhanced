@@ -538,24 +538,43 @@ def _wrap_command(code: str) -> list[str]:
     return out
 
 
+_TALLY_UNITS = {"运行命令": "跑了 {n} 条命令", "读取文件": "读了 {n} 个文件", "修改文件": "改了 {n} 个文件",
+                "查找文件": "查找 {n} 次", "搜索": "搜索 {n} 次", "读取网页": "读了 {n} 个网页",
+                "操作浏览器": "操作浏览器 {n} 次", "运行代码": "跑了 {n} 段代码", "派给子代理": "派了 {n} 个子代理",
+                "发 Telegram 消息": "发了 {n} 条消息", "查看技能": "看了 {n} 个技能", "查记忆": "查了 {n} 次记忆",
+                "看图片": "看了 {n} 张图"}
+
+
+def _step_verb(label: str) -> str:
+    return str(label).split("\n", 1)[0].split("：", 1)[0].split(" 等 ", 1)[0].strip()
+
+
+def _fmt_secs(sec: float) -> str:
+    sec = int(sec)
+    return f"{sec // 60}m{sec % 60:02d}s" if sec >= 60 else f"{sec}s"
+
+
 def _render_draft(rec: dict[str, Any]) -> str:
-    """Caller holds rec["cv"]."""
+    """Caller holds rec["cv"]. Turn-summary style: a one-line tally of finished tools plus what is running now."""
     import html as _html
-    lines = ["小助手处理中…"]
+    now = time.time()
+    lines = [f"小助手处理中… · {_fmt_secs(now - rec.get('t0', now))}"]
     if _setting("show_tool_progress", True):
         steps = list(rec["steps"])
-        hidden = max(0, len(steps) - int(_setting("tool_progress_lines", 5)))
-        if hidden:
-            lines.append(f"…（前面还有 {hidden} 步）")
-        now = time.time()
-        for st in steps[hidden:]:
-            head, *body = str(st["label"]).split("\n")
-            if st["status"] == "running":
-                lines.append(f"… {head} · {now - st['t0']:.0f}s")
-            else:
-                mark = "✓" if st["status"] == "ok" else "✗"
-                lines.append(f"{mark} {head} · {st['dur']:.1f}s")
-            lines.extend("\u2003\u2003" + b for b in body)  # em spaces: rich HTML collapses ASCII runs
+        done = [st for st in steps if st["status"] != "running"]
+        if done:
+            counts: dict[str, int] = {}
+            for st in done:
+                v = _step_verb(st["label"])
+                counts[v] = counts.get(v, 0) + 1
+            parts = [(_TALLY_UNITS.get(v) or (v + " {n} 次")).format(n=n)
+                     for v, n in sorted(counts.items(), key=lambda kv: -kv[1])]
+            if len(parts) > 4:
+                parts = parts[:4] + [f"等 {len(counts)} 类"]
+            errs = sum(1 for st in done if st["status"] != "ok")
+            lines.append(" · ".join(parts) + (f"（{errs} 次出错）" if errs else ""))
+        for st in [st for st in steps if st["status"] == "running"][-2:]:
+            lines.append(f"正在{_step_verb(st['label'])} · {_fmt_secs(now - st['t0'])}")
     # Rich HTML collapses newlines like a browser; <br> is the documented line break.
     return "<tg-thinking>" + "<br>".join(_html.escape(x, quote=False) for x in lines) + "</tg-thinking>"
 
@@ -798,7 +817,7 @@ def _stop_begin(session_id: str, turn_id: str, parent_session_id: str) -> None:
            "user_name": _session("HERMES_SESSION_USER_NAME"),
            "message_id": _session("HERMES_SESSION_MESSAGE_ID"),
            "token": secrets.token_hex(6), "cv": threading.Condition(lock), "ended": False, "inflight": False,
-           "draft": draft, "draft_on": True, "draft_id": _draft_id(key), "steps": [],
+           "draft": draft, "draft_on": True, "t0": time.time(), "draft_id": _draft_id(key), "steps": [],
            "stop_epoch": 0, "stop_ts": 0.0, "user_msg_ts": 0.0}
     with _state["turns_lock"]:
         _state["stops"][key] = rec
