@@ -214,6 +214,20 @@ def likely_rich(text: str) -> bool:
                 or _RICH_TASK_RE.search(text) or _RICH_DETAILS_RE.search(text) or "$$" in text)
 
 
+_ANY_LIST_RE = re.compile(r"^[ \t]*(?:[-*+]|\d{1,3}[.)])[ \t]+\S")
+
+
+def has_markdown_list(text: str) -> bool:
+    """True when a Markdown list item appears outside code fences (rich messages render real lists)."""
+    in_fence = False
+    for line in (text or "").split("\n"):
+        if _FENCE_RE.match(line):
+            in_fence = not in_fence
+        elif not in_fence and _ANY_LIST_RE.match(line):
+            return True
+    return False
+
+
 def bulletize_plain(text: str) -> str:
     """MarkdownV2 has no list syntax: ``- item`` arrives as a literal hyphen. Use real bullet glyphs.
 

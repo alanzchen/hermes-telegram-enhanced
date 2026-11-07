@@ -17,6 +17,7 @@ import hashlib
 import json
 import logging
 import os
+import sys
 import threading
 import time
 import urllib.error
@@ -27,7 +28,7 @@ from typing import Any
 from .core import (
     CALLBACK_PREFIX, DEFAULT_TZ, ButtonSpecError, JsonStore, PendingStore, card_key, choice_injection_text,
     choice_list, compose_markdown, expand_time_placeholders, new_request_id, normalize_buttons,
-    parse_callback_data, time_fallback, parse_when, TIME_PLACEHOLDER_RE, bulletize_plain,
+    parse_callback_data, time_fallback, parse_when, TIME_PLACEHOLDER_RE, bulletize_plain, has_markdown_list,
 )
 
 logger = logging.getLogger("hermes_plugins.telegram_enhanced")
@@ -388,6 +389,10 @@ def _draft_loop(rec: dict[str, Any]) -> None:
 
 def _on_pre_llm_call(session_id: str = "", platform: str = "", **_kw: Any) -> None:
     try:
+        _patch_telegram_lists()
+    except Exception:
+        logger.debug("telegram-enhanced: list patch failed", exc_info=True)
+    try:
         if not _setting("stop_button", True) or (platform or "").lower() != "telegram" or not session_id:
             return None
         chat_id = _session("HERMES_SESSION_CHAT_ID")
@@ -601,9 +606,40 @@ def _on_transform_output(response_text: str = "", platform: str = "", **_kw: Any
             except Exception:
                 return m.group(0)
         text = TIME_PLACEHOLDER_RE.sub(repl, text)
-    if str(platform or "").lower() == "telegram":
-        text = bulletize_plain(text)
     return text if text != response_text else None
+
+
+# ---------------------------------------------------------------- native lists
+
+_LIST_PATCH_MARK = "_hte_native_lists"
+
+
+def _patch_telegram_lists() -> None:
+    """Send replies containing Markdown lists via sendRichMessage (native lists); if a reply still
+    lands on MarkdownV2 (rich ineligible or rejected), show bullet glyphs instead of literal hyphens.
+
+    Hermes core is read-only, so wrap the live TelegramAdapter class(es). Idempotent; re-run from
+    pre_llm_call because the platform plugin may (re)load after this plugin registers.
+    """
+    for mod in list(sys.modules.values()):
+        try:
+            cls = getattr(mod, "TelegramAdapter", None)
+        except Exception:
+            continue
+        if (not isinstance(cls, type) or cls.__dict__.get(_LIST_PATCH_MARK)
+                or not hasattr(cls, "_needs_rich_rendering") or not hasattr(cls, "format_message")):
+            continue
+        orig_need, orig_fmt = cls._needs_rich_rendering, cls.format_message
+
+        def _needs_rich(self, content, _orig=orig_need):
+            return bool(_orig(self, content) or has_markdown_list(content))
+
+        def _format(self, content, _orig=orig_fmt):
+            return _orig(self, bulletize_plain(content) if isinstance(content, str) else content)
+
+        cls._needs_rich_rendering, cls.format_message = _needs_rich, _format
+        setattr(cls, _LIST_PATCH_MARK, True)
+        logger.info("telegram-enhanced: native list rendering enabled on %s.%s", cls.__module__, cls.__name__)
 
 
 # ---------------------------------------------------------------- registration
@@ -634,6 +670,10 @@ def _extend_allowed_updates() -> None:
 
 def register(ctx: Any) -> None:
     _state["ctx"] = ctx
+    try:
+        _patch_telegram_lists()
+    except Exception:
+        logger.debug("telegram-enhanced: list patch failed", exc_info=True)
     root = _profile_home() / "telegram-enhanced"
     _state["pending"] = PendingStore(root)
     _state["cards"] = JsonStore(root, "cards.json")

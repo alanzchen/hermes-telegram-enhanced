@@ -130,5 +130,13 @@ class BulletTests(unittest.TestCase):
             self.assertEqual(core.bulletize_plain(rich), rich)
         self.assertEqual(core.bulletize_plain("no list"), "no list")
 
+
+class NativeListTests(unittest.TestCase):
+    def test_list_detection(self):
+        self.assertTrue(core.has_markdown_list("hi\n- a"))
+        self.assertTrue(core.has_markdown_list("1. a\n2. b"))
+        self.assertFalse(core.has_markdown_list("**bold** text\n---\nplain"))
+        self.assertFalse(core.has_markdown_list("```\n- in code\n```"))
+
 if __name__ == "__main__":
     unittest.main()
