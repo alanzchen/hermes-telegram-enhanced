@@ -386,7 +386,7 @@ STOP_BUTTON_LABEL = "⏹"
 STOP_CONFIRM_TEXT = "要停止这一轮吗？不停的话，直接发消息就是插话"
 STOP_CONFIRM_LABEL = "⏹ 停止"
 STOP_MESSAGE_MARKDOWN = "_Thinking…_"
-DRAFT_HTTP_TIMEOUT = 6
+DRAFT_HTTP_TIMEOUT = 4
 STOPMSG_MAX_AGE = 47 * 3600  # bots cannot delete messages older than 48h
 
 _GENERATION = object()
@@ -523,8 +523,8 @@ def _render_draft(rec: dict[str, Any]) -> str:
 
 def _rec_for_tool(turn_id: Any, session_id: str) -> dict[str, Any] | None:
     with _state["turns_lock"]:
-        if turn_id and str(turn_id) in _state["stops"]:
-            return _state["stops"][str(turn_id)]
+        if turn_id:
+            return _state["stops"].get(str(turn_id))
         return next((r for r in _state["stops"].values() if session_id and r["session_id"] == session_id), None)
 
 
@@ -607,6 +607,10 @@ def _draft_worker(rec: dict[str, Any]) -> None:
         with rec["cv"]:
             rec["inflight"] = False
             rec["cv"].notify_all()
+            late = rec["ended"] and rec.get("end_released") and res.get("ok")
+        if late:
+            _clear_late_draft(rec)
+            return
             if not res.get("ok"):
                 logger.info("telegram-enhanced: draft refresh failed: %s", res.get("description"))
             # Wait for the periodic refresh or a state change (tool event, stop, steer, end) ...
@@ -615,6 +619,18 @@ def _draft_worker(rec: dict[str, Any]) -> None:
             # ... but send at most ~1 update/s.
             while _alive(rec) and time.time() - last_sent < 0.8:
                 rec["cv"].wait(0.8 - (time.time() - last_sent))
+
+
+def _clear_late_draft(rec: dict[str, Any]) -> None:
+    """A draft request outlived the turn's end wait and may have landed after the final reply. Any bot
+    message clears a draft, so post and delete a silent placeholder."""
+    base: dict[str, Any] = {"chat_id": int(rec["chat_id"]), "disable_notification": True, "text": "·"}
+    if rec["thread_id"]:
+        base["message_thread_id"] = int(rec["thread_id"])
+    res = _api("sendMessage", base)
+    logger.info("telegram-enhanced: late draft after turn end -> clearing (%s)", res.get("ok"))
+    if res.get("ok"):
+        _stop_delete(rec["chat_id"], int(res["result"]["message_id"]))
 
 
 def _bubble_worker(rec: dict[str, Any]) -> None:
@@ -683,6 +699,12 @@ def _send_stop_message(rec: dict[str, Any], confirm: bool) -> None:
     if stale:
         logger.info("telegram-enhanced: %s %s became stale while sending; deleting", slot, mid)
         _stop_delete(rec["chat_id"], mid)
+        if confirm:
+            with rec["cv"]:
+                again = _alive(rec) and not rec["draft_on"] and rec["stop_epoch"] != stop_epoch \
+                    and not rec.get("confirm_mid") and not rec.get("confirm_mid_sending")
+            if again:  # a newer Stop's grace expired while this send blocked it
+                _send_stop_message(rec, confirm=True)
 
 
 # ---- turn lifecycle
@@ -697,7 +719,8 @@ def _stop_end(rec: dict[str, Any], why: str = "") -> None:
     with rec["cv"]:
         rec["ended"] = True
         rec["cv"].notify_all()
-        rec["cv"].wait_for(lambda: not rec["inflight"], DRAFT_HTTP_TIMEOUT + 2)
+        if not rec["cv"].wait_for(lambda: not rec["inflight"], DRAFT_HTTP_TIMEOUT + 2):
+            rec["end_released"] = True  # the worker clears the draft if that request still lands
         mids = [m for m in (rec.pop("confirm_mid", None), rec.pop("bubble_mid", None)) if m]
     for mid in mids:
         _stop_delete(rec["chat_id"], mid)
@@ -725,8 +748,8 @@ def _stop_begin(session_id: str, turn_id: str, parent_session_id: str) -> None:
         draft = False
     with _state["turns_lock"]:
         stale = [r for r in _state["stops"].values() if r["chat_id"] == chat_id and r["thread_id"] == thread_id]
-    for r in stale:  # a new top-level turn here means earlier ones are over (interrupted/steered/rotated)
-        _spawn(_stop_end, r, "new turn")
+    for r in stale:  # earlier turns here are over (interrupted/steered/rotated); drain them before starting,
+        _stop_end(r, "new turn")  # so an old in-flight draft can't land after this turn's reply
     key = turn_id or session_id
     lock = threading.Lock()
     rec = {"key": key, "session_id": session_id, "session_key": _session("HERMES_SESSION_KEY"),
@@ -797,8 +820,8 @@ def _on_session_end(session_id: str = "", turn_id: Any = "", **_kw: Any) -> None
 
 
 def _on_loop_stopped(session_key: str = "", **_kw: Any) -> None:
-    if session_key:
-        _stop_finish(session_key=session_key)
+    if session_key:  # fired synchronously on the gateway's event loop: do the blocking part elsewhere
+        _spawn(_stop_finish, "", "", session_key, name="tg-enhanced-stopped")
 
 
 # ---- native Stop on the draft, steering, and the inline stop button
@@ -835,6 +858,14 @@ def _confirm_after_grace(rec: dict[str, Any], epoch: int) -> None:
         rec["cv"].wait_for(lambda: not _alive(rec) or rec["stop_epoch"] != epoch or rec["draft_on"], grace)
         if not _alive(rec) or rec["stop_epoch"] != epoch or rec["draft_on"]:
             return  # ended, stopped again, or a steer already resumed the draft
+        if rec["user_msg_ts"] >= rec["stop_ts"] - 1.0 and rec["user_msg_ts"] > rec.get("steer_used_ts", 0):
+            # The message was released by this Stop but reached the gateway first: still a steer.
+            rec["steer_used_ts"] = rec["user_msg_ts"]
+            rec["draft_on"] = True
+            rec["draft_id"] = _draft_id(rec["key"])
+            rec["cv"].notify_all()
+            logger.info("telegram-enhanced: steer just before native stop -> resume draft")
+            return
     logger.info("telegram-enhanced: native stop for chat %s thread %s -> confirm prompt", rec["chat_id"], rec["thread_id"])
     _send_stop_message(rec, confirm=True)
 
@@ -850,6 +881,7 @@ def _on_user_message(chat_id: str, thread_id: str) -> None:
             r["user_msg_ts"] = time.time()
             if r["ended"] or not r["draft"] or r["draft_on"]:
                 continue
+            r["steer_used_ts"] = r["user_msg_ts"]
             r["draft_on"] = True
             r["draft_id"] = _draft_id(r["key"])  # fresh draft; the stopped one may be ignored by the client
             mid = r.pop("confirm_mid", None)
