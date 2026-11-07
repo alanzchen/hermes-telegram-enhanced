@@ -201,6 +201,42 @@ def expand_time_placeholders(text: str, display_tz: str = DEFAULT_TZ) -> str:
 
 # ---------------------------------------------------------------- maps & galleries
 
+_FENCE_RE = re.compile(r"^\s*(```|~~~)")
+_LIST_ITEM_RE = re.compile(r"^([ \t]*)[-*+][ \t]+(?!\[[ xX]\][ \t])(\S.*)$")
+_RICH_TABLE_SEP_RE = re.compile(r"^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$")
+_RICH_TASK_RE = re.compile(r"(?m)^\s*[-*]\s+\[[ xX]\]\s+")
+_RICH_DETAILS_RE = re.compile(r"(?m)^</?(details|summary)\b")
+
+
+def likely_rich(text: str) -> bool:
+    """Mirror of the adapter's rich gate: these replies go via sendRichMessage, which renders real lists."""
+    return bool(any(_RICH_TABLE_SEP_RE.match(line) for line in text.splitlines())
+                or _RICH_TASK_RE.search(text) or _RICH_DETAILS_RE.search(text) or "$$" in text)
+
+
+def bulletize_plain(text: str) -> str:
+    """MarkdownV2 has no list syntax: ``- item`` arrives as a literal hyphen. Use real bullet glyphs.
+
+    Top-level items become ``• ``, indented ones ``  ◦ ``. Code fences and replies bound for the rich
+    endpoint are left untouched.
+    """
+    if not text or likely_rich(text):
+        return text
+    out, in_fence, changed = [], False, False
+    for line in text.split("\n"):
+        if _FENCE_RE.match(line):
+            in_fence = not in_fence
+            out.append(line)
+            continue
+        m = None if in_fence else _LIST_ITEM_RE.match(line)
+        if m:
+            indent = len(m.group(1).expandtabs(4))
+            line = ("  ◦ " if indent >= 2 else "• ") + m.group(2)
+            changed = True
+        out.append(line)
+    return "\n".join(out) if changed else text
+
+
 def render_maps(maps: Any) -> str:
     if not maps:
         return ""

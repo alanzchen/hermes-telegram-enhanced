@@ -116,5 +116,19 @@ class StoreTests(unittest.TestCase):
         self.assertIsNone(js.get("k"))
 
 
+
+class BulletTests(unittest.TestCase):
+    def test_plain_lists_become_bullets(self):
+        src = "看这里:\n- **一**: a\n- 二\n  - 子项\n* 三\n**粗体** 不动\n---\n1. 编号不动"
+        self.assertEqual(core.bulletize_plain(src),
+                         "看这里:\n• **一**: a\n• 二\n  ◦ 子项\n• 三\n**粗体** 不动\n---\n1. 编号不动")
+
+    def test_code_and_rich_untouched(self):
+        code = "```\n- keep\n```\n- go"
+        self.assertEqual(core.bulletize_plain(code), "```\n- keep\n```\n• go")
+        for rich in ("- [ ] task\n- other", "| a | b |\n|---|---|\n| 1 | 2 |\n- x", "<details>\n- x\n</details>"):
+            self.assertEqual(core.bulletize_plain(rich), rich)
+        self.assertEqual(core.bulletize_plain("no list"), "no list")
+
 if __name__ == "__main__":
     unittest.main()

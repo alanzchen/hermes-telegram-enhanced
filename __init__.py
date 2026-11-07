@@ -27,7 +27,7 @@ from typing import Any
 from .core import (
     CALLBACK_PREFIX, DEFAULT_TZ, ButtonSpecError, JsonStore, PendingStore, card_key, choice_injection_text,
     choice_list, compose_markdown, expand_time_placeholders, new_request_id, normalize_buttons,
-    parse_callback_data, time_fallback, parse_when, TIME_PLACEHOLDER_RE,
+    parse_callback_data, time_fallback, parse_when, TIME_PLACEHOLDER_RE, bulletize_plain,
 )
 
 logger = logging.getLogger("hermes_plugins.telegram_enhanced")
@@ -588,17 +588,22 @@ def telegram_guest_reply(args: dict[str, Any], **_kw: Any) -> str:
 # ---------------------------------------------------------------- time placeholders in plain replies
 
 def _on_transform_output(response_text: str = "", platform: str = "", **_kw: Any) -> str | None:
-    """Plain (MarkdownV2) replies can't carry date-time entities; render placeholders as text."""
-    if not response_text or "{{time:" not in response_text:
+    """Plain (MarkdownV2) replies: render time placeholders as text and list markers as bullets."""
+    if not response_text:
         return None
-    tz = _display_tz()
+    text = response_text
+    if "{{time:" in text:
+        tz = _display_tz()
 
-    def repl(m: Any) -> str:
-        try:
-            return time_fallback(parse_when(m.group(1), (m.group(2) or "").strip() or None), tz)
-        except Exception:
-            return m.group(0)
-    return TIME_PLACEHOLDER_RE.sub(repl, response_text)
+        def repl(m: Any) -> str:
+            try:
+                return time_fallback(parse_when(m.group(1), (m.group(2) or "").strip() or None), tz)
+            except Exception:
+                return m.group(0)
+        text = TIME_PLACEHOLDER_RE.sub(repl, text)
+    if str(platform or "").lower() == "telegram":
+        text = bulletize_plain(text)
+    return text if text != response_text else None
 
 
 # ---------------------------------------------------------------- registration
