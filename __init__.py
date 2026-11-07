@@ -614,11 +614,41 @@ async def _on_stopped_generation(update: Any, _context: Any) -> None:
         logger.info("telegram-enhanced: native stop for unknown/ended draft %s (%s) known=%s state=%x",
                     draft_id, type(draft_id).__name__, known, id(_state))
         return
-    logger.info("telegram-enhanced: native stop -> confirm prompt for chat %s thread %s", rec["chat_id"], rec["thread_id"])
-    threading.Thread(target=_stop_fire, args=(rec, True), name="tg-enhanced-confirm", daemon=True).start()
+    rec["native_stop_ts"] = time.time()
+    threading.Thread(target=_confirm_after_grace, args=(rec,), name="tg-enhanced-confirm", daemon=True).start()
+
+
+def _confirm_after_grace(rec: dict[str, Any]) -> None:
+    """Pressing Stop releases any message the client had queued. If one arrives within the grace window
+    the user was steering, so skip the "really stop?" prompt."""
+    grace = float(_setting("stop_confirm_grace_seconds", 1.0))
+    if rec["cancel"].wait(grace):
+        return
+    followed = rec.get("user_msg_ts", 0) >= rec["native_stop_ts"] - 0.5
+    logger.info("telegram-enhanced: native stop for chat %s thread %s -> %s", rec["chat_id"], rec["thread_id"],
+                "follow-up message arrived, no prompt" if followed else "confirm prompt")
+    if not followed:
+        _stop_fire(rec, True)
+
+
+def _note_user_message(update: Any) -> None:
+    msg = getattr(update, "message", None)
+    if msg is None or getattr(getattr(msg, "from_user", None), "is_bot", False):
+        return
+    chat_id = str(getattr(msg, "chat_id", "") or "")
+    thread_id = str(getattr(msg, "message_thread_id", "") or "")
+    now = time.time()
+    with _state["turns_lock"]:
+        for r in _state["stops"].values():
+            if r["chat_id"] == chat_id and (r["thread_id"] or "") == thread_id:
+                r["user_msg_ts"] = now
 
 
 async def _route_new_updates(update: Any, context: Any) -> None:
+    try:
+        _note_user_message(update)
+    except Exception:
+        logger.debug("telegram-enhanced: note user message failed", exc_info=True)
     kw = getattr(update, "api_kwargs", None) or {}
     if "stopped_message_generation" in kw:
         await _on_stopped_generation(update, context)
