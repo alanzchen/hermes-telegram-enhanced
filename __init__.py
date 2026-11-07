@@ -512,7 +512,8 @@ async def _on_stopped_generation(update: Any, _context: Any) -> None:
 
 STOP_PREFIX = "hs:"
 _STOP_DATA_RE = re.compile(r"^hs:([0-9a-f]{12})$")
-STOP_MESSAGE_TEXT = "⏳ 小助手处理中, 需要时点「停止」"
+STOP_MESSAGE_TEXT = "💬"  # a lone emoji renders large and animated for every user
+STOP_BUTTON_LABEL = "⏹"
 STOP_MESSAGE_MARKDOWN = "_Thinking…_"
 
 
@@ -568,8 +569,8 @@ def _stop_fire(rec: dict[str, Any]) -> None:
     if _setting("stop_message_rich", False):  # Alan preferred the plain inline-keyboard look
         res = _api("sendRichMessage", {**base, "rich_message": {"markdown": markdown}})
     if not res.get("ok"):
-        res = _api("sendMessage", {**base, "text": STOP_MESSAGE_TEXT, "reply_markup": {
-            "inline_keyboard": [[{"text": "⏹ 停止", "callback_data": data}]]}})
+        res = _api("sendMessage", {**base, "text": str(_setting("stop_message_text", STOP_MESSAGE_TEXT)), "reply_markup": {
+            "inline_keyboard": [[{"text": str(_setting("stop_button_label", STOP_BUTTON_LABEL)), "callback_data": data}]]}})
     if not res.get("ok"):
         logger.info("telegram-enhanced: stop message send failed: %s", res.get("description"))
         return
