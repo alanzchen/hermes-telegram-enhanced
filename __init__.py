@@ -32,6 +32,7 @@ from .core import (
     choice_list, compose_markdown, expand_time_placeholders, new_request_id, normalize_buttons,
     parse_callback_data, time_fallback, parse_when, TIME_PLACEHOLDER_RE, bulletize_plain, has_markdown_list,
 )
+from . import i18n
 
 logger = logging.getLogger("hermes_plugins.telegram_enhanced")
 
@@ -335,16 +336,17 @@ def _make_callback(ctx: Any):
         request_id, index = parsed
         user = getattr(query, "from_user", None)
         status, entry, choice = _state["pending"].claim(request_id, index, str(getattr(user, "id", "")))
+        lang = _lang_of_msg(getattr(query, "message", None))
         if status != "ok":
-            text = {"expired": "已过期", "unauthorized": "这个按钮不是给你的",
-                    "used": "已经选过了", "invalid": "无效按钮"}.get(status, "无法处理")
-            await query.answer(text=text)
+            key = {"expired": "expired", "unauthorized": "not_yours", "used": "used", "invalid": "invalid"}
+            await query.answer(text=i18n.t(key.get(status, "cannot"), lang))
             return
-        await query.answer(text=f"已选择：{choice['label']}"[:190])
+        chosen = i18n.t("chosen", lang, label=choice["label"])
+        await query.answer(text=chosen[:190])
         try:
             render = entry.get("render") or {"align": entry.get("align")}
             markdown = compose_markdown(entry.get("body") or "", entry.get("rows") or [], None,
-                                        include_choices=False, footer=f"> ✅ 已选择：**{choice['label']}**",
+                                        include_choices=False, footer="> ✅ " + i18n.t("chosen", lang, label=f"**{choice['label']}**"),
                                         display_tz=_display_tz(), **render)
             message = getattr(query, "message", None)
             chat_id = getattr(message, "chat_id", None) or entry.get("chat_id")
@@ -355,7 +357,7 @@ def _make_callback(ctx: Any):
                     "rich_message": {"markdown": markdown}})
         except Exception:
             logger.debug("telegram-enhanced: could not edit message after press", exc_info=True)
-        who = getattr(user, "first_name", None) or "用户"
+        who = getattr(user, "first_name", None) or "user"
         ok = False
         try:
             ok = ctx.inject_message(choice_injection_text(entry, choice, who), session_key=entry["session_key"])
@@ -383,8 +385,6 @@ STOP_PREFIX = "hs:"
 _STOP_DATA_RE = re.compile(r"^hs:([0-9a-f]{12})$")
 STOP_MESSAGE_TEXT = "💬"  # a lone emoji renders large and animated for every user
 STOP_BUTTON_LABEL = "⏹"
-STOP_CONFIRM_TEXT = "要停止这一轮吗？不停的话，直接发消息就是插话"
-STOP_CONFIRM_LABEL = "⏹ 停止"
 STOP_MESSAGE_MARKDOWN = "_Thinking…_"
 DRAFT_HTTP_TIMEOUT = 4
 STOPMSG_MAX_AGE = 47 * 3600  # bots cannot delete messages older than 48h
@@ -457,43 +457,78 @@ def _stop_cleanup_leftovers(chat_id: str, thread_id: str) -> None:
         _stop_delete(chat_id, mid)
 
 
+# ---- language: follow the user's latest message in each chat/topic
+
+def _lang_key(chat_id: Any, thread_id: Any) -> str:
+    return f"{chat_id}:{thread_id or ''}"
+
+
+def _remember_lang(chat_id: Any, thread_id: Any, text: Any) -> None:
+    lang = i18n.detect(text)
+    if not lang or not chat_id:
+        return
+    langs = _state.setdefault("langs", {})
+    key = _lang_key(chat_id, thread_id)
+    if langs.get(key) == lang:
+        return
+    langs[key] = lang
+    try:
+        meta = _state.get("meta")
+        if meta is not None:
+            stored = meta.get("langs") or {}
+            stored[key] = lang
+            meta.set("langs", stored)
+    except Exception:
+        logger.debug("telegram-enhanced: could not persist language", exc_info=True)
+
+
+def _lang(chat_id: Any = "", thread_id: Any = "") -> str:
+    """``language`` setting if pinned (zh/en); else the remembered language of this topic, then of the
+    chat, then ``default_language``."""
+    pinned = str(_setting("language", "auto") or "auto").lower()
+    if pinned in i18n.LANGS:
+        return pinned
+    langs = _state.setdefault("langs", {})
+    if not langs.get("_loaded"):
+        try:
+            meta = _state.get("meta")
+            langs.update({k: v for k, v in ((meta.get("langs") or {}) if meta is not None else {}).items()
+                          if k not in langs})
+        except Exception:
+            pass
+        langs["_loaded"] = True
+    lang = langs.get(_lang_key(chat_id, thread_id)) or langs.get(_lang_key(chat_id, ""))
+    return i18n.norm(lang or str(_setting("default_language", "en")))
+
+
+def _lang_of_msg(msg: Any) -> str:
+    if msg is None:
+        return _lang()
+    return _lang(str(getattr(msg, "chat_id", "") or ""), str(getattr(msg, "message_thread_id", "") or ""))
+
+
+def _assistant_name(lang: str) -> str:
+    return str(_setting("assistant_name", "") or i18n.DEFAULT_NAME[i18n.norm(lang)])
+
+
 # ---- tool progress inside the draft
 
-_TOOL_LABELS: list[tuple[tuple[str, ...], str, str]] = [
-    (("terminal", "process"), "💻", "运行命令"),
-    (("read_file",), "📖", "读取文件"),
-    (("write_file", "patch"), "✏️", "修改文件"),
-    (("search_files",), "🗂️", "查找文件"),
-    (("web_search", "_search"), "🔎", "搜索"),
-    (("web_extract", "fetch", "scrape", "_contents", "crawl"), "🌐", "读取网页"),
-    (("browser",), "🧭", "操作浏览器"),
-    (("execute_code",), "🐍", "运行代码"),
-    (("delegate_task",), "🤖", "派给子代理"),
-    (("telegram_",), "💬", "发 Telegram 消息"),
-    (("skill",), "📚", "查看技能"),
-    (("memory", "honcho"), "🧠", "查记忆"),
-    (("vision", "image"), "🖼️", "看图片"),
-    (("clarify",), "❓", "等你选择"),
-]
-
-
-def _tool_label(tool_name: str, args: Any) -> str:
+def _tool_step(tool_name: str, args: Any) -> dict[str, Any]:
+    """Language-neutral description of a tool call; ``_step_parts`` renders it."""
     name = tool_name or "tool"
     if name == "tool_call" and isinstance(args, dict):  # deferred tools: show the inner one
         calls = args.get("calls") or []
         if calls and isinstance(calls[0], dict):
-            inner = str(calls[0].get("name") or name)
-            more = f" 等 {len(calls)} 个" if len(calls) > 1 else ""
-            return _tool_label(inner, calls[0].get("arguments") or {}) + more
-    icon, verb = "⚙️", name.split("__")[-1]
-    for keys, ic, vb in _TOOL_LABELS:
-        if any(k in name for k in keys):
-            icon, verb = ic, vb
-            break
+            step = _tool_step(str(calls[0].get("name") or name), calls[0].get("arguments") or {})
+            if len(calls) > 1:
+                step["more"] = len(calls)
+            return step
+    step: dict[str, Any] = {"kind": i18n.tool_kind(name), "verb": name.split("__")[-1], "detail": "", "code": ""}
     code = _command_text(name, args)
-    if code:  # say what the command is for, not the command itself
-        purpose = _command_purpose(code)
-        return f"{verb}：{purpose}" if purpose else verb
+    if code:  # say what the command is for, never the command itself
+        step["detail"] = _command_comment(code)
+        step["code"] = code[:2000]
+        return step
     detail = ""
     try:
         from agent.display import build_tool_preview
@@ -501,9 +536,23 @@ def _tool_label(tool_name: str, args: Any) -> str:
     except Exception:
         pass
     detail = " ".join(str(detail).split())
-    if len(detail) > 48:
-        detail = detail[:47] + "…"
-    return verb + (f"：{detail}" if detail else "")
+    step["detail"] = detail[:47] + "…" if len(detail) > 48 else detail
+    return step
+
+
+def _step_parts(st: dict[str, Any], lang: str) -> tuple[str, str]:
+    """(verb, what is happening) for one step in ``lang``."""
+    verb = i18n.tool_verb(st.get("kind", ""), lang, st.get("verb") or "tool")
+    what = st.get("detail") or (i18n.cmd_hint(st["code"], lang) if st.get("code") else "") or verb
+    if st.get("more"):
+        what += i18n.t("and_more", lang, n=st["more"], m=st["more"] - 1)
+    return verb, what
+
+
+def _tool_label(tool_name: str, args: Any, lang: str = "zh") -> str:
+    """One-line label (kept for debugging scripts)."""
+    verb, what = _step_parts(_tool_step(tool_name, args), lang)
+    return verb if what == verb else f"{verb}: {what}"
 
 
 _CMD_WIDTH = 48
@@ -520,21 +569,8 @@ def _command_text(name: str, args: Any) -> str:
     return ""
 
 
-_CMD_HINTS: list[tuple[tuple[str, ...], str]] = [
-    (("git push",), "推送代码"), (("git commit",), "提交代码"), (("git ",), "查看代码版本"),
-    (("unittest", "pytest", "sim.py", "py_compile"), "跑测试"),
-    (("reload_gateway_plugins", "gateway restart"), "重新加载 bot"),
-    (("paseo",), "在 Mac Studio 上操作"), (("op read",), "读取密码库"),
-    (("curl ", "wget ", "api.telegram.org"), "访问网络"),
-    (("grep ", "rg ", "awk "), "搜索文件内容"), (("find ", "ls "), "查看目录"),
-    (("cat ", "sed -n", "head ", "tail "), "读取文件"), (("sleep ",), "等待"),
-    (("pip ", "uv ", "npm ", "apt"), "安装依赖"), (("cp ", "mv ", "mkdir "), "整理文件"),
-    (("python", "node "), "运行脚本"),
-]
-
-
-def _command_purpose(code: str) -> str:
-    """The model's own one-line '# purpose' comment if present, else a rough guess from the command."""
+def _command_comment(code: str) -> str:
+    """The model's own one-line '# purpose' comment, if the command starts with one."""
     for ln in code.strip().splitlines():
         ln = ln.strip()
         if not ln:
@@ -543,11 +579,11 @@ def _command_purpose(code: str) -> str:
             text = ln.lstrip("#").strip()
             return text[:40] + ("…" if len(text) > 40 else "")
         break
-    low = code.lower()
-    for keys, label in _CMD_HINTS:
-        if any(k in low for k in keys):
-            return label
     return ""
+
+
+def _command_purpose(code: str, lang: str = "zh") -> str:
+    return _command_comment(code) or i18n.cmd_hint(code, lang)
 
 
 def _wrap_command(code: str) -> list[str]:
@@ -569,45 +605,35 @@ def _wrap_command(code: str) -> list[str]:
     return out
 
 
-_TALLY_UNITS = {"运行命令": "跑了 {n} 条命令", "读取文件": "读了 {n} 个文件", "修改文件": "改了 {n} 个文件",
-                "查找文件": "查找 {n} 次", "搜索": "搜索 {n} 次", "读取网页": "读了 {n} 个网页",
-                "操作浏览器": "操作浏览器 {n} 次", "运行代码": "跑了 {n} 段代码", "派给子代理": "派了 {n} 个子代理",
-                "发 Telegram 消息": "发了 {n} 条消息", "查看技能": "看了 {n} 个技能", "查记忆": "查了 {n} 次记忆",
-                "看图片": "看了 {n} 张图"}
-
-
-def _step_verb(label: str) -> str:
-    return str(label).split("\n", 1)[0].split("：", 1)[0].split(" 等 ", 1)[0].strip()
-
-
 def _fmt_secs(sec: float) -> str:
     sec = int(sec)
     return f"{sec // 60}m{sec % 60:02d}s" if sec >= 60 else f"{sec}s"
 
 
 def _render_draft(rec: dict[str, Any]) -> str:
-    """Caller holds rec["cv"]. Turn-summary style: a one-line tally of finished tools plus what is running now."""
+    """Caller holds rec["cv"]. Turn-summary style: a one-line tally of finished tools plus what is running now,
+    in the language of the user's latest message."""
     import html as _html
     now = time.time()
-    lines = [f"小助手处理中… · {_fmt_secs(now - rec.get('t0', now))}"]
+    lang = rec.get("lang") or "en"
+    lines = [f"{i18n.t('working', lang, name=_assistant_name(lang))} · {_fmt_secs(now - rec.get('t0', now))}"]
     if _setting("show_tool_progress", True):
         steps = list(rec["steps"])
         done = [st for st in steps if st["status"] != "running"]
         if done:
-            counts: dict[str, int] = {}
+            counts: dict[tuple[str, str], int] = {}
             for st in done:
-                v = _step_verb(st["label"])
-                counts[v] = counts.get(v, 0) + 1
-            parts = [(_TALLY_UNITS.get(v) or (v + " {n} 次")).format(n=n)
-                     for v, n in sorted(counts.items(), key=lambda kv: -kv[1])]
+                k = (st.get("kind", ""), "" if st.get("kind") else st.get("verb", ""))
+                counts[k] = counts.get(k, 0) + 1
+            parts = [i18n.tool_tally(kind, n, lang, verb or "tool")
+                     for (kind, verb), n in sorted(counts.items(), key=lambda kv: -kv[1])]
             if len(parts) > 4:
-                parts = parts[:4] + [f"等 {len(counts)} 类"]
+                parts = parts[:4] + [i18n.t("more_kinds", lang, n=len(counts))]
             errs = sum(1 for st in done if st["status"] != "ok")
-            lines.append(" · ".join(parts) + (f"（{errs} 次出错）" if errs else ""))
+            lines.append(" · ".join(parts) + (i18n.t("errors", lang, n=errs) if errs else ""))
         for st in [st for st in steps if st["status"] == "running"][-2:]:
-            head = str(st["label"]).split("\n", 1)[0]
-            what = head.split("：", 1)[1] if "：" in head else head
-            lines.append(f"正在{what} · {_fmt_secs(now - st['t0'])}")
+            _verb, what = _step_parts(st, lang)
+            lines.append(f"{i18n.t('now', lang, what=what)} · {_fmt_secs(now - st['t0'])}")
     # Rich HTML collapses newlines like a browser; <br> is the documented line break.
     return "<tg-thinking>" + "<br>".join(_html.escape(x, quote=False) for x in lines) + "</tg-thinking>"
 
@@ -625,7 +651,7 @@ def _on_pre_tool_call(tool_name: str = "", args: Any = None, session_id: str = "
         rec = _rec_for_tool(turn_id, session_id)
         if rec is None or not rec["draft"]:
             return None
-        step = {"id": tool_call_id or f"{tool_name}:{time.time()}", "label": _tool_label(tool_name, args),
+        step = {"id": tool_call_id or f"{tool_name}:{time.time()}", **_tool_step(tool_name, args),
                 "status": "running", "t0": time.time(), "dur": 0.0}
         with rec["cv"]:
             rec["steps"].append(step)
@@ -765,13 +791,13 @@ def _send_stop_message(rec: dict[str, Any], confirm: bool) -> None:
         base["message_thread_id"] = int(rec["thread_id"])
     res: dict[str, Any] = {"ok": False}
     if confirm:
-        text, label = STOP_CONFIRM_TEXT, STOP_CONFIRM_LABEL
+        text, label = i18n.t("stop_confirm", rec.get("lang")), i18n.t("stop_label", rec.get("lang"))
     else:
         text = str(_setting("stop_message_text", STOP_MESSAGE_TEXT))
         label = str(_setting("stop_button_label", STOP_BUTTON_LABEL))
         if _setting("stop_message_rich", False):
             markdown = (str(_setting("stop_message_markdown", STOP_MESSAGE_MARKDOWN)) + "\n\n<tg-button-row>\n"
-                        f'<tg-button type="callback_data" style="danger" data="{data}">⏹ 停止</tg-button>\n</tg-button-row>')
+                        f'<tg-button type="callback_data" style="danger" data="{data}">{i18n.t('stop_label', rec.get('lang'))}</tg-button>\n</tg-button-row>')
             res = _api("sendRichMessage", {**base, "rich_message": {"markdown": markdown}})
     if not res.get("ok"):
         res = _api("sendMessage", {**base, "text": text, "reply_markup": {
@@ -851,7 +877,7 @@ def _stop_begin(session_id: str, turn_id: str, parent_session_id: str) -> None:
            "message_id": _session("HERMES_SESSION_MESSAGE_ID"),
            "token": secrets.token_hex(6), "cv": threading.Condition(lock), "ended": False, "inflight": False,
            "draft": draft, "draft_on": True, "t0": time.time(), "draft_id": _draft_id(key), "steps": [],
-           "stop_epoch": 0, "stop_ts": 0.0, "user_msg_ts": 0.0}
+           "stop_epoch": 0, "stop_ts": 0.0, "user_msg_ts": 0.0, "lang": _lang(chat_id, thread_id)}
     with _state["turns_lock"]:
         _state["stops"][key] = rec
     logger.info("telegram-enhanced: indicator begin key=%s draft=%s", key, draft)
@@ -877,11 +903,17 @@ def _same_route(rec: dict[str, Any], session_key: str) -> bool:
 
 
 def _on_pre_llm_call(session_id: str = "", platform: str = "", turn_id: Any = "",
-                     parent_session_id: str = "", **_kw: Any) -> None:
+                     parent_session_id: str = "", user_message: Any = None, **_kw: Any) -> None:
     try:
         _patch_telegram_lists()
     except Exception:
         logger.debug("telegram-enhanced: list patch failed", exc_info=True)
+    if (platform or "").lower() == "telegram" and not parent_session_id:
+        try:  # covers voice notes, whose text only exists after transcription
+            thread = _session("HERMES_SESSION_THREAD_ID")
+            _remember_lang(_session("HERMES_SESSION_CHAT_ID"), thread if thread.isdigit() else "", user_message)
+        except Exception:
+            logger.debug("telegram-enhanced: language detection failed", exc_info=True)
     if (platform or "").lower() == "telegram" and session_id:
         try:
             _stop_begin(session_id, str(turn_id or ""), parent_session_id or "")
@@ -980,15 +1012,19 @@ def _resume_after_prompt(rec: dict[str, Any], epoch: int) -> None:
         _stop_delete(rec["chat_id"], mid)
 
 
-def _on_user_message(chat_id: str, thread_id: str) -> None:
+def _on_user_message(chat_id: str, thread_id: str, text: Any = None) -> None:
     """A user message reached this chat/topic (normalized by the gateway). If the draft is paused by a
-    native Stop, this is a steer: resume the draft and drop the "really stop?" prompt."""
+    native Stop, this is a steer: resume the draft and drop the "really stop?" prompt. The running
+    turn's bubble switches to the language of this message."""
+    _remember_lang(chat_id, thread_id, text)
+    lang = _lang(chat_id, thread_id)
     drop: list[tuple[dict[str, Any], int]] = []
     with _state["turns_lock"]:
         recs = [r for r in _state["stops"].values() if r["chat_id"] == chat_id and (r["thread_id"] or "") == thread_id]
     for r in recs:
         with r["cv"]:
             r["user_msg_ts"] = time.time()
+            r["lang"] = lang
             if r["ended"] or not r["draft"]:
                 continue
             if r["draft_on"]:
@@ -1018,7 +1054,7 @@ def _on_pre_gateway_dispatch(event: Any = None, **_kw: Any) -> None:
         chat_id = str(getattr(src, "chat_id", "") or "")
         thread_id = str(getattr(src, "thread_id", "") or "")
         if chat_id:
-            _on_user_message(chat_id, thread_id if thread_id.isdigit() else "")
+            _on_user_message(chat_id, thread_id if thread_id.isdigit() else "", getattr(event, "text", None))
     except Exception:
         logger.debug("telegram-enhanced: pre_gateway_dispatch observer failed", exc_info=True)
     return None
@@ -1116,20 +1152,22 @@ async def _on_stop_button(update: Any, _context: Any) -> None:
     with _state["turns_lock"]:
         rec = next((r for r in _state["stops"].values() if m and r["token"] == m.group(1)), None)
     msg = getattr(query, "message", None)
+    lang = rec.get("lang") if rec is not None and rec.get("lang") else _lang_of_msg(msg)
     if rec is None or rec["ended"]:
         logger.info("telegram-enhanced: stop press for unknown/ended turn")
-        await query.answer(text="这一轮已经结束了")
+        await query.answer(text=i18n.t("turn_over", lang))
         if msg is not None:
             _spawn(_stop_delete, str(msg.chat_id), int(msg.message_id))
         return
     if str(getattr(getattr(query, "from_user", None), "id", "")) != str(rec["user_id"]):
-        await query.answer(text="这个按钮不是给你的")
+        await query.answer(text=i18n.t("not_yours", lang))
         return
     # Re-validate right before dispatching: /stop targets the chat, so never send it for a stale turn.
     with _state["turns_lock"]:
         current = _state["stops"].get(rec["key"]) is rec and not rec["ended"]
     ok = current and await _dispatch_stop(rec)
-    await query.answer(text="已停止" if ok else ("这一轮已经结束了" if not current else "停止失败，请发 /stop"))
+    await query.answer(text=i18n.t("stopped", lang) if ok else
+                       i18n.t("turn_over" if not current else "stop_failed", lang))
     _spawn(_stop_end, rec, "stop button")
 
 
@@ -1139,7 +1177,7 @@ GUEST_SCHEMA = {
     "name": "telegram_guest_reply",
     "description": (
         "Answer a Telegram Guest Mode request (someone @mentioned the bot in another chat). Replaces the "
-        "'处理中' placeholder in THAT chat with your answer. Everything you write is visible to everyone in "
+        "'working…' placeholder in THAT chat with your answer. Everything you write is visible to everyone in "
         "that chat: include only what the request needs and never add private details unless explicitly asked. "
         "Supports Rich Markdown and {{time:...}} placeholders; no buttons."
     ),
@@ -1159,12 +1197,12 @@ def _guest_allowed(user_id: str) -> bool:
     return str(user_id) in {str(a) for a in allowed}
 
 
-def _guest_topic(owner_id: str) -> str | None:
+def _guest_topic(owner_id: str, lang: str = "en") -> str | None:
     meta: JsonStore = _state["meta"]
     info = meta.get("guest_topic") or {}
     if info.get(owner_id):
         return str(info[owner_id])
-    res = _api("createForumTopic", {"chat_id": int(owner_id), "name": "👥 跨聊天调用"})
+    res = _api("createForumTopic", {"chat_id": int(owner_id), "name": i18n.t("guest_topic", lang)})
     thread = (res.get("result") or {}).get("message_thread_id")
     if thread:
         info[owner_id] = thread
@@ -1199,8 +1237,10 @@ async def _on_guest_message(update: Any, _context: Any) -> None:
         reply_text = (reply.get("text") if isinstance(reply, dict) else getattr(reply, "text", None)) or \
                      (reply.get("caption") if isinstance(reply, dict) else getattr(reply, "caption", None)) or ""
 
-    placeholder = {"type": "article", "id": "hte-wait", "title": "小助手",
-                   "input_message_content": {"rich_message": {"markdown": "⏳ 小助手处理中…"}}}
+    lang = i18n.detect(text) or _lang(user_id, "")
+    name = _assistant_name(lang)
+    placeholder = {"type": "article", "id": "hte-wait", "title": name,
+                   "input_message_content": {"rich_message": {"markdown": i18n.t("guest_wait", lang, name=name)}}}
     res = _api("answerGuestQuery", {"guest_query_id": query_id, "result": placeholder})
     inline_id = (res.get("result") or {}).get("inline_message_id")
     if not res.get("ok") or not inline_id:
@@ -1209,14 +1249,15 @@ async def _on_guest_message(update: Any, _context: Any) -> None:
     guest_id = new_request_id()
     _state["guests"].set(guest_id, {"inline_message_id": inline_id, "user_id": user_id, "chat_title": chat_title,
                                     "created_at": time.time(), "answered": False})
-    lines = [f"[Telegram Guest] 有人在其他聊天里 @ 了小助手。guest_id: {guest_id}",
-             f"聊天: {chat_title or '(私聊或未知)'}",
-             f"请求: {text}"]
+    lines = [f"[Telegram Guest] Someone mentioned you in another chat. guest_id: {guest_id}",
+             f"Chat: {chat_title or '(private or unknown)'}",
+             f"Request: {text}"]
     if reply_text:
-        lines.append(f"被回复的消息: {reply_text[:2000]}")
-    lines.append("回答会公开显示在那个聊天里：用 telegram_guest_reply 回复，只写请求需要的内容，不透露其他隐私。")
+        lines.append(f"Replied-to message: {reply_text[:2000]}")
+    lines.append("The answer is shown publicly in that chat: reply with telegram_guest_reply, in the language of "
+                 "the request, with only what the request needs and nothing else private.")
     owner = user_id
-    thread = _guest_topic(owner)
+    thread = _guest_topic(owner, _lang(owner, ""))
     adapter = _state.get("adapter")
     ok = False
     try:
@@ -1227,7 +1268,7 @@ async def _on_guest_message(update: Any, _context: Any) -> None:
         logger.warning("telegram-enhanced: guest inject failed", exc_info=True)
     if not ok:
         _api("editMessageText", {"inline_message_id": inline_id,
-                                 "rich_message": {"markdown": "⚠️ 小助手暂时无法处理这个请求"}})
+                                 "rich_message": {"markdown": i18n.t("guest_fail", lang, name=name)}})
 
 
 def telegram_guest_reply(args: dict[str, Any], **_kw: Any) -> str:
