@@ -1353,6 +1353,83 @@ def _on_transform_output(response_text: str = "", platform: str = "", **_kw: Any
 
 # ---------------------------------------------------------------- native lists
 
+
+# ---- voice steer dedupe
+# In interrupt mode a voice note sent mid-turn is transcribed and echoed by the busy path, then the
+# queued copy reaches the normal inbound path as a different event object (the per-event STT cache
+# is lost) and is transcribed and echoed a second time. Remember clips per file (name + size) so the
+# second pass reuses the transcript and skips the duplicate echo.
+_VOICE_MARK = "_hte_voice_dedupe_v1"
+_VOICE_TTL = 900.0
+
+
+def _clip_key(path: Any) -> str:
+    try:
+        return f"{os.path.basename(str(path))}:{os.path.getsize(str(path))}"
+    except OSError:
+        return os.path.basename(str(path))
+
+
+def _voice_store() -> dict[str, Any]:
+    store = getattr(sys, "_hte_voice_store", None)
+    if store is None:
+        store = {"clips": {}, "echoed": {}}
+        sys._hte_voice_store = store
+    now = time.time()
+    for name in ("clips", "echoed"):
+        for k in [k for k, v in store[name].items() if now - v[0] > _VOICE_TTL]:
+            store[name].pop(k, None)
+    return store
+
+
+def _patch_voice_dedupe(runner: Any) -> None:
+    cls = type(runner)
+    if cls.__dict__.get(_VOICE_MARK) or not all(hasattr(cls, n) for n in (
+            "_transcribe_one_clip", "_transcribe_and_echo_pending_voice", "_enrich_inbound_voice",
+            "_enrich_message_with_transcription", "_pending_event_audio_paths")):
+        return
+    orig_clip, orig_pending, orig_inbound = (cls._transcribe_one_clip, cls._transcribe_and_echo_pending_voice,
+                                             cls._enrich_inbound_voice)
+
+    async def _transcribe_one_clip(self, path, *a, **kw):
+        store = _voice_store()
+        hit = store["clips"].get(_clip_key(path))
+        if hit is not None:
+            return hit[1]
+        result = await orig_clip(self, path, *a, **kw)
+        if isinstance(result, tuple) and result and result[0]:
+            store["clips"][_clip_key(path)] = (time.time(), result)
+        return result
+
+    async def _transcribe_and_echo_pending_voice(self, event, *a, **kw):
+        result = await orig_pending(self, event, *a, **kw)
+        try:
+            if isinstance(result, tuple) and len(result) > 1 and result[1]:
+                store = _voice_store()
+                for path in self._pending_event_audio_paths(event):
+                    store["echoed"][_clip_key(path)] = (time.time(), True)
+        except Exception:
+            logger.debug("telegram-enhanced: voice dedupe bookkeeping failed", exc_info=True)
+        return result
+
+    async def _enrich_inbound_voice(self, event, source, message_text, audio_paths):
+        try:
+            store = _voice_store()
+            if audio_paths and all(_clip_key(p) in store["echoed"] for p in audio_paths):
+                logger.info("telegram-enhanced: voice already transcribed and echoed mid-turn; reusing it")
+                text, _ = await self._enrich_message_with_transcription(message_text, audio_paths)
+                return text
+        except Exception:
+            logger.debug("telegram-enhanced: voice dedupe check failed", exc_info=True)
+        return await orig_inbound(self, event, source, message_text, audio_paths)
+
+    cls._transcribe_one_clip = _transcribe_one_clip
+    cls._transcribe_and_echo_pending_voice = _transcribe_and_echo_pending_voice
+    cls._enrich_inbound_voice = _enrich_inbound_voice
+    setattr(cls, _VOICE_MARK, True)
+    logger.info("telegram-enhanced: voice steer dedupe enabled on %s", cls.__name__)
+
+
 _LIST_PATCH_MARK = "_hte_native_lists_v2"
 _LEGACY_LIST_PATCH_MARK = "_hte_native_lists"
 # Wrappers resolve helpers at call time, so a plugin reload updates the behaviour of an already-patched
@@ -1400,6 +1477,12 @@ def _patch_telegram_lists() -> None:
             except Exception:
                 continue
     live = _state.get("adapter")
+    runner = getattr(live, "gateway_runner", None) if live is not None else None
+    if runner is not None:
+        try:
+            _patch_voice_dedupe(runner)
+        except Exception:
+            logger.warning("telegram-enhanced: voice dedupe patch failed", exc_info=True)
     if live is not None:  # the instance actually sending; after a plugin reload its class may no
         candidates.append(type(live))  # longer be the one sys.modules points at
     for mod in list(sys.modules.values()):
