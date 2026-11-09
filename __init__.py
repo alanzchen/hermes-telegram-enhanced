@@ -1430,6 +1430,104 @@ def _patch_voice_dedupe(runner: Any) -> None:
     logger.info("telegram-enhanced: voice steer dedupe enabled on %s", cls.__name__)
 
 
+
+# ---- document bursts
+# Several files sent at once reach Hermes as separate updates: core merges photo albums but not
+# documents. With busy_input_mode=interrupt each file then interrupts the turn started for the previous
+# one, and files still waiting for the session are dropped ("Stopped before this turn started").
+# Merge the documents of one chat/topic that arrive together into a single event. Updates of one chat
+# are handled in order, so the flush timer is paused while a document downloads and re-armed once it is
+# cached; ``document_burst_seconds`` only has to cover the gap between two updates.
+_DOC_MARK = "_hte_doc_burst_v1"
+
+
+def _doc_inline_flags(event: Any) -> list:
+    urls = getattr(event, "media_urls", None) or []
+    return (list(getattr(event, "media_text_inlined", None) or []) + [None] * len(urls))[:len(urls)]
+
+
+def _doc_merge(adapter: Any, pending: dict, key: str, event: Any) -> None:
+    existing = pending.get(key)
+    if existing is None:
+        pending[key] = event
+        return
+    flags = _doc_inline_flags(existing) + _doc_inline_flags(event)
+    existing.absorb_reply_expected(event)
+    existing.extend_media(event)
+    existing.media_text_inlined = flags
+    if event.text:
+        existing.text = adapter._merge_caption(existing.text, event.text)
+
+
+def _doc_arm_flush(adapter: Any, st: dict, key: str) -> None:
+    import asyncio
+    try:
+        delay = max(0.2, float(_setting("document_burst_seconds", 1.5)))
+    except (TypeError, ValueError):
+        delay = 1.5
+
+    def _log(ev: Any) -> None:
+        logger.info("telegram-enhanced: %d document(s) sent together go to the agent as one message (%s)",
+                    len(getattr(ev, "media_urls", None) or []), key)
+
+    st["tasks"][key] = asyncio.create_task(
+        adapter._flush_buffered(st["pending"], st["tasks"], key, delay, "hte-doc-burst", _log))
+
+
+async def _doc_burst_impl(adapter: Any, orig: Any, msg: Any, event: Any) -> bool:
+    if not _setting("merge_document_bursts", True):
+        return await orig(adapter, msg, event)
+    try:
+        key = f"{adapter._event_session_key(event)}:hte-doc-burst"
+    except Exception:
+        return await orig(adapter, msg, event)
+    st = adapter.__dict__.setdefault("_hte_doc_burst", {"pending": {}, "tasks": {}, "inflight": {}})
+    pending, tasks, inflight = st["pending"], st["tasks"], st["inflight"]
+    inflight[key] = inflight.get(key, 0) + 1
+    timer = tasks.get(key)
+    if timer is not None and not timer.done():
+        timer.cancel()  # still sleeping, so nothing was popped; re-armed after this file is cached
+    try:
+        handled = await orig(adapter, msg, event)
+        if (handled or not getattr(event, "media_urls", None)
+                or getattr(getattr(event, "message_type", None), "name", "") != "DOCUMENT"
+                or adapter._should_drop_delayed_delivery()):
+            return handled  # image/video documents, failures and audio keep core's own path
+        _doc_merge(adapter, pending, key, event)
+        adapter._accept_update()
+        return True
+    finally:
+        left = inflight.get(key, 1) - 1
+        if left > 0:
+            inflight[key] = left
+        else:
+            inflight.pop(key, None)
+            if key in pending:
+                _doc_arm_flush(adapter, st, key)
+
+
+sys._hte_doc_impl = _doc_burst_impl
+
+
+def _patch_doc_burst(cls: Any) -> None:
+    if (not isinstance(cls, type) or cls.__dict__.get(_DOC_MARK) or not all(hasattr(cls, n) for n in (
+            "_cache_inbound_document", "_flush_buffered", "_event_session_key", "_merge_caption",
+            "_accept_update", "_should_drop_delayed_delivery"))):
+        return
+    cls._hte_orig_cache_document = cls.__dict__.get("_hte_orig_cache_document", cls._cache_inbound_document)
+
+    async def _cache_inbound_document(self, msg, event):
+        orig = type(self)._hte_orig_cache_document
+        impl = getattr(sys, "_hte_doc_impl", None)  # resolved per call so a plugin reload takes effect
+        if impl is None:
+            return await orig(self, msg, event)
+        return await impl(self, orig, msg, event)
+
+    cls._cache_inbound_document = _cache_inbound_document
+    setattr(cls, _DOC_MARK, True)
+    logger.info("telegram-enhanced: document burst merging enabled on %s.%s", cls.__module__, cls.__name__)
+
+
 _LIST_PATCH_MARK = "_hte_native_lists_v2"
 _LEGACY_LIST_PATCH_MARK = "_hte_native_lists"
 # Wrappers resolve helpers at call time, so a plugin reload updates the behaviour of an already-patched
@@ -1494,6 +1592,10 @@ def _patch_telegram_lists() -> None:
         logger.info("telegram-enhanced: live adapter class %s.%s id=%x patched=%s", type(live).__module__,
                     type(live).__name__, id(type(live)), bool(type(live).__dict__.get(_LIST_PATCH_MARK)))
     for cls in candidates:
+        try:
+            _patch_doc_burst(cls)
+        except Exception:
+            logger.warning("telegram-enhanced: document burst patch failed", exc_info=True)
         if (not isinstance(cls, type) or cls.__dict__.get(_LIST_PATCH_MARK)
                 or not hasattr(cls, "_needs_rich_rendering") or not hasattr(cls, "format_message")):
             continue

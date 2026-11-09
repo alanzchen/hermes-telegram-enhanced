@@ -24,6 +24,15 @@ class Detect(unittest.TestCase):
         self.assertEqual(i18n.detect(ORIGIN + "还是都用 rich message 吧"), "zh")
         self.assertEqual(i18n.detect('[Replying to: "找到原因了，已经改好了，四个 bot 都热加载了"]\n\nok, ship it please'), "en")
 
+    def test_attachment_notes_and_file_content_are_ignored(self):
+        note = ("[The user sent a document: 'OmiNotesWatch-2026-11-09-012619.ips'. It is saved at: "
+                "/opt/data/cache/documents/x.ips. Its text is not inlined here (it's a binary format such as PDF "
+                "or DOCX). To read it, extract the document's text yourself.]")
+        self.assertIsNone(i18n.detect(note))
+        self.assertIsNone(i18n.detect("[User sent a file: /tmp/a.ips]\n[User sent an image: /tmp/b.png]"))
+        self.assertIsNone(i18n.detect("[Content of notes.txt]:\nThis whole file is written in English prose."))
+        self.assertEqual(i18n.detect(note + "\n\n帮我看看这几个崩溃日志"), "zh")
+
     def test_undecidable(self):
         self.assertIsNone(i18n.detect("👍"))
         self.assertIsNone(i18n.detect("123"))

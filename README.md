@@ -32,6 +32,8 @@ hermes gateway restart
 | `stop_button` | `true` | Show the Thinking/Stop draft during turns in private chats |
 | `guest_mode` | `true` | Handle Guest Mode @mentions |
 | `guest_allowed_users` | `TELEGRAM_ALLOWED_USERS` | User IDs whose Guest Mode requests are answered; other users are ignored |
+| `merge_document_bursts` | `true` | Files sent together (one album, or back to back) reach the agent as one message instead of one turn per file |
+| `document_burst_seconds` | `1.5` | How long to wait after the last file of a burst before handing it to the agent |
 
 ## How it works
 
@@ -40,6 +42,7 @@ hermes gateway restart
 - **New update types**: Hermes polls with `allowed_updates=Update.ALL_TYPES`. The plugin appends `stopped_message_generation` and `guest_message` to that list at load time, because the bundled python-telegram-bot predates them. This takes effect on the next gateway (re)start.
 - **Guest Mode**: the plugin answers the guest query once with a placeholder and edits that inline message when the agent replies. It never posts anything else into the foreign chat. The agent is told that the answer is public in that chat.
 - **State**: kept under `$HERMES_HOME/telegram-enhanced/`, with directory mode `0700` and file mode `0600`.
+- **File bursts**: Hermes merges photo albums but hands every other file to the agent as its own message. With `busy_input_mode: interrupt`, each file of a multi-file send then interrupts the turn of the one before it, and files still waiting for the session are dropped. The plugin buffers the documents of one chat/topic that arrive together and passes them on as a single message.
 
 ## Notes
 

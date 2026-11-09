@@ -16,7 +16,9 @@ _LATIN_WORD = re.compile(r"[A-Za-z]{2,}")
 # Wrappers the gateway adds around the user's words (English metadata, quoted replies, injected context).
 _NOISE = re.compile(
     r"Gateway message origin.*?insufficient\.|\[Replying to:.*?\](?=\s*\n|\s*$)|<memory-context>.*?</memory-context>"
-    r"|\[System:[^\]]*\]|\[Context from[^\]]*\]|\[This response[^\]]*\]|\{[^{}]*\}|https?://\S+|`[^`]*`",
+    r"|\[System:[^\]]*\]|\[Context from[^\]]*\]|\[This response[^\]]*\]|\{[^{}]*\}|https?://\S+|`[^`]*`"
+    # attachment notes and inlined file content: the file's language is not the user's
+    r"|\[The user sent [^\]]*\]|\[User sent [^\]]*\]|\[Content of [^\]]*\]:.*",
     re.S)
 
 
