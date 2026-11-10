@@ -195,5 +195,18 @@ class PluginFlow(unittest.TestCase):
         self.assertIn("widget_query", held)
 
 
+class Adoption(unittest.TestCase):
+    def test_only_gateway_turns_are_adopted(self):
+        p = load_plugin()
+        sid = "20261110_210247_73052a"
+        self.assertTrue(p._is_gateway_turn(sid, f"{sid}:{sid}:5f8e03e9"))
+        # the post-reply background review runs in the same session with a random task id
+        self.assertFalse(p._is_gateway_turn(sid, f"{sid}:bf56d1e5-05b7-4f69-9038-63371498320d:5ee92da7"))
+        self.assertFalse(p._is_gateway_turn(sid, "other:other:1"))
+        self.assertFalse(p._is_gateway_turn(sid, ""))
+        p._state["loaded_at"] = __import__("time").time()
+        self.assertIsNone(p._adopt_turn(sid, f"{sid}:bf56d1e5-05b7-4f69-9038-63371498320d:5ee92da7"))
+
+
 if __name__ == "__main__":
     unittest.main()

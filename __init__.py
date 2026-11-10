@@ -677,11 +677,21 @@ def _rec_for_tool(turn_id: Any, session_id: str) -> dict[str, Any] | None:
 ADOPT_WINDOW = 3600  # seconds after a plugin load during which orphaned turns are picked up
 
 
+def _is_gateway_turn(session_id: str, turn_id: Any) -> bool:
+    """Gateway chat turns run with task_id == session_id, so their id is ``<session>:<session>:<hex>``.
+    Work that runs after the reply in the same session (the background memory/skill review) gets a random
+    task id; adopting it showed a "processing" bubble for minutes after the answer was already sent."""
+    parts = str(turn_id or "").split(":")
+    return len(parts) >= 3 and parts[0] == str(session_id) and parts[1] == str(session_id)
+
+
 def _adopt_turn(session_id: str, turn_id: Any) -> dict[str, Any] | None:
     """A plugin reload ends the in-flight turn's record ("plugin unload") and the new generation never
     sees that turn's pre_llm_call. Restart its bubble at the turn's next tool call — only for a
     Telegram DM topic with no live record (a subagent's tools land where the parent's record lives)."""
     if not turn_id or not session_id or time.time() - _state.get("loaded_at", 0) > ADOPT_WINDOW:
+        return None
+    if not _is_gateway_turn(session_id, turn_id):
         return None
     if _session("HERMES_SESSION_PLATFORM").lower() != "telegram":
         return None
