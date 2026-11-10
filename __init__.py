@@ -34,6 +34,7 @@ from .core import (
 )
 from . import i18n
 from . import followup as fu
+from . import widget as wg
 
 logger = logging.getLogger("hermes_plugins.telegram_enhanced")
 
@@ -1138,6 +1139,9 @@ async def _route_new_updates(update: Any, context: Any) -> None:
             from telegram.ext import ApplicationHandlerStop
             raise ApplicationHandlerStop
     kw = getattr(update, "api_kwargs", None) or {}
+    if isinstance(kw.get("widget_query"), dict):
+        _spawn(_on_widget_query, kw["widget_query"])  # must be answered within 15 s; HTTP off the loop
+        return
     if "stopped_message_generation" in kw:
         await _on_stopped_generation(update, context)
     elif getattr(update, "guest_message", None) is not None or "guest_message" in kw:
@@ -1526,6 +1530,149 @@ def telegram_wrapup(args: dict[str, Any], **_kw: Any) -> str:
         decision = args.get("decision")
         send["decision"] = str(args.get("title") or "") if decision is None else str(decision)
     return telegram_rich_send(send)
+
+
+# ---------------------------------------------------------------- HTML widgets (Bot API 10.4)
+
+WIDGET_SCHEMA = {
+    "name": "telegram_widget",
+    "description": (
+        "Send an interactive HTML widget into the CURRENT Telegram private chat/topic (Bot API 10.4): one "
+        "self-contained HTML document drawn inside the message bubble, sandboxed (no network, no keyboard, "
+        "taps only), styled natively by Telegram (unstyled <button>s look like the client's buttons; use the "
+        "--tg-theme-* CSS variables, never hard-coded colors). Use it when an in-bubble view beats text: a "
+        "small dashboard, a comparison with tap-to-choose, a checklist, a progress view you update in place. "
+        "For a plain question with buttons prefer telegram_decisions / telegram_rich_send. "
+        "actions: each tap of an element with data-action=\"<key>\" comes back to you as a normal turn "
+        "('[Telegram 小组件] ... 点击了「label」' + value); if the HTML has no data-action elements the plugin "
+        "adds a button row. With once=true (default) the first tap locks the buttons and marks the chosen one. "
+        "chat_data: a JSON object (<=1024 bytes) the widget reads as JSON.parse(TelegramWidget.chatData) and "
+        "redraws on the 'chatDataChanged' event; action=update replaces it on a sent widget (key 'chosen' is "
+        "reserved). Limits: 32 KB HTML, 4 KB after zlib -9 (checked before sending), inline CSS/JS only, images "
+        "only as data: URLs or inline SVG; no input/select/form elements. The message is sent immediately; do "
+        "not repeat it in your reply."),
+    "parameters": {"type": "object", "properties": {
+        "action": {"type": "string", "enum": ["send", "update"]},
+        "html": {"type": "string", "description": "send: the widget HTML (a fragment is fine)."},
+        "title": {"type": "string", "description": "send: what this widget is about (reported back with taps)."},
+        "actions": {"type": "array", "description": (
+            "send: up to 6 tappable actions, in Alan's language, e.g. [{key:'push', label:'现在推送', "
+            "value:'push the plugin to GitHub now'}]. key matches data-action in the HTML."),
+            "items": {"type": "object", "properties": {
+                "key": {"type": "string"}, "label": {"type": "string"}, "value": {"type": "string"}},
+                "required": ["label"]}},
+        "once": {"type": "boolean", "description": "send: lock after the first tap (default true)."},
+        "chat_data": {"type": "object", "description": "send/update: state the widget reads (JSON object)."},
+        "caption": {"type": "string", "description": "send: optional plain-text caption under the widget."},
+        "height": {"type": "integer", "description": "send: fixed height in px (50-600); omit to fit content."},
+        "reply_to": {"type": "integer", "description": "send: message to quote at the top."},
+        "message_id": {"type": "integer", "description": "update: the widget message."},
+    }, "required": ["action"]},
+}
+
+
+def telegram_widget(args: dict[str, Any], **_kw: Any) -> str:
+    target, err = _current_target()
+    if err:
+        return _result(success=False, error=f"telegram_widget {err}")
+    if target.get("chat_type") not in ("dm", "private", ""):
+        return _result(success=False, error="widgets work only in the private chat with the bot for now")
+    chat_id, thread_id = target["chat_id"], target.get("thread_id") or ""
+    store: JsonStore = _state["widgets"]
+    action = str(args.get("action") or "send").lower()
+    try:
+        data = wg.chat_data_obj(args.get("chat_data"))
+        if action == "update":
+            mid = int(args.get("message_id") or 0)
+            key = wg.store_key(chat_id, mid)
+            rec = store.get(key) or {}
+            if rec.get("chosen") is not None:
+                data["chosen"] = rec["chosen"]
+            res = _api("editMessageWidgetData", {"chat_id": _int_or_str(chat_id), "message_id": mid,
+                                                 "chat_data": wg.encode_data(data)})
+            if not res.get("ok"):
+                return _result(success=False, error=str(res.get("description") or "editMessageWidgetData failed"))
+            if rec:
+                rec["chat_data"] = data
+                store.set(key, rec)
+            return _result(success=True, action="updated", message_id=mid)
+        actions = wg.normalize_actions(args.get("actions"))
+        if actions and not (target.get("session_key") and target.get("user_id")):
+            return _result(success=False, error="no session/user bound; widget taps cannot route back")
+        doc = wg.build_html(str(args.get("html") or ""), actions)
+        raw, packed = wg.check_size(doc)
+        encoded = wg.encode_data(data) if data else None
+    except wg.WidgetError as exc:
+        return _result(success=False, error=str(exc))
+    payload: dict[str, Any] = {"chat_id": _int_or_str(chat_id), "html": doc}
+    if thread_id.isdigit():
+        payload["message_thread_id"] = int(thread_id)
+    if actions:
+        payload["allow_queries"] = True
+    if encoded:
+        payload["chat_data"] = encoded
+    if str(args.get("caption") or "").strip():
+        payload["caption"] = str(args["caption"])[:1024]
+    if str(args.get("height") or "").isdigit():
+        payload["height"] = max(50, min(600, int(args["height"])))
+    if str(args.get("reply_to") or "").isdigit():
+        payload["reply_parameters"] = {"message_id": int(args["reply_to"]), "allow_sending_without_reply": True}
+    res = _api("sendWidget", payload)
+    if not res.get("ok"):
+        return _result(success=False, error=str(res.get("description") or "sendWidget failed"),
+                       html_bytes=raw, compressed_bytes=packed)
+    mid = (res.get("result") or {}).get("message_id")
+    if actions:
+        with store.locked() as all_recs:
+            wg.prune(all_recs, time.time())
+            all_recs[wg.store_key(chat_id, mid)] = {
+                "chat_id": str(chat_id), "thread_id": thread_id, "message_id": mid,
+                "session_key": target["session_key"], "user_id": str(target["user_id"]),
+                "title": " ".join(str(args.get("title") or args.get("caption") or "").split())[:120],
+                "actions": actions, "once": args.get("once") is not False, "chosen": None,
+                "chat_data": data, "created_at": time.time()}
+    logger.info("telegram-enhanced: widget sent mid=%s actions=%d html=%dB packed=%dB", mid, len(actions), raw, packed)
+    return _result(success=True, message_id=mid, html_bytes=raw, compressed_bytes=packed)
+
+
+def _on_widget_query(raw: dict[str, Any]) -> None:
+    qid = str(raw.get("id") or "")
+    chat_id = str((raw.get("chat") or {}).get("id") or "")
+    mid = str(raw.get("message_id") or "")
+    user = raw.get("from") or {}
+    key = wg.parse_query(str(raw.get("data") or ""))
+    store: JsonStore = _state["widgets"]
+    skey = wg.store_key(chat_id, mid)
+    status, action, rec = "invalid", None, None
+    if key is not None:
+        with store.locked() as all_recs:
+            rec = all_recs.get(skey)
+            status, action = wg.claim(rec, key, str(user.get("id") or ""))
+            if status == "ok":
+                all_recs[skey] = rec
+    answer = {"ok": 1, "again": int(not rec.get("once", True))} if status == "ok" else {"ok": 0, "e": status}
+    _api("answerWidgetQuery", {"widget_query_id": qid, "data": json.dumps(answer)})
+    logger.info("telegram-enhanced: widget query %s data=%r -> %s", skey, raw.get("data"), status)
+    if status != "ok":
+        return
+    if rec.get("once", True):
+        state = dict(rec.get("chat_data") or {})
+        state["chosen"] = key
+        try:
+            res = _api("editMessageWidgetData", {"chat_id": _int_or_str(chat_id), "message_id": int(mid),
+                                                 "chat_data": wg.encode_data(state)})
+            if not res.get("ok"):
+                logger.warning("telegram-enhanced: widget state edit failed: %s", res.get("description"))
+        except wg.WidgetError:
+            logger.warning("telegram-enhanced: widget state too large to mark the choice")
+    ok = False
+    try:
+        ok = _state["ctx"].inject_message(wg.injection_text(rec, action, user.get("first_name") or "user"),
+                                          session_key=rec["session_key"])
+    except Exception:
+        logger.warning("telegram-enhanced: widget inject_message failed", exc_info=True)
+    if not ok:
+        logger.warning("telegram-enhanced: widget tap %s not routed (allow_gateway_injection?)", skey)
 
 
 # ---------------------------------------------------------------- guest mode
@@ -1961,10 +2108,14 @@ def _extend_allowed_updates() -> None:
     """
     try:
         import telegram
-        extra = ["stopped_message_generation", "guest_message"]
+        extra = ["stopped_message_generation", "guest_message", "widget_query"]
         current = [str(getattr(t, "value", t)) for t in telegram.Update.ALL_TYPES]
         missing = [t for t in extra if t not in current]
-        if missing:
+        if missing and isinstance(telegram.Update.ALL_TYPES, list):
+            # in place: the running poller holds this very list and serializes it on every getUpdates,
+            # so a hot reload adds new types without restarting polling
+            telegram.Update.ALL_TYPES.extend(missing)
+        elif missing:
             telegram.Update.ALL_TYPES = list(telegram.Update.ALL_TYPES) + missing
     except Exception:
         logger.debug("telegram-enhanced: could not extend allowed_updates", exc_info=True)
@@ -1985,6 +2136,7 @@ def register(ctx: Any) -> None:
     _state["stopmsgs"] = JsonStore(root, "stopmsgs.json")
     _state["reminders"] = JsonStore(root, "reminders.json")
     _state["decisions"] = JsonStore(root, "decisions.json")
+    _state["widgets"] = JsonStore(root, "widgets.json")
     sys._hte_stop_button = _on_stop_button
     sys._hte_new_updates = _route_new_updates
     try:
@@ -2005,6 +2157,9 @@ def register(ctx: Any) -> None:
     ctx.register_tool(name="telegram_wrapup", toolset=TOOLSET, schema=WRAPUP_SCHEMA,
                       handler=lambda args, **kw: telegram_wrapup(args or {}, **kw),
                       description="End-of-task summary card with next-step buttons", emoji="✅")
+    ctx.register_tool(name="telegram_widget", toolset=TOOLSET, schema=WIDGET_SCHEMA,
+                      handler=lambda args, **kw: telegram_widget(args or {}, **kw),
+                      description="Interactive HTML widgets inside the message bubble", emoji="🧩")
     ctx.register_tool(name="telegram_guest_reply", toolset=TOOLSET, schema=GUEST_SCHEMA,
                       handler=lambda args, **kw: telegram_guest_reply(args or {}, **kw),
                       description="Answer Telegram Guest Mode requests", emoji="👥")

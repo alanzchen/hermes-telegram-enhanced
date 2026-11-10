@@ -6,6 +6,9 @@ kind: standalone
 provides_tools:
   - telegram_rich_send
   - telegram_status_card
+  - telegram_decisions
+  - telegram_wrapup
+  - telegram_widget
   - telegram_guest_reply
 provides_hooks:
   - pre_llm_call
