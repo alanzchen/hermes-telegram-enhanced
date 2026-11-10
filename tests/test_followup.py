@@ -73,12 +73,28 @@ class Decisions(unittest.TestCase):
         self.assertEqual(items, [])
         self.assertFalse(fu.resolve_item(items, item_id="deadbeef")[1])
 
-    def test_render(self):
-        items, a = fu.add_item([], "要不要把插件推到 GitHub", 1762750000)
+    def test_render_default_yes_no_and_jump(self):
+        items, a = fu.add_item([], "要不要把插件推到 GitHub", 1762750000, msg=9570, sk="agent:x")
         md = fu.render_decisions(items, "zh", "America/Chicago")
         self.assertIn("待你决定 · 1", md)
-        self.assertIn(f'data="hd:{a}"', md)
-        self.assertEqual(fu.parse_decision(f"hd:{a}"), a)
+        self.assertIn(f'data="hd:{a}:0">1 · 是<', md)
+        self.assertIn(f'data="hd:{a}:1">1 · 否<', md)
+        self.assertIn(f'data="hd:{a}:j">1 · ↗ 原消息<', md)
+        self.assertEqual(fu.parse_decision(f"hd:{a}:1"), (a, "1"))
+        self.assertEqual(fu.parse_decision(f"hd:{a}:j"), (a, "j"))
+        self.assertIsNone(fu.parse_decision(f"hd:{a}"))
+
+    def test_custom_options_and_no_jump_without_message(self):
+        items, a = fu.add_item([], "Ship it?", 1.0, opts=["Push", "Roll back", "Later", "Extra"])
+        md = fu.render_decisions(items, "en", "America/Chicago")
+        self.assertIn(">1 · Roll back<", md)
+        self.assertNotIn("Extra", md)
+        self.assertNotIn(":j", md)
+        items, b = fu.add_item(items, "ship IT?", 2.0, msg=5)  # same item, gains the message link
+        self.assertEqual(a, b)
+        self.assertEqual(fu.find_item(items, a)["msg"], 5)
+        text = fu.decision_injection_text(fu.find_item(items, a), "Push", "Alan")
+        self.assertIn("「Ship it?」选了「Push」", text)
 
 
 class Wrapup(unittest.TestCase):

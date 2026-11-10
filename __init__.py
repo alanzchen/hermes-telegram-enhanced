@@ -235,7 +235,9 @@ def telegram_rich_send(args: dict[str, Any], **_kw: Any) -> str:
     tracked = False
     if entry and decision:
         try:
-            _decision_add(target["chat_id"], target.get("thread_id"), decision, entry["decision_id"])
+            _decision_add(target["chat_id"], target.get("thread_id"), decision, entry["decision_id"],
+                          msg=message_id, sk=target.get("session_key"), uid=target.get("user_id"),
+                          rid=entry["id"], opts=[c["label"] for c in entry["choices"]])
             tracked = True
         except Exception:
             logger.warning("telegram-enhanced: could not track decision", exc_info=True)
@@ -1377,10 +1379,11 @@ def _decision_sync(chat_id: Any, thread_id: Any) -> None:
                      "pinned": bool(pin.get("ok")), "created_at": time.time(), "updated_at": time.time()})
 
 
-def _decision_add(chat_id: Any, thread_id: Any, text: str, item_id: str | None = None) -> str:
+def _decision_add(chat_id: Any, thread_id: Any, text: str, item_id: str | None = None, **extra: Any) -> str:
     dkey = fu.decisions_key(chat_id, thread_id)
     with _state["decisions"].locked() as data:
-        items, item_id = fu.add_item((data.get(dkey) or {}).get("items") or [], text, time.time(), item_id)
+        items, item_id = fu.add_item((data.get(dkey) or {}).get("items") or [], text, time.time(), item_id,
+                                     **extra)
         data[dkey] = {"items": items}
     _decision_sync(chat_id, thread_id)
     return item_id
@@ -1412,14 +1415,92 @@ async def _on_followup_button(query: Any, data: str) -> None:
                                        str(getattr(getattr(query, "from_user", None), "id", "")), code)
         await query.answer(text=text[:190])
         return
-    item_id = fu.parse_decision(data)
-    if item_id:
-        ok = await asyncio.to_thread(_decision_resolve, chat_id, thread_id, item_id)
-        await query.answer(text=fu.s("dec_resolved" if ok else "dec_gone", lang))
-        if not ok:  # stale card: re-render it from the store
-            _spawn(_decision_sync, chat_id, thread_id)
+    parsed = fu.parse_decision(data)
+    if parsed:
+        await _on_decision_press(query, chat_id, thread_id, lang, *parsed)
         return
     await query.answer()
+
+
+def _jump_reply(chat_id: str, thread_id: str, message_id: int, lang: str) -> bool:
+    """A short reply to the original message: tapping its quote jumps there (works on every client)."""
+    payload: dict[str, Any] = {"chat_id": _int_or_str(chat_id), "text": fu.s("jump_here", lang),
+                               "reply_parameters": {"message_id": int(message_id)},
+                               "disable_notification": True}
+    if thread_id.isdigit():
+        payload["message_thread_id"] = int(thread_id)
+    res = _api("sendMessage", payload)
+    result = res.get("result")
+    mid = result.get("message_id") if isinstance(result, dict) else None
+    if mid:  # it is only a signpost: clean it up after a while
+        threading.Timer(180, _stop_delete, args=(chat_id, int(mid))).start()
+    return bool(res.get("ok"))
+
+
+def _press_original_choice(item: dict[str, Any], index: int, user_id: str, lang: str
+                           ) -> tuple[str, dict[str, Any] | None, dict[str, str] | None]:
+    """A card press on an item that mirrors a choice message counts as pressing that message's button."""
+    status, entry, choice = _state["pending"].claim(str(item["rid"]), index, user_id)
+    if status != "ok" or entry is None or choice is None:
+        return status, entry, choice
+    try:
+        render = entry.get("render") or {"align": entry.get("align")}
+        markdown = compose_markdown(entry.get("body") or "", entry.get("rows") or [], None, include_choices=False,
+                                    footer="> ✅ " + i18n.t("chosen", lang, label=f"**{choice['label']}**"),
+                                    display_tz=_display_tz(), **render)
+        if entry.get("chat_id") and entry.get("message_id"):
+            _api("editMessageText", {"chat_id": _int_or_str(entry["chat_id"]), "message_id": int(entry["message_id"]),
+                                     "rich_message": {"markdown": markdown}})
+    except Exception:
+        logger.debug("telegram-enhanced: could not mark the original choice message", exc_info=True)
+    return status, entry, choice
+
+
+async def _on_decision_press(query: Any, chat_id: str, thread_id: str, lang: str, item_id: str, k: str) -> None:
+    import asyncio
+    dkey = fu.decisions_key(chat_id, thread_id)
+    items = (await asyncio.to_thread(_state["decisions"].get, dkey) or {}).get("items") or []
+    item = fu.find_item(items, item_id)
+    if item is None:
+        await query.answer(text=fu.s("dec_gone", lang))
+        _spawn(_decision_sync, chat_id, thread_id)  # stale card: re-render from the store
+        return
+    if k == "j":
+        ok = await asyncio.to_thread(_jump_reply, chat_id, thread_id, int(item.get("msg") or 0), lang) \
+            if item.get("msg") else False
+        await query.answer(text=fu.s("jump_sent", lang) if ok else fu.s("dec_gone", lang))
+        return
+    options = fu.item_options(item, lang)
+    index = int(k)
+    if index >= len(options):
+        await query.answer(text=i18n.t("invalid", lang))
+        return
+    user = getattr(query, "from_user", None)
+    who = getattr(user, "first_name", None) or "user"
+    ctx = _state.get("ctx")
+    if item.get("rid"):
+        status, entry, choice = await asyncio.to_thread(_press_original_choice, item, index,
+                                                        str(getattr(user, "id", "")), lang)
+        if status != "ok":
+            names = {"expired": "expired", "unauthorized": "not_yours", "used": "used", "invalid": "invalid"}
+            await query.answer(text=i18n.t(names.get(status, "cannot"), lang))
+            if status in ("used", "expired"):
+                _spawn(_decision_resolve, chat_id, thread_id, item_id)
+            return
+        text, session_key = choice_injection_text(entry, choice, who), entry["session_key"]
+    else:
+        text, session_key = fu.decision_injection_text(item, options[index], who), item.get("sk")
+    ok = False
+    if ctx is not None and session_key:
+        try:
+            ok = bool(ctx.inject_message(text, session_key=session_key))
+        except Exception:
+            logger.warning("telegram-enhanced: decision press not routed", exc_info=True)
+    if not ok:
+        await query.answer(text=fu.s("dec_failed", lang))
+        return
+    await query.answer(text=fu.s("dec_answered", lang, label=options[index])[:190])
+    _spawn(_decision_resolve, chat_id, thread_id, item_id)
 
 
 DECISIONS_SCHEMA = {
@@ -1428,13 +1509,19 @@ DECISIONS_SCHEMA = {
         "Keep the pinned 'waiting on you' card of the CURRENT Telegram chat/topic up to date: everything that "
         "waits on Alan's decision or action (e.g. 'push the plugin to GitHub?'). action=add lists an item "
         "(same wording is not added twice), action=resolve crosses one off by id or by matching text, "
-        "action=list shows them. Alan can also tick items off himself with the card's ✓ buttons. Resolve an item "
-        "as soon as he decides, so the card never lists stale questions. Choice buttons sent with "
-        "telegram_rich_send/telegram_wrapup can do this automatically via their `decision` field."),
+        "action=list shows them. Each item on the card has answer buttons (default yes/no, or `options`) and a "
+        "button that jumps to the related message; a press comes back to this conversation as '[待你决定] … 选了 …' "
+        "and removes the item. Resolve an item yourself as soon as he decides in chat, so the card never lists "
+        "stale questions. Choice buttons sent with telegram_rich_send/telegram_wrapup do this automatically via "
+        "their `decision` field."),
     "parameters": {"type": "object", "properties": {
         "action": {"type": "string", "enum": ["add", "resolve", "list"]},
         "text": {"type": "string", "description": "add: one short line; resolve: text to match."},
         "id": {"type": "string", "description": "resolve: item id from add/list."},
+        "options": {"type": "array", "items": {"type": "string"},
+                    "description": "add: up to 3 short answer labels (default: yes / no in Alan's language)."},
+        "message_id": {"type": "integer", "description": "add: the message the decision is about (default: "
+                                                          "Alan's message that started this turn)."},
     }, "required": ["action"]},
 }
 
@@ -1447,7 +1534,11 @@ def telegram_decisions(args: dict[str, Any], **_kw: Any) -> str:
     action = str(args.get("action") or "list").lower()
     try:
         if action == "add":
-            item_id = _decision_add(chat_id, thread_id, str(args.get("text") or ""))
+            anchor = args.get("message_id") or target.get("message_id")
+            item_id = _decision_add(chat_id, thread_id, str(args.get("text") or ""),
+                                    msg=int(anchor) if str(anchor or "").isdigit() else None,
+                                    sk=target.get("session_key"), uid=target.get("user_id"),
+                                    opts=args.get("options") if isinstance(args.get("options"), list) else None)
             return _result(success=True, id=item_id)
         if action == "resolve":
             ok = _decision_resolve(chat_id, thread_id, str(args.get("id") or ""), str(args.get("text") or ""))

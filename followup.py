@@ -14,7 +14,8 @@ from zoneinfo import ZoneInfo
 SNOOZE_PREFIX = "hz:"
 DECISION_PREFIX = "hd:"
 SNOOZE_RE = re.compile(r"^hz:(1h|3h|ev|am)$")
-DECISION_RE = re.compile(r"^hd:([0-9a-f]{8})$")
+DECISION_RE = re.compile(r"^hd:([0-9a-f]{8}):(\d|j)$")
+MAX_OPTIONS = 3
 EVENING_HOUR = 20
 MORNING_HOUR = 9
 MAX_DECISIONS = 12
@@ -28,9 +29,14 @@ STR = {
     "set": {"zh": "好，{when} 提醒你", "en": "OK, I'll remind you {when}"},
     "nudge": {"zh": "⏰ 你让我这时候提醒你回头看这条", "en": "⏰ You asked me to bring this back now"},
     "dec_title": {"zh": "📌 待你决定 · {n}", "en": "📌 Waiting on you · {n}"},
-    "dec_done": {"zh": "✓ {label}", "en": "✓ {label}"},
-    "dec_resolved": {"zh": "已划掉", "en": "Crossed off"},
+    "yes": {"zh": "是", "en": "Yes"},
+    "no": {"zh": "否", "en": "No"},
+    "jump": {"zh": "↗ 原消息", "en": "↗ Message"},
+    "jump_here": {"zh": "↑ 就是这条，点上面的引用跳过去", "en": "↑ This one — tap the quote to jump there"},
+    "jump_sent": {"zh": "已在聊天底部回复了原消息", "en": "Replied to the original message at the bottom"},
+    "dec_answered": {"zh": "已选择：{label}", "en": "Selected: {label}"},
     "dec_gone": {"zh": "这件事已经处理过了", "en": "Already handled"},
+    "dec_failed": {"zh": "没能转给我，请直接回复", "en": "Couldn't pass this on — please reply directly"},
     "changed": {"zh": "改了什么", "en": "What changed"},
     "verified": {"zh": "验证过的", "en": "Verified"},
     "pending": {"zh": "还没做 / 没验证", "en": "Not done / not verified"},
@@ -119,25 +125,45 @@ def new_item_id() -> str:
     return secrets.token_hex(4)
 
 
-def parse_decision(data: str) -> str | None:
+def parse_decision(data: str) -> tuple[str, str] | None:
+    """``hd:<item>:<k>`` -> (item id, k) where k is an option index or 'j' (jump to the message)."""
     m = DECISION_RE.match(data or "")
-    return m.group(1) if m else None
+    return (m.group(1), m.group(2)) if m else None
+
+
+def item_options(item: dict[str, Any], lang: str) -> list[str]:
+    opts = [str(o) for o in (item.get("opts") or []) if str(o).strip()][:MAX_OPTIONS]
+    return opts or [s("yes", lang), s("no", lang)]
+
+
+def find_item(items: list[dict[str, Any]], item_id: str) -> dict[str, Any] | None:
+    return next((it for it in items if it.get("id") == item_id), None)
+
+
+def decision_injection_text(item: dict[str, Any], label: str, who: str) -> str:
+    """Data-only description of a press on the pinned card, for the conversation."""
+    return (f"[待你决定] {who} 对「{item.get('text', '')}」选了「{label}」\n"
+            f"decision_id: {item.get('id', '')}")
 
 
 def decisions_key(chat_id: Any, thread_id: Any) -> str:
     return f"{chat_id}:{thread_id or '-'}"
 
 
-def add_item(items: list[dict[str, Any]], text: str, now_ts: float, item_id: str | None = None
-             ) -> tuple[list[dict[str, Any]], str]:
+def add_item(items: list[dict[str, Any]], text: str, now_ts: float, item_id: str | None = None,
+             **extra: Any) -> tuple[list[dict[str, Any]], str]:
     text = " ".join(str(text or "").split())[:300]
     if not text:
         raise ValueError("text is required")
-    for it in items:  # same wording -> same item
+    extra = {k: v for k, v in extra.items() if v not in (None, "", [])}
+    if "opts" in extra:
+        extra["opts"] = [str(o)[:40] for o in extra["opts"] if str(o).strip()][:MAX_OPTIONS]
+    for it in items:  # same wording -> same item (newer details win)
         if it["text"].casefold() == text.casefold():
+            it.update(extra)
             return items, it["id"]
     item_id = item_id or new_item_id()
-    items = items + [{"id": item_id, "text": text, "at": now_ts}]
+    items = items + [{"id": item_id, "text": text, "at": now_ts, **extra}]
     return items[-MAX_DECISIONS:], item_id
 
 
@@ -156,9 +182,15 @@ def render_decisions(items: list[dict[str, Any]], lang: str, tz_name: str) -> st
     for i, it in enumerate(items, 1):
         when = datetime.fromtimestamp(float(it.get("at", 0)), _tz(tz_name)).strftime("%m-%d")
         lines.append(f"{i}. {it['text']} · {when}")
-    rows = [f'<tg-button type="callback_data" data="{DECISION_PREFIX}{it["id"]}">'
-            f'{html.escape(s("dec_done", lang, label=f"{i}. " + _short(it["text"])))}</tg-button>'
-            for i, it in enumerate(items, 1)]
+    rows = []
+    for i, it in enumerate(items, 1):
+        tags = [f'<tg-button type="callback_data" data="{DECISION_PREFIX}{it["id"]}:{k}">'
+                f'{html.escape(f"{i} · {_short(label, 16)}")}</tg-button>'
+                for k, label in enumerate(item_options(it, lang))]
+        if it.get("msg"):
+            tags.append(f'<tg-button type="callback_data" data="{DECISION_PREFIX}{it["id"]}:j">'
+                        f'{html.escape(f"{i} · " + s("jump", lang))}</tg-button>')
+        rows.append("\n".join(tags))
     buttons = "\n".join(f"<tg-button-row>\n{r}\n</tg-button-row>" for r in rows)
     return "\n".join(lines) + ("\n\n" + buttons if buttons else "")
 
