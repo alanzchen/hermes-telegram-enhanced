@@ -1489,7 +1489,8 @@ async def _on_decision_press(query: Any, chat_id: str, thread_id: str, lang: str
             return
         text, session_key = choice_injection_text(entry, choice, who), entry["session_key"]
     else:
-        text, session_key = fu.decision_injection_text(item, options[index], who), item.get("sk")
+        text = fu.decision_injection_text(item, options[index], who, fu.item_value(item, index, lang))
+        session_key = item.get("sk")
     ok = False
     if ctx is not None and session_key:
         try:
@@ -1509,17 +1510,22 @@ DECISIONS_SCHEMA = {
         "Keep the pinned 'waiting on you' card of the CURRENT Telegram chat/topic up to date: everything that "
         "waits on Alan's decision or action (e.g. 'push the plugin to GitHub?'). action=add lists an item "
         "(same wording is not added twice), action=resolve crosses one off by id or by matching text, "
-        "action=list shows them. Each item on the card has answer buttons (default yes/no, or `options`) and a "
-        "button that jumps to the related message; a press comes back to this conversation as '[待你决定] … 选了 …' "
-        "and removes the item. Resolve an item yourself as soon as he decides in chat, so the card never lists "
+        "action=list shows them. Each item on the card has the action buttons YOU choose in `options` (2-3 concrete "
+        "next steps that fit this decision, never a bare yes/no) plus a button that jumps to the related message; a "
+        "press comes back to this conversation as '[待你决定] … 选了 …' (with the option's value) and removes the "
+        "item. Resolve an item yourself as soon as he decides in chat, so the card never lists "
         "stale questions. Choice buttons sent with telegram_rich_send/telegram_wrapup do this automatically via "
         "their `decision` field."),
     "parameters": {"type": "object", "properties": {
         "action": {"type": "string", "enum": ["add", "resolve", "list"]},
         "text": {"type": "string", "description": "add: one short line; resolve: text to match."},
         "id": {"type": "string", "description": "resolve: item id from add/list."},
-        "options": {"type": "array", "items": {"type": "string"},
-                    "description": "add: up to 3 short answer labels (default: yes / no in Alan's language)."},
+        "options": {"type": "array", "description": (
+            "add (required): 2-3 concrete actions for this decision, in Alan's language, e.g. "
+            "[{label:'现在推送', value:'push the plugin to GitHub now'}, {label:'这批做完一起推'}, {label:'先不推'}]. "
+            "label <= 16 chars is shown on the button; value (optional) is what you will receive."),
+            "items": {"type": "object", "properties": {"label": {"type": "string"}, "value": {"type": "string"}},
+                      "required": ["label"]}},
         "message_id": {"type": "integer", "description": "add: the message the decision is about (default: "
                                                           "Alan's message that started this turn)."},
     }, "required": ["action"]},
@@ -1534,6 +1540,9 @@ def telegram_decisions(args: dict[str, Any], **_kw: Any) -> str:
     action = str(args.get("action") or "list").lower()
     try:
         if action == "add":
+            labels, _ = fu.normalize_options(args.get("options") if isinstance(args.get("options"), list) else [])
+            if len(labels) < 2:
+                return _result(success=False, error="options: give 2-3 concrete actions for this decision")
             anchor = args.get("message_id") or target.get("message_id")
             item_id = _decision_add(chat_id, thread_id, str(args.get("text") or ""),
                                     msg=int(anchor) if str(anchor or "").isdigit() else None,

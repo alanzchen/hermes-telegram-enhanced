@@ -96,6 +96,23 @@ class Decisions(unittest.TestCase):
         text = fu.decision_injection_text(fu.find_item(items, a), "Push", "Alan")
         self.assertIn("「Ship it?」选了「Push」", text)
 
+    def test_model_chosen_actions_with_values(self):
+        items, a = fu.add_item([], "插件推 GitHub", 1.0, opts=[
+            {"label": "现在推送", "value": "push the plugin to GitHub now"}, {"label": "这批做完一起推"}, "先不推"])
+        it = fu.find_item(items, a)
+        self.assertEqual(it["opts"], ["现在推送", "这批做完一起推", "先不推"])
+        self.assertEqual(fu.item_value(it, 0, "zh"), "push the plugin to GitHub now")
+        self.assertEqual(fu.item_value(it, 2, "zh"), "先不推")
+        text = fu.decision_injection_text(it, "现在推送", "Alan", fu.item_value(it, 0, "zh"))
+        self.assertIn("value: push the plugin to GitHub now", text)
+        md = fu.render_decisions(items, "zh", "America/Chicago")
+        self.assertIn(">1 · 这批做完一起推<", md)
+        self.assertNotIn(">1 · 是<", md)
+        # re-adding the same question with new actions replaces them
+        items, b = fu.add_item(items, "插件推 GitHub", 2.0, opts=["推", "不推"])
+        self.assertEqual(a, b)
+        self.assertEqual(fu.find_item(items, a)["opts"], ["推", "不推"])
+
 
 class Wrapup(unittest.TestCase):
     def test_sections(self):

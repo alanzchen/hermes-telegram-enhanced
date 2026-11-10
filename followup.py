@@ -131,19 +131,42 @@ def parse_decision(data: str) -> tuple[str, str] | None:
     return (m.group(1), m.group(2)) if m else None
 
 
+def normalize_options(options: Any) -> tuple[list[str], list[str]]:
+    """Options as strings or {label, value}: -> (labels, values); value defaults to the label."""
+    labels: list[str] = []
+    values: list[str] = []
+    for o in options or []:
+        if isinstance(o, dict):
+            label, value = str(o.get("label") or "").strip(), str(o.get("value") or "").strip()
+        else:
+            label, value = str(o or "").strip(), ""
+        if label:
+            labels.append(label[:40])
+            values.append((value or label)[:300])
+    return labels[:MAX_OPTIONS], values[:MAX_OPTIONS]
+
+
 def item_options(item: dict[str, Any], lang: str) -> list[str]:
     opts = [str(o) for o in (item.get("opts") or []) if str(o).strip()][:MAX_OPTIONS]
-    return opts or [s("yes", lang), s("no", lang)]
+    return opts or [s("yes", lang), s("no", lang)]  # legacy items without model-chosen actions
+
+
+def item_value(item: dict[str, Any], index: int, lang: str) -> str:
+    vals = item.get("vals") or []
+    return str(vals[index]) if index < len(vals) and vals[index] else item_options(item, lang)[index]
 
 
 def find_item(items: list[dict[str, Any]], item_id: str) -> dict[str, Any] | None:
     return next((it for it in items if it.get("id") == item_id), None)
 
 
-def decision_injection_text(item: dict[str, Any], label: str, who: str) -> str:
+def decision_injection_text(item: dict[str, Any], label: str, who: str, value: str = "") -> str:
     """Data-only description of a press on the pinned card, for the conversation."""
-    return (f"[待你决定] {who} 对「{item.get('text', '')}」选了「{label}」\n"
-            f"decision_id: {item.get('id', '')}")
+    lines = [f"[待你决定] {who} 对「{item.get('text', '')}」选了「{label}」"]
+    if value and value != label:
+        lines.append(f"value: {value}")
+    lines.append(f"decision_id: {item.get('id', '')}")
+    return "\n".join(lines)
 
 
 def decisions_key(chat_id: Any, thread_id: Any) -> str:
@@ -157,9 +180,16 @@ def add_item(items: list[dict[str, Any]], text: str, now_ts: float, item_id: str
         raise ValueError("text is required")
     extra = {k: v for k, v in extra.items() if v not in (None, "", [])}
     if "opts" in extra:
-        extra["opts"] = [str(o)[:40] for o in extra["opts"] if str(o).strip()][:MAX_OPTIONS]
+        labels, values = normalize_options(extra["opts"])
+        extra["opts"] = labels
+        if any(v != lab for v, lab in zip(values, labels)):
+            extra["vals"] = values
+        if not labels:
+            extra.pop("opts")
     for it in items:  # same wording -> same item (newer details win)
         if it["text"].casefold() == text.casefold():
+            if "opts" in extra:
+                it.pop("vals", None)
             it.update(extra)
             return items, it["id"]
     item_id = item_id or new_item_id()
