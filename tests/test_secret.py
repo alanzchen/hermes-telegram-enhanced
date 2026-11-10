@@ -189,6 +189,25 @@ class Flow(unittest.TestCase):
         self.assertEqual(out["action"], "skip")
         self.assertEqual(self.injected, [])
 
+    def test_card_pauses_this_topics_bubble_until_capture(self):
+        import threading
+
+        def rec(thread):
+            return {"chat_id": "100", "thread_id": thread, "cv": threading.Condition(), "ended": False, "draft": True,
+                    "draft_on": True, "stop_epoch": 0, "inflight": False, "key": "k" + thread, "draft_id": 1}
+        here, other = rec("55"), rec("77")
+        self.p._state["stops"].update({"here": here, "other": other})
+        try:
+            self.request()
+            self.assertFalse(here["draft_on"])  # the client's Send button is free for the secret
+            self.assertEqual(here["stop_epoch"], 1)
+            self.assertTrue(other["draft_on"])
+            self.p._on_pre_gateway_dispatch(self.event(SECRET))
+            self.assertTrue(here["draft_on"])  # bubble back once the value is in
+            self.assertNotEqual(here["draft_id"], 1)
+        finally:
+            self.p._state["stops"].clear()
+
     def test_only_private_chats(self):
         with mock.patch.dict(os.environ, {"HERMES_SESSION_CHAT_TYPE": "group"}):
             res = self.request()

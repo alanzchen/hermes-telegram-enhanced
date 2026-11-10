@@ -1780,6 +1780,29 @@ def _secret_values() -> dict[str, Any]:
     return sys._hte_secret_values
 
 
+def _secret_hold_drafts(chat_id: str, thread_id: str) -> int:
+    """Pause this topic's processing bubble before the secure-input card goes out. While a can_stop draft
+    is up the client turns Send into Stop and holds the message, so the secret could not be sent until the
+    turn ends. The card itself (a bot message) clears the visible draft; the paused worker sends no new one.
+    The bubble resumes when the value is captured or Alan sends any other message (the steer path)."""
+    with _state["turns_lock"]:
+        recs = [r for r in _state["stops"].values() if r["chat_id"] == str(chat_id)
+                and (r["thread_id"] or "") == (thread_id or "")]
+    held = 0
+    for r in recs:
+        with r["cv"]:
+            if r["ended"] or not r["draft"] or not r["draft_on"]:
+                continue
+            r["draft_on"] = False
+            r["stop_epoch"] += 1  # an older Stop-prompt timer must not resume it
+            r["cv"].notify_all()
+            r["cv"].wait_for(lambda: not r["inflight"], DRAFT_HTTP_TIMEOUT + 2)  # no draft may land after the card
+            held += 1
+    if held:
+        logger.info("telegram-enhanced: secure input: paused %d bubble(s) in chat %s thread %s", held, chat_id, thread_id)
+    return held
+
+
 def _secret_vault() -> str:
     return str(_setting("secret_vault", "Hermes") or "Hermes")
 
@@ -1875,6 +1898,7 @@ def _secret_claim(event: Any, src: Any, chat_id: str, thread_id: str, user_id: s
     mid = getattr(event, "message_id", None) or getattr(src, "message_id", None)
     logger.info("telegram-enhanced: secure input %s %s (%d chars)", req["id"], req["state"], req["length"])
     _spawn(_secret_finish, dict(req), value, mid)
+    _on_user_message(chat_id, thread_id, None)  # resume a bubble paused for the card (no text: no language guess)
     return {"action": "skip", "reason": "telegram-enhanced secure input"}
 
 
@@ -2040,6 +2064,7 @@ def telegram_secret(args: dict[str, Any], **_kw: Any) -> str:
         data[req["id"]] = req
     for r in superseded:
         _secret_card_edit(r, sx.s("cancelled", r.get("lang") or "zh", label=r["label"]))
+    _secret_hold_drafts(req["chat_id"], req["thread_id"])
     res = _send_rich(target, sx.card_markdown(req, req["lang"], _secret_vault()))
     if not res.get("ok"):
         _secret_cancel(req["id"])
