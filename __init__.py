@@ -1126,10 +1126,15 @@ async def _route_new_updates(update: Any, context: Any) -> None:
                     getattr(msg, "message_id", "?"), time.time() - msg.date.timestamp())
     query = getattr(update, "callback_query", None)
     data = str(getattr(query, "data", "") or "") if query is not None else ""
-    if data.startswith((fu.SNOOZE_PREFIX, fu.DECISION_PREFIX)):
+    if data.startswith((fu.SNOOZE_PREFIX, fu.DECISION_PREFIX, CALLBACK_PREFIX)):
         try:
-            await _on_followup_button(query, data)
-        finally:  # ours: core's catch-all must not see it
+            if data.startswith(CALLBACK_PREFIX):
+                # Choice buttons: the rb: handler wired at adapter start belongs to the plugin generation that
+                # was loaded then (reloads don't re-run handler factories), so answer here with current code.
+                await _make_callback(_state["ctx"])(update, context)
+            else:
+                await _on_followup_button(query, data)
+        finally:  # ours: core's catch-all and the stale rb: handler must not see it
             from telegram.ext import ApplicationHandlerStop
             raise ApplicationHandlerStop
     kw = getattr(update, "api_kwargs", None) or {}
