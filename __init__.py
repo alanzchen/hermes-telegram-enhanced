@@ -33,6 +33,7 @@ from .core import (
     parse_callback_data, time_fallback, parse_when, TIME_PLACEHOLDER_RE, bulletize_plain, has_markdown_list,
 )
 from . import i18n
+from . import followup as fu
 
 logger = logging.getLogger("hermes_plugins.telegram_enhanced")
 
@@ -205,6 +206,9 @@ RICH_SCHEMA = {
         "question": {"type": "string", "description": "What the choice buttons decide; echoed back with the press."},
         "align": {"type": "string", "enum": ["left", "center", "right"]},
         "single_use": {"type": "boolean", "description": "Choice buttons accept only the first press (default true)."},
+        "decision": {"type": "string", "description": (
+            "With choice buttons: a short line (<=80 chars) naming the decision. It is listed on this topic's "
+            "pinned 'waiting on you' card until Alan presses one of the buttons.")},
     }, "required": ["markdown"]},
 }
 
@@ -217,6 +221,9 @@ def telegram_rich_send(args: dict[str, Any], **_kw: Any) -> str:
         markdown, entry = _build(args, target)
     except ButtonSpecError as exc:
         return _result(success=False, error=str(exc))
+    decision = " ".join(str(args.get("decision") or "").split())
+    if entry and decision:
+        entry["decision_id"] = fu.new_item_id()
     if entry:
         _state["pending"].put(entry)
     res = _send_rich(target, markdown)
@@ -225,8 +232,15 @@ def telegram_rich_send(args: dict[str, Any], **_kw: Any) -> str:
     message_id = (res.get("result") or {}).get("message_id")
     if entry:
         _state["pending"].update(entry["id"], message_id=message_id)
+    tracked = False
+    if entry and decision:
+        try:
+            _decision_add(target["chat_id"], target.get("thread_id"), decision, entry["decision_id"])
+            tracked = True
+        except Exception:
+            logger.warning("telegram-enhanced: could not track decision", exc_info=True)
     return _result(success=True, message_id=message_id, request_id=entry["id"] if entry else None,
-                   choice_buttons=len(entry["choices"]) if entry else 0)
+                   choice_buttons=len(entry["choices"]) if entry else 0, decision_tracked=tracked)
 
 
 # ---------------------------------------------------------------- tool: status cards
@@ -343,6 +357,8 @@ def _make_callback(ctx: Any):
             return
         chosen = i18n.t("chosen", lang, label=choice["label"])
         await query.answer(text=chosen[:190])
+        if entry.get("decision_id"):
+            _spawn(_decision_resolve, entry.get("chat_id"), entry.get("thread_id"), entry["decision_id"])
         try:
             render = entry.get("render") or {"align": entry.get("align")}
             markdown = compose_markdown(entry.get("body") or "", entry.get("rows") or [], None,
@@ -1103,6 +1119,14 @@ async def _route_new_updates(update: Any, context: Any) -> None:
     if msg is not None and getattr(msg, "date", None) is not None and hasattr(msg.date, "timestamp"):
         logger.info("telegram-enhanced: user message %s received %.1fs after send",
                     getattr(msg, "message_id", "?"), time.time() - msg.date.timestamp())
+    query = getattr(update, "callback_query", None)
+    data = str(getattr(query, "data", "") or "") if query is not None else ""
+    if data.startswith((fu.SNOOZE_PREFIX, fu.DECISION_PREFIX)):
+        try:
+            await _on_followup_button(query, data)
+        finally:  # ours: core's catch-all must not see it
+            from telegram.ext import ApplicationHandlerStop
+            raise ApplicationHandlerStop
     kw = getattr(update, "api_kwargs", None) or {}
     if "stopped_message_generation" in kw:
         await _on_stopped_generation(update, context)
@@ -1207,6 +1231,274 @@ async def _on_stop_button(update: Any, _context: Any) -> None:
     await query.answer(text=i18n.t("stopped", lang) if ok else
                        i18n.t("turn_over" if not current else "stop_failed", lang))
     _spawn(_stop_end, rec, "stop button")
+
+
+
+# ---------------------------------------------------------------- follow-ups
+# Snooze: long replies get a row of "remind me later" buttons; the reminder is a short reply to that
+# message at the chosen time, sent by a small scheduler thread (no model call).
+# Decisions: one pinned card per chat/topic listing what is waiting on Alan; each item has a ✓ button.
+# Wrap-up: a structured end-of-task card (changed / verified / pending) with choice buttons.
+
+def _now_local():
+    from datetime import datetime
+    return datetime.now(fu._tz(_display_tz()))
+
+
+def _press_allowed(query: Any) -> bool:
+    user = str(getattr(getattr(query, "from_user", None), "id", "") or "")
+    msg = getattr(query, "message", None)
+    chat = getattr(msg, "chat", None)
+    if getattr(chat, "type", "") == "private":
+        return user == str(getattr(chat, "id", ""))
+    allowed = {u.strip() for u in os.environ.get("TELEGRAM_ALLOWED_USERS", "").split(",") if u.strip()}
+    return bool(user) and user in allowed
+
+
+def _snooze_markdown(content: str, chat_id: Any, thread_id: Any) -> str:
+    """Append the snooze row to a long final-looking reply in a private chat."""
+    if not _setting("snooze_buttons", True) or not isinstance(content, str) or fu.has_buttons(content):
+        return content
+    try:
+        min_chars = int(_setting("snooze_min_chars", 600))
+    except (TypeError, ValueError):
+        min_chars = 600
+    if len(content.strip()) < min_chars or not str(chat_id).isdigit():  # private chats have positive ids
+        return content
+    return content.rstrip() + "\n\n" + fu.snooze_row(_now_local(), _lang(chat_id, thread_id or ""))
+
+
+sys._hte_snooze_md = _snooze_markdown
+_SNOOZE_MARK = "_hte_snooze_v1"
+
+
+def _patch_snooze(cls: Any) -> None:
+    if not isinstance(cls, type) or cls.__dict__.get(_SNOOZE_MARK) or not hasattr(cls, "_try_send_rich"):
+        return
+    cls._hte_orig_try_send_rich = cls.__dict__.get("_hte_orig_try_send_rich", cls._try_send_rich)
+
+    async def _try_send_rich(self, chat_id, content, reply_to, metadata):
+        fn = getattr(sys, "_hte_snooze_md", None)
+        if fn is not None:
+            try:
+                thread = self._metadata_thread_id(metadata) if hasattr(self, "_metadata_thread_id") else None
+                content = fn(content, chat_id, thread)
+            except Exception:
+                logger.debug("telegram-enhanced: snooze row skipped", exc_info=True)
+        return await type(self)._hte_orig_try_send_rich(self, chat_id, content, reply_to, metadata)
+
+    cls._try_send_rich = _try_send_rich
+    setattr(cls, _SNOOZE_MARK, True)
+    logger.info("telegram-enhanced: snooze buttons enabled on %s.%s", cls.__module__, cls.__name__)
+
+
+def _snooze_set(chat_id: str, thread_id: str, message_id: int, user_id: str, code: str) -> str:
+    now = _now_local()
+    due = fu.snooze_due(code, now)
+    lang = _lang(chat_id, thread_id)
+    with _state["reminders"].locked() as data:
+        fu.prune_reminders(data, time.time())
+        data[fu.reminder_key(chat_id, message_id)] = {
+            "chat_id": chat_id, "thread_id": thread_id, "message_id": message_id, "user_id": user_id,
+            "due": due.timestamp(), "code": code, "set_at": time.time()}
+    logger.info("telegram-enhanced: reminder for %s:%s at %s", chat_id, message_id, due.isoformat())
+    return fu.s("set", lang, when=fu.when_text(due, now, lang))
+
+
+def _reminder_fire(rem: dict[str, Any]) -> bool:
+    chat_id, thread_id = str(rem["chat_id"]), str(rem.get("thread_id") or "")
+    lang = _lang(chat_id, thread_id)
+    markdown = fu.s("nudge", lang) + "\n\n" + fu.snooze_row(_now_local(), lang)
+    payload: dict[str, Any] = {"chat_id": _int_or_str(chat_id), "rich_message": {"markdown": markdown},
+                               "reply_parameters": {"message_id": int(rem["message_id"]),
+                                                    "allow_sending_without_reply": True}}
+    if thread_id.isdigit():
+        payload["message_thread_id"] = int(thread_id)
+    res = _api("sendRichMessage", payload)
+    if not res.get("ok"):
+        logger.warning("telegram-enhanced: reminder send failed: %s", res.get("description"))
+    return bool(res.get("ok"))
+
+
+def _reminder_loop(gen: object) -> None:
+    while getattr(sys, "_hte_reminder_gen", None) is gen:
+        try:
+            with _state["reminders"].locked() as data:
+                due = fu.due_reminders(data, time.time())
+                for key, _ in due:
+                    data.pop(key, None)
+            for _, rem in due:
+                if not _reminder_fire(rem) and rem.get("tries", 0) < 3:  # retry a transient failure later
+                    rem["tries"] = rem.get("tries", 0) + 1
+                    rem["due"] = time.time() + 120
+                    _state["reminders"].set(fu.reminder_key(rem["chat_id"], rem["message_id"]), rem)
+        except Exception:
+            logger.warning("telegram-enhanced: reminder loop error", exc_info=True)
+        time.sleep(15)
+
+
+def _decision_card_key(chat_id: Any, thread_id: Any) -> str:
+    return card_key(str(chat_id), str(thread_id or "") or None, "decisions")
+
+
+def _decision_sync(chat_id: Any, thread_id: Any) -> None:
+    """Render this topic's decision list onto its pinned card (create, edit, or delete when empty)."""
+    chat_id, thread_id = str(chat_id), str(thread_id or "")
+    dkey = fu.decisions_key(chat_id, thread_id)
+    items = (_state["decisions"].get(dkey) or {}).get("items") or []
+    ckey = _decision_card_key(chat_id, thread_id)
+    cards: JsonStore = _state["cards"]
+    card = cards.get(ckey)
+    chat = _int_or_str(chat_id)
+    if not items:
+        if card:
+            _api("unpinChatMessage", {"chat_id": chat, "message_id": card["message_id"]})
+            _api("deleteMessage", {"chat_id": chat, "message_id": card["message_id"]})
+            cards.pop(ckey)
+        return
+    markdown = fu.render_decisions(items, _lang(chat_id, thread_id), _display_tz())
+    if card:
+        res = _api("editMessageText", {"chat_id": chat, "message_id": card["message_id"],
+                                       "rich_message": {"markdown": markdown}})
+        if res.get("ok") or _not_modified(res):
+            card["updated_at"] = time.time()
+            cards.set(ckey, card)
+            return
+        if not _gone(res):
+            logger.warning("telegram-enhanced: decisions card edit failed: %s", res.get("description"))
+            return
+    res = _send_rich({"chat_id": chat_id, "thread_id": thread_id}, markdown)
+    if not res.get("ok"):
+        logger.warning("telegram-enhanced: decisions card send failed: %s", res.get("description"))
+        return
+    message_id = (res.get("result") or {}).get("message_id")
+    pin = _api("pinChatMessage", {"chat_id": chat, "message_id": message_id, "disable_notification": True})
+    cards.set(ckey, {"message_id": message_id, "chat_id": chat_id, "thread_id": thread_id or None,
+                     "pinned": bool(pin.get("ok")), "created_at": time.time(), "updated_at": time.time()})
+
+
+def _decision_add(chat_id: Any, thread_id: Any, text: str, item_id: str | None = None) -> str:
+    dkey = fu.decisions_key(chat_id, thread_id)
+    with _state["decisions"].locked() as data:
+        items, item_id = fu.add_item((data.get(dkey) or {}).get("items") or [], text, time.time(), item_id)
+        data[dkey] = {"items": items}
+    _decision_sync(chat_id, thread_id)
+    return item_id
+
+
+def _decision_resolve(chat_id: Any, thread_id: Any, item_id: str = "", text: str = "") -> bool:
+    dkey = fu.decisions_key(chat_id, thread_id)
+    with _state["decisions"].locked() as data:
+        items, changed = fu.resolve_item((data.get(dkey) or {}).get("items") or [], item_id, text)
+        if changed:
+            data[dkey] = {"items": items}
+    if changed:
+        _decision_sync(chat_id, thread_id)
+    return changed
+
+
+async def _on_followup_button(query: Any, data: str) -> None:
+    import asyncio
+    msg = getattr(query, "message", None)
+    chat_id = str(getattr(msg, "chat_id", "") or "")
+    thread_id = str(getattr(msg, "message_thread_id", "") or "")
+    lang = _lang(chat_id, thread_id)
+    if not _press_allowed(query):
+        await query.answer(text=i18n.t("not_yours", lang))
+        return
+    code = fu.parse_snooze(data)
+    if code and msg is not None:
+        text = await asyncio.to_thread(_snooze_set, chat_id, thread_id, int(msg.message_id),
+                                       str(getattr(getattr(query, "from_user", None), "id", "")), code)
+        await query.answer(text=text[:190])
+        return
+    item_id = fu.parse_decision(data)
+    if item_id:
+        ok = await asyncio.to_thread(_decision_resolve, chat_id, thread_id, item_id)
+        await query.answer(text=fu.s("dec_resolved" if ok else "dec_gone", lang))
+        if not ok:  # stale card: re-render it from the store
+            _spawn(_decision_sync, chat_id, thread_id)
+        return
+    await query.answer()
+
+
+DECISIONS_SCHEMA = {
+    "name": "telegram_decisions",
+    "description": (
+        "Keep the pinned 'waiting on you' card of the CURRENT Telegram chat/topic up to date: everything that "
+        "waits on Alan's decision or action (e.g. 'push the plugin to GitHub?'). action=add lists an item "
+        "(same wording is not added twice), action=resolve crosses one off by id or by matching text, "
+        "action=list shows them. Alan can also tick items off himself with the card's ✓ buttons. Resolve an item "
+        "as soon as he decides, so the card never lists stale questions. Choice buttons sent with "
+        "telegram_rich_send/telegram_wrapup can do this automatically via their `decision` field."),
+    "parameters": {"type": "object", "properties": {
+        "action": {"type": "string", "enum": ["add", "resolve", "list"]},
+        "text": {"type": "string", "description": "add: one short line; resolve: text to match."},
+        "id": {"type": "string", "description": "resolve: item id from add/list."},
+    }, "required": ["action"]},
+}
+
+
+def telegram_decisions(args: dict[str, Any], **_kw: Any) -> str:
+    target, err = _current_target()
+    if err:
+        return _result(success=False, error=f"telegram_decisions {err}")
+    chat_id, thread_id = target["chat_id"], target.get("thread_id") or ""
+    action = str(args.get("action") or "list").lower()
+    try:
+        if action == "add":
+            item_id = _decision_add(chat_id, thread_id, str(args.get("text") or ""))
+            return _result(success=True, id=item_id)
+        if action == "resolve":
+            ok = _decision_resolve(chat_id, thread_id, str(args.get("id") or ""), str(args.get("text") or ""))
+            return _result(success=ok, error=None if ok else "no matching item")
+        items = (_state["decisions"].get(fu.decisions_key(chat_id, thread_id)) or {}).get("items") or []
+        return _result(success=True, items=[{"id": i["id"], "text": i["text"]} for i in items])
+    except ValueError as exc:
+        return _result(success=False, error=str(exc))
+
+
+WRAPUP_SCHEMA = {
+    "name": "telegram_wrapup",
+    "description": (
+        "Finish a long task (code change, deployment, investigation) with ONE structured card in the CURRENT "
+        "Telegram chat/topic instead of a long prose report: what changed, what was verified, what is still "
+        "pending or unverified, and choice buttons for the next step (e.g. push / roll back / leave it). Headings "
+        "follow Alan's language; write the item text in his language too. Only list facts backed by real tool "
+        "output. With actions, the decision is also listed on the pinned 'waiting on you' card until he presses a "
+        "button. The card is sent immediately: end the turn after it, with at most one short line."),
+    "parameters": {"type": "object", "properties": {
+        "title": {"type": "string", "description": "One-line result, e.g. '文件合并已上线'."},
+        "summary": {"type": "string", "description": "Optional one or two sentences."},
+        "changed": {"type": "array", "items": {"type": "string"}},
+        "verified": {"type": "array", "items": {"type": "string"}},
+        "pending": {"type": "array", "items": {"type": "string"}},
+        "actions": {"type": "array", "description": "Next-step buttons (choice).", "items": {"type": "object",
+                    "properties": {"label": {"type": "string"}, "value": {"type": "string"},
+                                   "style": {"type": "string", "enum": ["primary", "success", "danger", "link"]}},
+                    "required": ["label"]}},
+        "decision": {"type": "string", "description": "Short name of the decision for the pinned card "
+                                                      "(defaults to the title). Empty string = do not track."},
+    }, "required": ["title"]},
+}
+
+
+def telegram_wrapup(args: dict[str, Any], **_kw: Any) -> str:
+    target, err = _current_target()
+    if err:
+        return _result(success=False, error=f"telegram_wrapup {err}")
+    lang = _lang(target["chat_id"], target.get("thread_id") or "")
+    body = fu.wrapup_markdown(str(args.get("title") or ""), lang, summary=str(args.get("summary") or ""),
+                              changed=args.get("changed"), verified=args.get("verified"), pending=args.get("pending"))
+    actions = [a for a in (args.get("actions") or []) if isinstance(a, dict) and a.get("label")]
+    send: dict[str, Any] = {"markdown": body}
+    if actions:
+        send["buttons"] = [[{"label": str(a["label"]), "type": "choice", "value": a.get("value"),
+                             "style": a.get("style")} for a in actions[i:i + 3]] for i in range(0, len(actions), 3)]
+        send["question"] = str(args.get("title") or "")
+        decision = args.get("decision")
+        send["decision"] = str(args.get("title") or "") if decision is None else str(decision)
+    return telegram_rich_send(send)
 
 
 # ---------------------------------------------------------------- guest mode
@@ -1596,6 +1888,10 @@ def _patch_telegram_lists() -> None:
             _patch_doc_burst(cls)
         except Exception:
             logger.warning("telegram-enhanced: document burst patch failed", exc_info=True)
+        try:
+            _patch_snooze(cls)
+        except Exception:
+            logger.warning("telegram-enhanced: snooze patch failed", exc_info=True)
         if (not isinstance(cls, type) or cls.__dict__.get(_LIST_PATCH_MARK)
                 or not hasattr(cls, "_needs_rich_rendering") or not hasattr(cls, "format_message")):
             continue
@@ -1660,6 +1956,8 @@ def register(ctx: Any) -> None:
     _state["guests"] = JsonStore(root, "guests.json")
     _state["meta"] = JsonStore(root, "meta.json")
     _state["stopmsgs"] = JsonStore(root, "stopmsgs.json")
+    _state["reminders"] = JsonStore(root, "reminders.json")
+    _state["decisions"] = JsonStore(root, "decisions.json")
     sys._hte_stop_button = _on_stop_button
     sys._hte_new_updates = _route_new_updates
     try:
@@ -1674,6 +1972,12 @@ def register(ctx: Any) -> None:
     ctx.register_tool(name="telegram_status_card", toolset=TOOLSET, schema=CARD_SCHEMA,
                       handler=lambda args, **kw: telegram_status_card(args or {}, **kw),
                       description="Pinned, edit-in-place Telegram status cards", emoji="📌")
+    ctx.register_tool(name="telegram_decisions", toolset=TOOLSET, schema=DECISIONS_SCHEMA,
+                      handler=lambda args, **kw: telegram_decisions(args or {}, **kw),
+                      description="Pinned card of decisions waiting on the user", emoji="📌")
+    ctx.register_tool(name="telegram_wrapup", toolset=TOOLSET, schema=WRAPUP_SCHEMA,
+                      handler=lambda args, **kw: telegram_wrapup(args or {}, **kw),
+                      description="End-of-task summary card with next-step buttons", emoji="✅")
     ctx.register_tool(name="telegram_guest_reply", toolset=TOOLSET, schema=GUEST_SCHEMA,
                       handler=lambda args, **kw: telegram_guest_reply(args or {}, **kw),
                       description="Answer Telegram Guest Mode requests", emoji="👥")
@@ -1705,7 +2009,13 @@ def register(ctx: Any) -> None:
 
     ctx.register_telegram_handler(factory)
 
+    gen = object()
+    sys._hte_reminder_gen = gen  # an older generation's scheduler thread sees this and exits
+    threading.Thread(target=_reminder_loop, args=(gen,), name="tg-enhanced-reminders", daemon=True).start()
+
     def _cleanup() -> None:
+        if getattr(sys, "_hte_reminder_gen", None) is gen:
+            sys._hte_reminder_gen = None
         with _state["turns_lock"]:
             recs = list(_state["stops"].values())
         for rec in recs:  # same terminal transition as a normal turn end, off the caller's thread

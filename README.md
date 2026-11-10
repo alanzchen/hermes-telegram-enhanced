@@ -34,6 +34,8 @@ hermes gateway restart
 | `guest_allowed_users` | `TELEGRAM_ALLOWED_USERS` | User IDs whose Guest Mode requests are answered; other users are ignored |
 | `merge_document_bursts` | `true` | Files sent together (one album, or back to back) reach the agent as one message instead of one turn per file |
 | `document_burst_seconds` | `1.5` | How long to wait after the last file of a burst before handing it to the agent |
+| `snooze_buttons` | `true` | Long replies in private chats get "remind me later" buttons |
+| `snooze_min_chars` | `600` | Minimum reply length for the snooze buttons |
 
 ## How it works
 
@@ -42,6 +44,9 @@ hermes gateway restart
 - **New update types**: Hermes polls with `allowed_updates=Update.ALL_TYPES`. The plugin appends `stopped_message_generation` and `guest_message` to that list at load time, because the bundled python-telegram-bot predates them. This takes effect on the next gateway (re)start.
 - **Guest Mode**: the plugin answers the guest query once with a placeholder and edits that inline message when the agent replies. It never posts anything else into the foreign chat. The agent is told that the answer is public in that chat.
 - **State**: kept under `$HERMES_HOME/telegram-enhanced/`, with directory mode `0700` and file mode `0600`.
+- **Remind me later**: long replies in private chats end with a row of buttons (in 1 hour / tonight / tomorrow morning). A press schedules a reminder; at that time the bot replies to the original message so it is one tap away. Reminders are kept in `reminders.json` and sent by a small scheduler thread, without any model call.
+- **Waiting on you**: `telegram_decisions` keeps one pinned card per chat/topic listing what waits on the user, each with a ✓ button that crosses it off. Choice buttons sent with a `decision` field are listed there until pressed.
+- **Wrap-up cards**: `telegram_wrapup` ends a long task with one card (what changed / what was verified / what is still pending) and next-step buttons.
 - **File bursts**: Hermes merges photo albums but hands every other file to the agent as its own message. With `busy_input_mode: interrupt`, each file of a multi-file send then interrupts the turn of the one before it, and files still waiting for the session are dropped. The plugin buffers the documents of one chat/topic that arrive together and passes them on as a single message.
 
 ## Notes
