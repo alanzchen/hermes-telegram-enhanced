@@ -84,6 +84,9 @@ class Helpers(unittest.TestCase):
         self.assertEqual(wg.claim(rec, "k", "1")[0], "used")
         rec2 = dict(rec, once=False, chosen="k")
         self.assertEqual(wg.claim(rec2, "k", "1")[0], "ok")
+        rec3 = dict(rec, chosen=None, expires_at=1)
+        self.assertEqual(wg.claim(rec3, "k", "1")[0], "expired")
+        self.assertIsNone(rec3["chosen"])
 
 
 class PluginFlow(unittest.TestCase):
@@ -194,6 +197,24 @@ class PluginFlow(unittest.TestCase):
             self.assertEqual(saved, {"success": True, "saved": "note"})
             self.assertTrue((Path(self.tmp.name) / "note.html").exists())
 
+    def test_approve_card_expiry_and_confirm(self):
+        with mock.patch.object(self.p, "_template_dirs", lambda: [ROOT / "templates"]):
+            ex = {t["name"]: t["example"] for t in json.loads(self.p.telegram_widget({"action": "templates"}))["templates"]}
+            res = json.loads(self.p.telegram_widget({"action": "send", "template": "approve", "chat_data": ex["approve"],
+                                                     "expires_in": 300}))
+            self.assertTrue(res["success"], res)
+            payload = self.calls[-1][1]
+            exp = json.loads(payload["chat_data"])["exp"]
+            self.assertAlmostEqual(exp, __import__("time").time() + 300, delta=5)
+            self.assertIn("data-confirm", payload["html"])  # runtime supports the second-tap confirm
+            store = self.p._state["widgets"]
+            rec = store.get("100:777")
+            rec["expires_at"] = 1  # pretend the five minutes passed
+            store.set("100:777", rec)
+            self.query("a:ok", qid="late")
+            self.assertEqual(self.answers()[-1], {"ok": 0, "e": "expired"})
+            self.assertEqual(self.injected, [])
+
     def test_rejects_before_any_api_call(self):
         res = json.loads(self.p.telegram_widget({"action": "send", "html": os.urandom(6000).hex()}))
         self.assertFalse(res["success"])
@@ -222,7 +243,7 @@ class Templates(unittest.TestCase):
     def test_builtins_parse_fit_and_list(self):
         dirs = [ROOT / "templates"]
         names = {t["name"] for t in wg.list_templates(dirs)}
-        self.assertTrue({"weather", "tracker", "compare", "stack"} <= names)
+        self.assertEqual({"weather", "tracker", "compare", "approve"}, names)
         for name in names:
             meta, body = wg.load_template(dirs, name)
             self.assertNotIn("<!--hte", body)

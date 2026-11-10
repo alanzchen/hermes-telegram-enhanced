@@ -1564,7 +1564,10 @@ WIDGET_SCHEMA = {
         "TEMPLATES: reusable widgets that draw themselves from chat_data. action=templates lists them with a "
         "description and an example chat_data; send with template=<name> + chat_data (no html). Built-ins: "
         "weather, tracker (package/trip/long-task progress, update i in place), compare (option cards with "
-        "tap-to-choose; taps come from chat_data.o), stack (a small game). action=save_template stores a new "
+        "tap-to-choose; taps come from chat_data.o), approve (authorization card for an external, paid or "
+        "sensitive action: details, risk line, approve needs a second tap, expires_in shows a countdown and "
+        "late taps are refused). Use approve instead of a plain yes/no whenever Alan must authorize "
+        "something. action=save_template stores a new "
         "one (name, html that reads JSON.parse(TelegramWidget.chatData), desc, example) when Alan asks to keep "
         "a widget for reuse."),
     "parameters": {"type": "object", "properties": {
@@ -1590,6 +1593,8 @@ WIDGET_SCHEMA = {
         "caption": {"type": "string", "description": "send: optional plain-text caption under the widget."},
         "height": {"type": "integer", "description": "send: fixed height in px (50-600); omit to fit content."},
         "reply_to": {"type": "integer", "description": "send: message to quote at the top."},
+        "expires_in": {"type": "integer", "description": (
+            "send: seconds until taps are refused (also written to chat_data.exp for the countdown).")},
         "message_id": {"type": "integer", "description": "update: the widget message."},
     }, "required": ["action"]},
 }
@@ -1641,6 +1646,10 @@ def telegram_widget(args: dict[str, Any], **_kw: Any) -> str:
                 actions = wg.actions_from_data(data, str(meta["actions_from"]))
         if actions and not (target.get("session_key") and target.get("user_id")):
             return _result(success=False, error="no session/user bound; widget taps cannot route back")
+        expires_at = None
+        if str(args.get("expires_in") or "").isdigit() and int(args["expires_in"]) > 0:
+            expires_at = int(time.time()) + int(args["expires_in"])
+            data["exp"] = expires_at
         doc = wg.build_html(html, actions)
         raw, packed = wg.check_size(doc)
         encoded = wg.encode_data(data) if data else None
@@ -1672,7 +1681,7 @@ def telegram_widget(args: dict[str, Any], **_kw: Any) -> str:
                 "session_key": target["session_key"], "user_id": str(target["user_id"]),
                 "title": " ".join(str(args.get("title") or args.get("caption") or "").split())[:120],
                 "actions": actions, "once": args.get("once") is not False, "chosen": None,
-                "chat_data": data, "created_at": time.time()}
+                "chat_data": data, "created_at": time.time(), "expires_at": expires_at}
     logger.info("telegram-enhanced: widget sent mid=%s actions=%d html=%dB packed=%dB", mid, len(actions), raw, packed)
     return _result(success=True, message_id=mid, html_bytes=raw, compressed_bytes=packed)
 

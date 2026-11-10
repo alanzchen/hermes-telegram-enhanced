@@ -1,0 +1,19 @@
+<!--hte {"desc":"授权卡：要你批准的对外/花钱/敏感操作。标题 t、明细 d（[[标签, 值], ...]）、风险提示 risk、按钮 o（第一个是批准，默认要连点两次确认；confirm:false 关掉，或写 confirm 文案）。发送时给 expires_in（秒）会显示倒计时，过期后按钮失效，插件端也拒收过期点击。","actions_from":"o","example":{"t":"示例：以助手身份发送邮件","d":[["收件人","someone@example.com"],["主题","示例主题"],["发件身份","助手账号"]],"risk":"对外发送，发出后无法撤回","o":[{"k":"ok","n":"批准","v":"批准：发送这封邮件"},{"k":"no","n":"拒绝","v":"拒绝：不要发送"}]}}-->
+<style>body{margin:0}.w{padding:14px 14px 26px}.h{display:flex;align-items:center;gap:8px;font-weight:600}.i{flex:none;width:30px;height:30px;border-radius:50%;background:var(--tg-theme-secondary-bg-color);display:flex;align-items:center;justify-content:center}table{width:100%;margin:10px 0 2px;font-size:.86em;border-collapse:collapse}td{padding:4px 0;vertical-align:top;border:0}td:first-child{color:var(--tg-theme-hint-color);width:32%;padding-right:8px}.r{font-size:.82em;color:var(--tg-theme-destructive-text-color);margin-top:6px}.b{display:flex;gap:8px;margin-top:12px}.b button{flex:1}.s{font-weight:600;margin-top:10px}.e{font-size:.75em;color:var(--tg-theme-hint-color);margin-top:8px}</style>
+<div class="w" data-hte-actions><div class="h"><div class="i">🔐</div><div id="t"></div></div><table id="d"></table><div class="r" id="r"></div><div class="b" id="b"></div><div class="s" id="s"></div><div class="e" id="e"></div></div>
+<script>
+const T=window.TelegramWidget,$=i=>document.getElementById(i),E=x=>String(x==null?'':x).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+let s=null;try{s=JSON.parse(T&&T.chatData||'null')}catch(e){}
+const O=s&&s.o||[];
+if(s){$('t').textContent=s.t||'';$('r').textContent=s.risk||'';
+$('d').innerHTML=(s.d||[]).map(r=>'<tr><td>'+E(r[0])+'</td><td>'+E(r[1])+'</td></tr>').join('');
+$('b').innerHTML=O.map((o,i)=>'<button data-action="'+E(o.k)+'"'+(i===0&&s.confirm!==false?' data-confirm="'+E(s.confirm||'再点一次确认')+'"':'')+'>'+E(o.n)+'</button>').join('')}
+function off(){O.forEach(o=>{const b=document.querySelector('[data-action="'+o.k+'"]');if(b)b.disabled=true})}
+let iv=0;
+function tick(){let c=null;try{c=JSON.parse(T&&T.chatData||'{}').chosen}catch(e){}
+if(c!=null){const o=O.find(x=>x.k===c);$('s').textContent='已选择：'+(o?o.n:c);$('e').textContent='';clearInterval(iv);return}
+if(!s||!s.exp)return;const l=Math.round(s.exp-Date.now()/1000);
+if(l<=0){$('e').textContent='已过期，需要的话让我重新发起';off();clearInterval(iv);return}
+$('e').textContent=(l>=60?Math.floor(l/60)+' 分 ':'')+(l%60)+' 秒后失效'}
+if(T)T.onEvent('chatDataChanged',tick);tick();iv=setInterval(tick,1000);if(T&&T.ready)T.ready();
+</script>

@@ -32,6 +32,8 @@ _RUNTIME = (
     "function P(){var c=S().chosen;K.forEach(function(k){var b=B(k);if(!b||c==null)return;"
     "b.disabled=true;if(k===c)b.classList.add('hte-chosen')})}"
     "K.forEach(function(k){var b=B(k);if(b)b.addEventListener('click',function(){if(b.disabled)return;"
+    "var q=b.getAttribute('data-confirm');if(q&&!b._a){var o=b.textContent;b._a=1;b.textContent=q;"
+    "setTimeout(function(){if(!b.disabled){b._a=0;b.textContent=o}},4000);return}"
     "b.disabled=true;W.request('a:'+k).then(function(r){var d={};try{d=JSON.parse(r.result||'{}')}catch(x){}"
     "if(!d.ok||d.again)b.disabled=false},function(){b.disabled=false})})});"
     "W.onEvent('chatDataChanged',P);P();if(W.ready)W.ready()})();</script>"
@@ -151,6 +153,8 @@ def claim(rec: dict[str, Any] | None, key: str, user_id: str) -> tuple[str, dict
         return "invalid", None
     if rec.get("once", True) and rec.get("chosen") is not None:
         return "used", None
+    if rec.get("expires_at") and time.time() > float(rec["expires_at"]):
+        return "expired", None
     rec["chosen"] = key
     rec["pressed_at"] = time.time()
     return "ok", action
