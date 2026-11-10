@@ -52,66 +52,29 @@ class Snooze(unittest.TestCase):
 
 
 class Decisions(unittest.TestCase):
-    def test_add_dedupes_and_caps(self):
-        items, a = fu.add_item([], "推送 Telegram 插件到 GitHub", 1.0)
-        items, b = fu.add_item(items, "  推送 telegram 插件到 github ", 2.0)
-        self.assertEqual(a, b)
-        self.assertEqual(len(items), 1)
-        for i in range(20):
-            items, _ = fu.add_item(items, f"item {i}", 3.0 + i)
-        self.assertEqual(len(items), fu.MAX_DECISIONS)
+    def test_options_become_choice_buttons(self):
+        btns = fu.normalize_options([{"label": "现在推送", "value": "push now", "style": "primary"},
+                                     "先不推", {"label": ""}, "a", "b", "c"])
+        self.assertEqual([b["label"] for b in btns], ["现在推送", "先不推", "a", "b"])
+        self.assertEqual(btns[0]["value"], "push now")
+        self.assertIsNone(btns[1]["value"])
+        self.assertTrue(all(b["type"] == "choice" for b in btns))
+        self.assertEqual([len(r) for r in fu.option_rows(btns)], [2, 2])
+        self.assertEqual([len(r) for r in fu.option_rows(btns[:3])], [2, 1])
+
+    def test_markdown(self):
+        self.assertEqual(fu.decision_markdown(" 推不推 ", "本地有 5 个提交"), "**📌 推不推**\n\n本地有 5 个提交")
+        self.assertEqual(fu.decision_markdown("推不推"), "**📌 推不推**")
         with self.assertRaises(ValueError):
-            fu.add_item(items, "   ", 1.0)
+            fu.decision_markdown("  ")
 
-    def test_resolve_by_id_or_text(self):
-        items, a = fu.add_item([], "Push plugin", 1.0)
-        items, _ = fu.add_item(items, "File upstream issue", 2.0)
-        items, ok = fu.resolve_item(items, item_id=a)
-        self.assertTrue(ok)
-        items, ok = fu.resolve_item(items, text="upstream")
-        self.assertTrue(ok)
-        self.assertEqual(items, [])
-        self.assertFalse(fu.resolve_item(items, item_id="deadbeef")[1])
-
-    def test_render_default_yes_no_and_jump(self):
-        items, a = fu.add_item([], "要不要把插件推到 GitHub", 1762750000, msg=9570, sk="agent:x")
-        md = fu.render_decisions(items, "zh", "America/Chicago")
-        self.assertIn("待你决定 · 1", md)
-        self.assertIn(f'data="hd:{a}:0">1 · 是<', md)
-        self.assertIn(f'data="hd:{a}:1">1 · 否<', md)
-        self.assertIn(f'data="hd:{a}:j">1 · ↗ 原消息<', md)
-        self.assertEqual(fu.parse_decision(f"hd:{a}:1"), (a, "1"))
-        self.assertEqual(fu.parse_decision(f"hd:{a}:j"), (a, "j"))
-        self.assertIsNone(fu.parse_decision(f"hd:{a}"))
-
-    def test_custom_options_and_no_jump_without_message(self):
-        items, a = fu.add_item([], "Ship it?", 1.0, opts=["Push", "Roll back", "Later", "Extra"])
-        md = fu.render_decisions(items, "en", "America/Chicago")
-        self.assertIn(">1 · Roll back<", md)
-        self.assertNotIn("Extra", md)
-        self.assertNotIn(":j", md)
-        items, b = fu.add_item(items, "ship IT?", 2.0, msg=5)  # same item, gains the message link
-        self.assertEqual(a, b)
-        self.assertEqual(fu.find_item(items, a)["msg"], 5)
-        text = fu.decision_injection_text(fu.find_item(items, a), "Push", "Alan")
-        self.assertIn("「Ship it?」选了「Push」", text)
-
-    def test_model_chosen_actions_with_values(self):
-        items, a = fu.add_item([], "插件推 GitHub", 1.0, opts=[
-            {"label": "现在推送", "value": "push the plugin to GitHub now"}, {"label": "这批做完一起推"}, "先不推"])
-        it = fu.find_item(items, a)
-        self.assertEqual(it["opts"], ["现在推送", "这批做完一起推", "先不推"])
-        self.assertEqual(fu.item_value(it, 0, "zh"), "push the plugin to GitHub now")
-        self.assertEqual(fu.item_value(it, 2, "zh"), "先不推")
-        text = fu.decision_injection_text(it, "现在推送", "Alan", fu.item_value(it, 0, "zh"))
-        self.assertIn("value: push the plugin to GitHub now", text)
-        md = fu.render_decisions(items, "zh", "America/Chicago")
-        self.assertIn(">1 · 这批做完一起推<", md)
-        self.assertNotIn(">1 · 是<", md)
-        # re-adding the same question with new actions replaces them
-        items, b = fu.add_item(items, "插件推 GitHub", 2.0, opts=["推", "不推"])
-        self.assertEqual(a, b)
-        self.assertEqual(fu.find_item(items, a)["opts"], ["推", "不推"])
+    def test_track_find_untrack(self):
+        items = fu.track([], {"id": "a1", "text": "Push plugin", "rid": "r1", "mid": 5})
+        items = fu.track(items, {"id": "b2", "text": "File upstream issue", "rid": "r2", "mid": 6})
+        self.assertEqual(fu.find_open(items, rid="r2")["id"], "b2")
+        self.assertEqual(fu.find_open(items, text="push")["id"], "a1")
+        self.assertIsNone(fu.find_open(items, item_id="zz"))
+        self.assertEqual([i["id"] for i in fu.untrack(items, "a1")], ["b2"])
 
 
 class Wrapup(unittest.TestCase):

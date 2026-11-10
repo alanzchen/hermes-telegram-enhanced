@@ -148,8 +148,10 @@ def _build(args: dict[str, Any], target: dict[str, str]) -> tuple[str, dict[str,
     return markdown, entry
 
 
-def _send_rich(target: dict[str, str], markdown: str) -> dict[str, Any]:
+def _send_rich(target: dict[str, str], markdown: str, reply_to: int | None = None) -> dict[str, Any]:
     payload: dict[str, Any] = {"chat_id": _int_or_str(target["chat_id"]), "rich_message": {"markdown": markdown}}
+    if reply_to:  # quoted at the top of the message; tapping the quote jumps to it
+        payload["reply_parameters"] = {"message_id": int(reply_to), "allow_sending_without_reply": True}
     if target.get("thread_id") and str(target["thread_id"]).isdigit():
         payload["message_thread_id"] = int(target["thread_id"])
     res = _api("sendRichMessage", payload)
@@ -207,8 +209,10 @@ RICH_SCHEMA = {
         "align": {"type": "string", "enum": ["left", "center", "right"]},
         "single_use": {"type": "boolean", "description": "Choice buttons accept only the first press (default true)."},
         "decision": {"type": "string", "description": (
-            "With choice buttons: a short line (<=80 chars) naming the decision. It is listed on this topic's "
-            "pinned 'waiting on you' card until Alan presses one of the buttons.")},
+            "With choice buttons: a short line (<=80 chars) naming the decision. The message is pinned until Alan "
+            "presses a button and is listed by telegram_decisions.")},
+        "reply_to": {"type": "integer", "description": (
+            "Message id to quote at the top (e.g. the message this is about); tapping the quote jumps there.")},
     }, "required": ["markdown"]},
 }
 
@@ -221,23 +225,22 @@ def telegram_rich_send(args: dict[str, Any], **_kw: Any) -> str:
         markdown, entry = _build(args, target)
     except ButtonSpecError as exc:
         return _result(success=False, error=str(exc))
-    decision = " ".join(str(args.get("decision") or "").split())
+    decision = " ".join(str(args.get("decision") or "").split())[:120]
     if entry and decision:
-        entry["decision_id"] = fu.new_item_id()
+        entry["decision"] = decision
     if entry:
         _state["pending"].put(entry)
-    res = _send_rich(target, markdown)
+    reply_to = args.get("reply_to")
+    res = _send_rich(target, markdown, int(reply_to) if str(reply_to or "").isdigit() else None)
     if not res.get("ok"):
         return _result(success=False, error=str(res.get("description") or "sendRichMessage failed"))
     message_id = (res.get("result") or {}).get("message_id")
     if entry:
         _state["pending"].update(entry["id"], message_id=message_id)
     tracked = False
-    if entry and decision:
+    if entry and decision and message_id:
         try:
-            _decision_add(target["chat_id"], target.get("thread_id"), decision, entry["decision_id"],
-                          msg=message_id, sk=target.get("session_key"), uid=target.get("user_id"),
-                          rid=entry["id"], opts=[c["label"] for c in entry["choices"]])
+            _decision_open(target["chat_id"], target.get("thread_id") or "", decision, int(message_id), entry["id"])
             tracked = True
         except Exception:
             logger.warning("telegram-enhanced: could not track decision", exc_info=True)
@@ -359,8 +362,8 @@ def _make_callback(ctx: Any):
             return
         chosen = i18n.t("chosen", lang, label=choice["label"])
         await query.answer(text=chosen[:190])
-        if entry.get("decision_id"):
-            _spawn(_decision_resolve, entry.get("chat_id"), entry.get("thread_id"), entry["decision_id"])
+        if entry.get("decision"):
+            _spawn(_decision_answered, entry)
         try:
             render = entry.get("render") or {"align": entry.get("align")}
             markdown = compose_markdown(entry.get("body") or "", entry.get("rows") or [], None,
@@ -1339,65 +1342,58 @@ def _reminder_loop(gen: object) -> None:
         time.sleep(15)
 
 
-def _decision_card_key(chat_id: Any, thread_id: Any) -> str:
-    return card_key(str(chat_id), str(thread_id or "") or None, "decisions")
-
-
-def _decision_sync(chat_id: Any, thread_id: Any) -> None:
-    """Render this topic's decision list onto its pinned card (create, edit, or delete when empty)."""
-    chat_id, thread_id = str(chat_id), str(thread_id or "")
-    dkey = fu.decisions_key(chat_id, thread_id)
-    items = (_state["decisions"].get(dkey) or {}).get("items") or []
-    ckey = _decision_card_key(chat_id, thread_id)
-    cards: JsonStore = _state["cards"]
-    card = cards.get(ckey)
-    chat = _int_or_str(chat_id)
-    if not items:
-        if card:
-            _api("unpinChatMessage", {"chat_id": chat, "message_id": card["message_id"]})
-            _api("deleteMessage", {"chat_id": chat, "message_id": card["message_id"]})
-            cards.pop(ckey)
-        return
-    markdown = fu.render_decisions(items, _lang(chat_id, thread_id), _display_tz())
-    if card:
-        res = _api("editMessageText", {"chat_id": chat, "message_id": card["message_id"],
-                                       "rich_message": {"markdown": markdown}})
-        if res.get("ok") or _not_modified(res):
-            card["updated_at"] = time.time()
-            cards.set(ckey, card)
-            return
-        if not _gone(res):
-            logger.warning("telegram-enhanced: decisions card edit failed: %s", res.get("description"))
-            return
-    res = _send_rich({"chat_id": chat_id, "thread_id": thread_id}, markdown)
-    if not res.get("ok"):
-        logger.warning("telegram-enhanced: decisions card send failed: %s", res.get("description"))
-        return
-    message_id = (res.get("result") or {}).get("message_id")
-    pin = _api("pinChatMessage", {"chat_id": chat, "message_id": message_id, "disable_notification": True})
-    cards.set(ckey, {"message_id": message_id, "chat_id": chat_id, "thread_id": thread_id or None,
-                     "pinned": bool(pin.get("ok")), "created_at": time.time(), "updated_at": time.time()})
-
-
-def _decision_add(chat_id: Any, thread_id: Any, text: str, item_id: str | None = None, **extra: Any) -> str:
+def _decision_open(chat_id: str, thread_id: str, text: str, message_id: int, request_id: str) -> str:
+    """Pin a decision message and remember it as open."""
+    pin = _api("pinChatMessage", {"chat_id": _int_or_str(chat_id), "message_id": message_id, "disable_notification": True})
+    item = {"id": fu.new_item_id(), "text": text, "mid": message_id, "rid": request_id, "at": time.time(),
+            "pinned": bool(pin.get("ok"))}
     dkey = fu.decisions_key(chat_id, thread_id)
     with _state["decisions"].locked() as data:
-        items, item_id = fu.add_item((data.get(dkey) or {}).get("items") or [], text, time.time(), item_id,
-                                     **extra)
-        data[dkey] = {"items": items}
-    _decision_sync(chat_id, thread_id)
-    return item_id
+        data[dkey] = {"items": fu.track((data.get(dkey) or {}).get("items") or [], item)}
+    return item["id"]
 
 
-def _decision_resolve(chat_id: Any, thread_id: Any, item_id: str = "", text: str = "") -> bool:
+def _decision_forget(chat_id: Any, thread_id: Any, item_id: str = "", text: str = "", rid: str = ""
+                     ) -> dict[str, Any] | None:
     dkey = fu.decisions_key(chat_id, thread_id)
     with _state["decisions"].locked() as data:
-        items, changed = fu.resolve_item((data.get(dkey) or {}).get("items") or [], item_id, text)
-        if changed:
-            data[dkey] = {"items": items}
-    if changed:
-        _decision_sync(chat_id, thread_id)
-    return changed
+        items = (data.get(dkey) or {}).get("items") or []
+        item = fu.find_open(items, item_id, text, rid)
+        if item is not None:
+            data[dkey] = {"items": fu.untrack(items, item["id"])}
+    return item
+
+
+def _decision_answered(entry: dict[str, Any]) -> None:
+    """A button on a decision message was pressed: unpin it and stop listing it."""
+    item = _decision_forget(entry.get("chat_id"), entry.get("thread_id") or "", rid=str(entry.get("id") or ""))
+    mid = (item or {}).get("mid") or entry.get("message_id")
+    if mid:
+        _api("unpinChatMessage", {"chat_id": _int_or_str(entry.get("chat_id")), "message_id": int(mid)})
+
+
+def _decision_close(chat_id: str, thread_id: str, item_id: str = "", text: str = "") -> bool:
+    """Alan decided in the chat: retire the buttons (so they can't fire later), mark it handled, unpin."""
+    item = _decision_forget(chat_id, thread_id, item_id, text)
+    if item is None:
+        return False
+    lang = _lang(chat_id, thread_id)
+    entry = None
+    with _state["pending"].locked() as data:
+        if item.get("rid") in data:
+            data[item["rid"]]["answered"] = {"index": -1, "user_id": "agent", "at": time.time()}
+            entry = dict(data[item["rid"]])
+    if entry is not None:
+        try:
+            render = entry.get("render") or {"align": entry.get("align")}
+            markdown = compose_markdown(entry.get("body") or "", entry.get("rows") or [], None, include_choices=False,
+                                        footer="> " + fu.s("closed", lang), display_tz=_display_tz(), **render)
+            _api("editMessageText", {"chat_id": _int_or_str(chat_id), "message_id": int(item["mid"]),
+                                     "rich_message": {"markdown": markdown}})
+        except Exception:
+            logger.debug("telegram-enhanced: could not mark decision closed", exc_info=True)
+    _api("unpinChatMessage", {"chat_id": _int_or_str(chat_id), "message_id": int(item["mid"])})
+    return True
 
 
 async def _on_followup_button(query: Any, data: str) -> None:
@@ -1415,119 +1411,36 @@ async def _on_followup_button(query: Any, data: str) -> None:
                                        str(getattr(getattr(query, "from_user", None), "id", "")), code)
         await query.answer(text=text[:190])
         return
-    parsed = fu.parse_decision(data)
-    if parsed:
-        await _on_decision_press(query, chat_id, thread_id, lang, *parsed)
-        return
-    await query.answer()
-
-
-def _jump_reply(chat_id: str, thread_id: str, message_id: int, lang: str) -> bool:
-    """A short reply to the original message: tapping its quote jumps there (works on every client)."""
-    payload: dict[str, Any] = {"chat_id": _int_or_str(chat_id), "text": fu.s("jump_here", lang),
-                               "reply_parameters": {"message_id": int(message_id)},
-                               "disable_notification": True}
-    if thread_id.isdigit():
-        payload["message_thread_id"] = int(thread_id)
-    res = _api("sendMessage", payload)
-    result = res.get("result")
-    mid = result.get("message_id") if isinstance(result, dict) else None
-    if mid:  # it is only a signpost: clean it up after a while
-        threading.Timer(180, _stop_delete, args=(chat_id, int(mid))).start()
-    return bool(res.get("ok"))
-
-
-def _press_original_choice(item: dict[str, Any], index: int, user_id: str, lang: str
-                           ) -> tuple[str, dict[str, Any] | None, dict[str, str] | None]:
-    """A card press on an item that mirrors a choice message counts as pressing that message's button."""
-    status, entry, choice = _state["pending"].claim(str(item["rid"]), index, user_id)
-    if status != "ok" or entry is None or choice is None:
-        return status, entry, choice
-    try:
-        render = entry.get("render") or {"align": entry.get("align")}
-        markdown = compose_markdown(entry.get("body") or "", entry.get("rows") or [], None, include_choices=False,
-                                    footer="> ✅ " + i18n.t("chosen", lang, label=f"**{choice['label']}**"),
-                                    display_tz=_display_tz(), **render)
-        if entry.get("chat_id") and entry.get("message_id"):
-            _api("editMessageText", {"chat_id": _int_or_str(entry["chat_id"]), "message_id": int(entry["message_id"]),
-                                     "rich_message": {"markdown": markdown}})
-    except Exception:
-        logger.debug("telegram-enhanced: could not mark the original choice message", exc_info=True)
-    return status, entry, choice
-
-
-async def _on_decision_press(query: Any, chat_id: str, thread_id: str, lang: str, item_id: str, k: str) -> None:
-    import asyncio
-    dkey = fu.decisions_key(chat_id, thread_id)
-    items = (await asyncio.to_thread(_state["decisions"].get, dkey) or {}).get("items") or []
-    item = fu.find_item(items, item_id)
-    if item is None:
-        await query.answer(text=fu.s("dec_gone", lang))
-        _spawn(_decision_sync, chat_id, thread_id)  # stale card: re-render from the store
-        return
-    if k == "j":
-        ok = await asyncio.to_thread(_jump_reply, chat_id, thread_id, int(item.get("msg") or 0), lang) \
-            if item.get("msg") else False
-        await query.answer(text=fu.s("jump_sent", lang) if ok else fu.s("dec_gone", lang))
-        return
-    options = fu.item_options(item, lang)
-    index = int(k)
-    if index >= len(options):
-        await query.answer(text=i18n.t("invalid", lang))
-        return
-    user = getattr(query, "from_user", None)
-    who = getattr(user, "first_name", None) or "user"
-    ctx = _state.get("ctx")
-    if item.get("rid"):
-        status, entry, choice = await asyncio.to_thread(_press_original_choice, item, index,
-                                                        str(getattr(user, "id", "")), lang)
-        if status != "ok":
-            names = {"expired": "expired", "unauthorized": "not_yours", "used": "used", "invalid": "invalid"}
-            await query.answer(text=i18n.t(names.get(status, "cannot"), lang))
-            if status in ("used", "expired"):
-                _spawn(_decision_resolve, chat_id, thread_id, item_id)
-            return
-        text, session_key = choice_injection_text(entry, choice, who), entry["session_key"]
-    else:
-        text = fu.decision_injection_text(item, options[index], who, fu.item_value(item, index, lang))
-        session_key = item.get("sk")
-    ok = False
-    if ctx is not None and session_key:
-        try:
-            ok = bool(ctx.inject_message(text, session_key=session_key))
-        except Exception:
-            logger.warning("telegram-enhanced: decision press not routed", exc_info=True)
-    if not ok:
-        await query.answer(text=fu.s("dec_failed", lang))
-        return
-    await query.answer(text=fu.s("dec_answered", lang, label=options[index])[:190])
-    _spawn(_decision_resolve, chat_id, thread_id, item_id)
+    await query.answer(text=fu.s("dec_gone", lang))  # buttons of the retired combined card
 
 
 DECISIONS_SCHEMA = {
     "name": "telegram_decisions",
     "description": (
-        "Keep the pinned 'waiting on you' card of the CURRENT Telegram chat/topic up to date: everything that "
-        "waits on Alan's decision or action (e.g. 'push the plugin to GitHub?'). action=add lists an item "
-        "(same wording is not added twice), action=resolve crosses one off by id or by matching text, "
-        "action=list shows them. Each item on the card has the action buttons YOU choose in `options` (2-3 concrete "
-        "next steps that fit this decision, never a bare yes/no) plus a button that jumps to the related message; a "
-        "press comes back to this conversation as '[待你决定] … 选了 …' (with the option's value) and removes the "
-        "item. Resolve an item yourself as soon as he decides in chat, so the card never lists "
-        "stale questions. Choice buttons sent with telegram_rich_send/telegram_wrapup do this automatically via "
-        "their `decision` field."),
+        "Ask Alan for a decision as its OWN message in the CURRENT Telegram chat/topic. The message quotes the "
+        "message it is about (tap the quote to jump there), says what is being decided with the context he needs, "
+        "and has the action buttons YOU choose (2-4 concrete next steps that fit this decision, never a bare "
+        "yes/no). It stays pinned until he presses a button; the press comes back as a normal button-press turn "
+        "(with the option's value) and you act on it. One call per decision: three open questions = three "
+        "messages. action=list shows open ones; action=resolve closes one he answered in the chat instead (its "
+        "buttons are retired, it is marked handled and unpinned). The message is sent immediately; do not repeat "
+        "it in your reply."),
     "parameters": {"type": "object", "properties": {
         "action": {"type": "string", "enum": ["add", "resolve", "list"]},
-        "text": {"type": "string", "description": "add: one short line; resolve: text to match."},
-        "id": {"type": "string", "description": "resolve: item id from add/list."},
+        "text": {"type": "string", "description": "add: the decision in one line (bold title). resolve: text to match."},
+        "detail": {"type": "string", "description": "add: what he needs to know to decide (Rich Markdown, short)."},
         "options": {"type": "array", "description": (
-            "add (required): 2-3 concrete actions for this decision, in Alan's language, e.g. "
-            "[{label:'现在推送', value:'push the plugin to GitHub now'}, {label:'这批做完一起推'}, {label:'先不推'}]. "
-            "label <= 16 chars is shown on the button; value (optional) is what you will receive."),
-            "items": {"type": "object", "properties": {"label": {"type": "string"}, "value": {"type": "string"}},
-                      "required": ["label"]}},
-        "message_id": {"type": "integer", "description": "add: the message the decision is about (default: "
-                                                          "Alan's message that started this turn)."},
+            "add (required): 2-4 concrete actions, in Alan's language, e.g. [{label:'现在推送', value:'push the "
+            "plugin to GitHub now', style:'primary'}, {label:'这批做完一起推'}, {label:'先不推'}]. label (<=16 chars) "
+            "is on the button; value (optional) is what you receive when it is pressed."),
+            "items": {"type": "object", "properties": {
+                "label": {"type": "string"}, "value": {"type": "string"},
+                "style": {"type": "string", "enum": ["primary", "success", "danger", "link"]}},
+                "required": ["label"]}},
+        "message_id": {"type": "integer", "description": (
+            "add: the message this decision is about, quoted at the top (default: Alan's message that started "
+            "this turn).")},
+        "id": {"type": "string", "description": "resolve: id from add/list."},
     }, "required": ["action"]},
 }
 
@@ -1538,24 +1451,33 @@ def telegram_decisions(args: dict[str, Any], **_kw: Any) -> str:
         return _result(success=False, error=f"telegram_decisions {err}")
     chat_id, thread_id = target["chat_id"], target.get("thread_id") or ""
     action = str(args.get("action") or "list").lower()
-    try:
-        if action == "add":
-            labels, _ = fu.normalize_options(args.get("options") if isinstance(args.get("options"), list) else [])
-            if len(labels) < 2:
-                return _result(success=False, error="options: give 2-3 concrete actions for this decision")
-            anchor = args.get("message_id") or target.get("message_id")
-            item_id = _decision_add(chat_id, thread_id, str(args.get("text") or ""),
-                                    msg=int(anchor) if str(anchor or "").isdigit() else None,
-                                    sk=target.get("session_key"), uid=target.get("user_id"),
-                                    opts=args.get("options") if isinstance(args.get("options"), list) else None)
-            return _result(success=True, id=item_id)
-        if action == "resolve":
-            ok = _decision_resolve(chat_id, thread_id, str(args.get("id") or ""), str(args.get("text") or ""))
-            return _result(success=ok, error=None if ok else "no matching item")
-        items = (_state["decisions"].get(fu.decisions_key(chat_id, thread_id)) or {}).get("items") or []
-        return _result(success=True, items=[{"id": i["id"], "text": i["text"]} for i in items])
-    except ValueError as exc:
-        return _result(success=False, error=str(exc))
+    dkey = fu.decisions_key(chat_id, thread_id)
+    if action == "add":
+        buttons = fu.normalize_options(args.get("options") if isinstance(args.get("options"), list) else [])
+        if len(buttons) < 2:
+            return _result(success=False, error="options: give 2-4 concrete actions for this decision")
+        text = " ".join(str(args.get("text") or "").split())[:120]
+        try:
+            markdown = fu.decision_markdown(text, str(args.get("detail") or ""))
+        except ValueError as exc:
+            return _result(success=False, error=str(exc))
+        items = (_state["decisions"].get(dkey) or {}).get("items") or []
+        if fu.find_open(items, text=text):
+            return _result(success=False, error="this decision is already open; resolve it first or reuse it")
+        anchor = args.get("message_id") or target.get("message_id")
+        res = json.loads(telegram_rich_send({"markdown": markdown, "buttons": fu.option_rows(buttons),
+                                             "question": text, "decision": text,
+                                             "reply_to": int(anchor) if str(anchor or "").isdigit() else None}))
+        if not res.get("success"):
+            return _result(**res)
+        item = fu.find_open((_state["decisions"].get(dkey) or {}).get("items") or [], rid=res.get("request_id") or "")
+        return _result(success=True, id=(item or {}).get("id"), message_id=res.get("message_id"),
+                       request_id=res.get("request_id"), pinned=bool((item or {}).get("pinned")))
+    if action == "resolve":
+        ok = _decision_close(chat_id, thread_id, str(args.get("id") or ""), str(args.get("text") or ""))
+        return _result(success=ok, error=None if ok else "no matching open decision")
+    items = (_state["decisions"].get(dkey) or {}).get("items") or []
+    return _result(success=True, items=[{"id": i["id"], "text": i["text"], "message_id": i.get("mid")} for i in items])
 
 
 WRAPUP_SCHEMA = {
@@ -1565,8 +1487,8 @@ WRAPUP_SCHEMA = {
         "Telegram chat/topic instead of a long prose report: what changed, what was verified, what is still "
         "pending or unverified, and choice buttons for the next step (e.g. push / roll back / leave it). Headings "
         "follow Alan's language; write the item text in his language too. Only list facts backed by real tool "
-        "output. With actions, the decision is also listed on the pinned 'waiting on you' card until he presses a "
-        "button. The card is sent immediately: end the turn after it, with at most one short line."),
+        "output. With actions, the card stays pinned until he presses a button. The card is sent immediately: "
+        "end the turn after it, with at most one short line."),
     "parameters": {"type": "object", "properties": {
         "title": {"type": "string", "description": "One-line result, e.g. '文件合并已上线'."},
         "summary": {"type": "string", "description": "Optional one or two sentences."},
@@ -1577,8 +1499,8 @@ WRAPUP_SCHEMA = {
                     "properties": {"label": {"type": "string"}, "value": {"type": "string"},
                                    "style": {"type": "string", "enum": ["primary", "success", "danger", "link"]}},
                     "required": ["label"]}},
-        "decision": {"type": "string", "description": "Short name of the decision for the pinned card "
-                                                      "(defaults to the title). Empty string = do not track."},
+        "decision": {"type": "string", "description": "Short name of the decision (defaults to the title). "
+                                                      "Empty string = do not pin/track it."},
     }, "required": ["title"]},
 }
 
