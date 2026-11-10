@@ -941,7 +941,9 @@ def _stop_begin(session_id: str, turn_id: str, parent_session_id: str) -> None:
            "user_name": _session("HERMES_SESSION_USER_NAME"),
            "message_id": _session("HERMES_SESSION_MESSAGE_ID"),
            "token": secrets.token_hex(6), "cv": threading.Condition(lock), "ended": False, "inflight": False,
-           "draft": draft, "draft_on": True, "t0": time.time(), "draft_id": _draft_id(key), "steps": [],
+           # a pending secure-input request here: no can_stop bubble, or the client would hold the secret
+           "draft": draft, "draft_on": not _secret_pending_here(chat_id, thread_id), "t0": time.time(),
+           "draft_id": _draft_id(key), "steps": [],
            "stop_epoch": 0, "stop_ts": 0.0, "user_msg_ts": 0.0, "lang": _lang(chat_id, thread_id)}
     with _state["turns_lock"]:
         _state["stops"][key] = rec
@@ -1778,6 +1780,19 @@ def _secret_values() -> dict[str, Any]:
         sys._hte_secret_values = {}
         sys._hte_secret_lock = threading.Lock()
     return sys._hte_secret_values
+
+
+def _secret_pending_here(chat_id: Any, thread_id: Any) -> bool:
+    store: JsonStore | None = _state.get("secret_reqs")
+    if store is None:
+        return False
+    try:
+        now = time.time()
+        return any(isinstance(r, dict) and r.get("state") == "pending" and r.get("chat_id") == str(chat_id)
+                   and (r.get("thread_id") or "") == str(thread_id or "") and now <= float(r.get("expires_at") or 0)
+                   for r in store._read().values())
+    except Exception:
+        return False
 
 
 def _secret_hold_drafts(chat_id: str, thread_id: str) -> int:

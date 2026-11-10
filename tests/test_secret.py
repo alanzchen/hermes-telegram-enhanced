@@ -208,6 +208,14 @@ class Flow(unittest.TestCase):
         finally:
             self.p._state["stops"].clear()
 
+    def test_pending_request_suppresses_new_bubbles_here(self):
+        self.assertFalse(self.p._secret_pending_here("100", "55"))
+        self.request()
+        self.assertTrue(self.p._secret_pending_here("100", "55"))
+        self.assertFalse(self.p._secret_pending_here("100", "77"))
+        self.p._on_pre_gateway_dispatch(self.event(SECRET))
+        self.assertFalse(self.p._secret_pending_here("100", "55"))
+
     def test_only_private_chats(self):
         with mock.patch.dict(os.environ, {"HERMES_SESSION_CHAT_TYPE": "group"}):
             res = self.request()
