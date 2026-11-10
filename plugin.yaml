@@ -9,6 +9,7 @@ provides_tools:
   - telegram_decisions
   - telegram_wrapup
   - telegram_widget
+  - telegram_secret
   - telegram_guest_reply
 provides_hooks:
   - pre_llm_call

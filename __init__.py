@@ -35,6 +35,7 @@ from .core import (
 from . import i18n
 from . import followup as fu
 from . import widget as wg
+from . import secret as sx
 
 logger = logging.getLogger("hermes_plugins.telegram_enhanced")
 
@@ -1115,7 +1116,7 @@ def _on_user_message(chat_id: str, thread_id: str, text: Any = None) -> None:
         _spawn(_stop_delete, r["chat_id"], mid)
 
 
-def _on_pre_gateway_dispatch(event: Any = None, **_kw: Any) -> None:
+def _on_pre_gateway_dispatch(event: Any = None, **_kw: Any) -> dict[str, str] | None:
     try:
         src = getattr(event, "source", None)
         platform = str(getattr(getattr(src, "platform", None), "value", getattr(src, "platform", "")) or "")
@@ -1123,8 +1124,12 @@ def _on_pre_gateway_dispatch(event: Any = None, **_kw: Any) -> None:
             return None
         chat_id = str(getattr(src, "chat_id", "") or "")
         thread_id = str(getattr(src, "thread_id", "") or "")
+        thread_id = thread_id if thread_id.isdigit() else ""
+        captured = _secret_intercept(event, src, chat_id, thread_id) if chat_id else None
+        if captured is not None:
+            return captured  # the secure-input value never reaches the gateway's logs, history or the agent
         if chat_id:
-            _on_user_message(chat_id, thread_id if thread_id.isdigit() else "", getattr(event, "text", None))
+            _on_user_message(chat_id, thread_id, getattr(event, "text", None))
     except Exception:
         logger.debug("telegram-enhanced: pre_gateway_dispatch observer failed", exc_info=True)
     return None
@@ -1137,9 +1142,11 @@ async def _route_new_updates(update: Any, context: Any) -> None:
                     getattr(msg, "message_id", "?"), time.time() - msg.date.timestamp())
     query = getattr(update, "callback_query", None)
     data = str(getattr(query, "data", "") or "") if query is not None else ""
-    if data.startswith((fu.SNOOZE_PREFIX, fu.DECISION_PREFIX, CALLBACK_PREFIX)):
+    if data.startswith((fu.SNOOZE_PREFIX, fu.DECISION_PREFIX, CALLBACK_PREFIX, sx.PREFIX)):
         try:
-            if data.startswith(CALLBACK_PREFIX):
+            if data.startswith(sx.PREFIX):
+                await _on_secret_button(query, data)
+            elif data.startswith(CALLBACK_PREFIX):
                 # Choice buttons: the rb: handler wired at adapter start belongs to the plugin generation that
                 # was loaded then (reloads don't re-run handler factories), so answer here with current code.
                 await _make_callback(_state["ctx"])(update, context)
@@ -1358,6 +1365,10 @@ def _reminder_loop(gen: object) -> None:
                     _state["reminders"].set(fu.reminder_key(rem["chat_id"], rem["message_id"]), rem)
         except Exception:
             logger.warning("telegram-enhanced: reminder loop error", exc_info=True)
+        try:
+            _secret_sweep()
+        except Exception:
+            logger.warning("telegram-enhanced: secure-input sweep error", exc_info=True)
         time.sleep(15)
 
 
@@ -1729,6 +1740,316 @@ def _on_widget_query(raw: dict[str, Any]) -> None:
         logger.warning("telegram-enhanced: widget inject_message failed", exc_info=True)
     if not ok:
         logger.warning("telegram-enhanced: widget tap %s not routed (allow_gateway_injection?)", skey)
+
+
+# ---------------------------------------------------------------- secure input
+
+SECRET_SCHEMA = {
+    "name": "telegram_secret",
+    "description": (
+        "Ask Alan for a password, one-time code or other secret WITHOUT it entering the conversation. "
+        "action=request posts a 'secure input' card in the CURRENT private chat/topic; his NEXT text message "
+        "there is taken by the plugin before the gateway logs or stores it and before you see it, deleted from "
+        "the chat, and either saved into 1Password (store=1password, default for passwords/text: a new item in "
+        "the Hermes vault; you get its op:// reference) or kept in memory for 15 minutes (store=temp, default "
+        "for codes; use it with action=exec, value in $HERMES_SECRET, output redacted). End your turn after "
+        "requesting: the result arrives as a new '[安全输入] ...' turn with the reference. Use this instead of "
+        "asking him to put things into 1Password himself, and never ask for secrets in plain chat. "
+        "status/list show requests (never values); cancel ends a pending one."),
+    "parameters": {"type": "object", "properties": {
+        "action": {"type": "string", "enum": ["request", "status", "list", "cancel", "exec"]},
+        "label": {"type": "string", "description": "request: what you need, shown to Alan, e.g. 'UPS 账号密码'."},
+        "kind": {"type": "string", "enum": list(sx.KINDS), "description": "request: password (default), code, text."},
+        "store": {"type": "string", "enum": ["1password", "temp"], "description": "request: where the value goes."},
+        "title": {"type": "string", "description": "request (1password): item title (default: label)."},
+        "username": {"type": "string", "description": "request (1password): login username; makes a Login item."},
+        "url": {"type": "string", "description": "request (1password): website, so browser_vault can fill it."},
+        "minutes": {"type": "integer", "description": "request: how long to wait for his message (default 10)."},
+        "id": {"type": "string", "description": "status/cancel/exec: request id."},
+        "command": {"type": "string", "description": "exec: shell command; read the value from $HERMES_SECRET."},
+        "timeout": {"type": "integer", "description": "exec: seconds (default 120)."},
+    }, "required": ["action"]},
+}
+
+
+def _secret_values() -> dict[str, Any]:
+    """Temporary values, in memory only; kept on ``sys`` so a plugin reload does not drop them."""
+    if not hasattr(sys, "_hte_secret_values"):
+        sys._hte_secret_values = {}
+        sys._hte_secret_lock = threading.Lock()
+    return sys._hte_secret_values
+
+
+def _secret_vault() -> str:
+    return str(_setting("secret_vault", "Hermes") or "Hermes")
+
+
+def _op_env() -> dict[str, str]:
+    env = dict(os.environ)
+    if not env.get("OP_SERVICE_ACCOUNT_TOKEN"):
+        try:
+            for line in (_profile_home() / ".env").read_text(encoding="utf-8").splitlines():
+                if line.startswith("OP_SERVICE_ACCOUNT_TOKEN="):
+                    env["OP_SERVICE_ACCOUNT_TOKEN"] = line.split("=", 1)[1].strip().strip('"').strip("'")
+        except OSError:
+            pass
+    home_bin = str(Path.home() / ".local" / "bin")
+    env["PATH"] = env.get("PATH", "") + os.pathsep + home_bin + os.pathsep + "/opt/data/home/.local/bin"
+    return env
+
+
+def _op_store(req: dict[str, Any], value: str) -> tuple[str, str]:
+    """Create a 1Password item from a JSON template on stdin (never argv). -> (op:// reference, error)."""
+    import shutil
+    import subprocess
+    env = _op_env()
+    op = shutil.which("op", path=env["PATH"])
+    if not op:
+        return "", "op CLI not found"
+    vault = _secret_vault()
+    category = "Login" if (req.get("username") or req.get("url")) else "Password"
+    try:
+        tpl = subprocess.run([op, "item", "template", "get", category, "--format", "json"], capture_output=True,
+                             text=True, timeout=60, env=env)
+        if tpl.returncode != 0:
+            return "", "template: " + tpl.stderr.strip()[-120:]
+        item = sx.op_item(json.loads(tpl.stdout), req["title"], value, req.get("username") or "", req.get("url") or "",
+                          notes=f"Entered by Alan in Telegram secure input ({req['label']}).")
+        res = subprocess.run([op, "item", "create", "--vault", vault, "--format", "json", "-"], input=json.dumps(item),
+                             capture_output=True, text=True, timeout=60, env=env)
+        if res.returncode != 0:
+            return "", res.stderr.strip()[-160:] or "op item create failed"
+        return f"op://{vault}/{json.loads(res.stdout)['id']}/password", ""
+    except Exception as exc:
+        return "", type(exc).__name__
+
+
+def _secret_card_edit(req: dict[str, Any], text: str) -> None:
+    if req.get("card_mid"):
+        _api("editMessageText", {"chat_id": _int_or_str(req["chat_id"]), "message_id": int(req["card_mid"]),
+                                 "rich_message": {"markdown": text}})
+
+
+def _secret_inject(req: dict[str, Any], text: str) -> None:
+    try:
+        if not _state["ctx"].inject_message(text, session_key=req["session_key"]):
+            logger.warning("telegram-enhanced: secure-input result for %s not routed", req["id"])
+    except Exception:
+        logger.warning("telegram-enhanced: secure-input inject failed", exc_info=True)
+
+
+def _secret_intercept(event: Any, src: Any, chat_id: str, thread_id: str) -> dict[str, str] | None:
+    store: JsonStore | None = _state.get("secret_reqs")
+    if store is None:
+        return None
+    mtype = getattr(event, "message_type", None)
+    if str(getattr(mtype, "value", mtype) or "text").lower() != "text":
+        return None
+    user_id = str(getattr(src, "user_id", "") or "")
+    now = time.time()
+    if sx.match_request(store._read(), chat_id, thread_id, user_id, now) is None:  # cheap, lock-free check
+        return None
+    text = getattr(event, "text", None)
+    cancel = sx.is_cancel_text(text)
+    value = None if cancel else sx.capture_value(text)
+    if not cancel and value is None:
+        return None  # a slash command (e.g. /stop) or empty text passes through
+    try:
+        return _secret_claim(event, src, chat_id, thread_id, user_id, now, cancel, value)
+    except Exception:  # fail closed: a message meant as a secret must never fall through to the agent
+        logger.warning("telegram-enhanced: secure-input capture failed; message dropped", exc_info=True)
+        return {"action": "skip", "reason": "telegram-enhanced secure input (error)"}
+
+
+def _secret_claim(event: Any, src: Any, chat_id: str, thread_id: str, user_id: str, now: float, cancel: bool,
+                  value: str | None) -> dict[str, str] | None:
+    store: JsonStore = _state["secret_reqs"]
+    with store.locked() as data:
+        req = sx.match_request(data, chat_id, thread_id, user_id, now)
+        if req is None:
+            return None
+        req["state"] = "cancelled" if cancel else "received"
+        req["length"] = 0 if cancel else len(value)
+        req["received_at"] = now
+        data[req["id"]] = req
+    mid = getattr(event, "message_id", None) or getattr(src, "message_id", None)
+    logger.info("telegram-enhanced: secure input %s %s (%d chars)", req["id"], req["state"], req["length"])
+    _spawn(_secret_finish, dict(req), value, mid)
+    return {"action": "skip", "reason": "telegram-enhanced secure input"}
+
+
+def _secret_finish(req: dict[str, Any], value: str | None, message_id: Any) -> None:
+    lang = req.get("lang") or "zh"
+    deleted = True
+    if message_id and str(message_id).isdigit():
+        res = _api("deleteMessage", {"chat_id": _int_or_str(req["chat_id"]), "message_id": int(message_id)})
+        deleted = bool(res.get("ok"))
+    tail = "" if deleted else sx.s("not_deleted", lang)
+    if req["state"] == "cancelled" or value is None:
+        _secret_card_edit(req, sx.s("cancelled", lang, label=req["label"]))
+        _secret_inject(req, f"[安全输入] Alan 取消了「{req['label']}」。request_id: {req['id']}")
+        return
+    ref = error = ""
+    if req["store"] == "1password":
+        ref, error = _op_store(req, value)
+        state = "stored" if ref else "failed"
+    else:
+        _secret_values()
+        with sys._hte_secret_lock:
+            sys._hte_secret_values[req["id"]] = {"value": value, "until": time.time() + sx.TEMP_KEEP}
+        state = "held"
+    length = len(value)
+    value = None
+    with _state["secret_reqs"].locked() as data:
+        cur = data.get(req["id"]) or req
+        cur.update(state=state, ref=ref, error=error[:200], deleted=deleted)
+        data[req["id"]] = cur
+    if state == "stored":
+        text = sx.s("got_op", lang, label=req["label"], n=length, title=req["title"])
+    elif state == "held":
+        text = sx.s("got_temp", lang, label=req["label"], n=length)
+    else:
+        text = sx.s("store_failed", lang, label=req["label"], err=error[:80] or "?")
+    _secret_card_edit(req, text + tail)
+    logger.info("telegram-enhanced: secure input %s -> %s (deleted=%s)", req["id"], state, deleted)
+    _secret_inject(req, sx.injection_text(req, length, ref=ref, error=error))
+
+
+def _secret_sweep() -> None:
+    store: JsonStore | None = _state.get("secret_reqs")
+    if store is None:
+        return
+    now = time.time()
+    expired = []
+    if any(isinstance(r, dict) and r.get("state") == "pending" and now > float(r.get("expires_at") or 0)
+           for r in store._read().values()):
+        with store.locked() as data:
+            for r in data.values():
+                if isinstance(r, dict) and r.get("state") == "pending" and now > float(r.get("expires_at") or 0):
+                    r["state"] = "expired"
+                    expired.append(dict(r))
+            sx.prune(data, now)
+    for r in expired:
+        _secret_card_edit(r, sx.s("expired", r.get("lang") or "zh", label=r["label"]))
+    values = _secret_values()
+    with sys._hte_secret_lock:
+        for k in [k for k, v in values.items() if now > v["until"]]:
+            values.pop(k, None)
+
+
+async def _on_secret_button(query: Any, data: str) -> None:
+    import asyncio
+    rid = sx.parse_cancel(data)
+    msg = getattr(query, "message", None)
+    lang = _lang(str(getattr(msg, "chat_id", "") or ""), str(getattr(msg, "message_thread_id", "") or ""))
+    if not _press_allowed(query):
+        await query.answer(text=i18n.t("not_yours", lang))
+        return
+    req = await asyncio.to_thread(_secret_cancel, rid or "")
+    await query.answer(text=(sx.s("cancelled", lang, label=req["label"]) if req else sx.s("gone", lang))[:190])
+    if req:
+        _spawn(_secret_inject, req, f"[安全输入] Alan 取消了「{req['label']}」。request_id: {req['id']}")
+
+
+def _secret_cancel(rid: str) -> dict[str, Any] | None:
+    with _state["secret_reqs"].locked() as data:
+        req = data.get(rid)
+        if not isinstance(req, dict) or req.get("state") != "pending":
+            return None
+        req["state"] = "cancelled"
+        data[rid] = req
+    _secret_card_edit(req, sx.s("cancelled", req.get("lang") or "zh", label=req["label"]))
+    return req
+
+
+def telegram_secret(args: dict[str, Any], **_kw: Any) -> str:
+    import subprocess
+    action = str(args.get("action") or "request").lower()
+    store: JsonStore = _state["secret_reqs"]
+    public = ("id", "label", "kind", "store", "title", "state", "ref", "length", "expires_at", "error")
+    if action in ("status", "list"):
+        data = store._read()
+        if action == "status":
+            req = data.get(str(args.get("id") or ""))
+            return _result(success=bool(req), request={k: req.get(k) for k in public} if req else None)
+        rows = sorted((r for r in data.values() if isinstance(r, dict)), key=lambda r: -r.get("created", 0))[:10]
+        return _result(success=True, requests=[{k: r.get(k) for k in public} for r in rows])
+    if action == "cancel":
+        req = _secret_cancel(str(args.get("id") or ""))
+        return _result(success=bool(req), error=None if req else "no pending request with that id")
+    if action == "exec":
+        rid = str(args.get("id") or "")
+        values = _secret_values()
+        with sys._hte_secret_lock:
+            entry = values.get(rid)
+        if not entry or time.time() > entry["until"]:
+            return _result(success=False, error="no temporary value for this id (expired, or it was saved to "
+                                                "1Password: use op read with its reference)")
+        command = str(args.get("command") or "")
+        if not command.strip():
+            return _result(success=False, error="command is required")
+        try:
+            timeout = max(5, min(600, int(args.get("timeout") or 120)))
+        except (TypeError, ValueError):
+            timeout = 120
+        env = _op_env()
+        env["HERMES_SECRET"] = entry["value"]
+        try:
+            res = subprocess.run(["bash", "-c", command], capture_output=True, text=True, timeout=timeout, env=env,
+                                 cwd=os.environ.get("TMPDIR") or None)
+        except subprocess.TimeoutExpired:
+            return _result(success=False, error=f"timed out after {timeout}s")
+        return _result(success=res.returncode == 0, exit_code=res.returncode,
+                       stdout=sx.redact(res.stdout, entry["value"])[-4000:],
+                       stderr=sx.redact(res.stderr, entry["value"])[-2000:])
+    target, err = _current_target()
+    if err:
+        return _result(success=False, error=f"telegram_secret {err}")
+    if target.get("chat_type") not in ("dm", "private"):
+        return _result(success=False, error="secure input works only in the private chat with the bot "
+                                            "(the bot must be able to delete the message)")
+    if not (target.get("session_key") and target.get("user_id")):
+        return _result(success=False, error="no session/user bound; the result could not route back")
+    label = " ".join(str(args.get("label") or "").split())[:80]
+    if not label:
+        return _result(success=False, error="label is required (what you need, shown to Alan)")
+    kind = str(args.get("kind") or "password").lower()
+    kind = kind if kind in sx.KINDS else "password"
+    where = str(args.get("store") or sx.default_store(kind)).lower()
+    where = where if where in ("1password", "temp") else sx.default_store(kind)
+    try:
+        minutes = max(1, min(60, int(args.get("minutes") or sx.WINDOW // 60)))
+    except (TypeError, ValueError):
+        minutes = sx.WINDOW // 60
+    now = time.time()
+    chat_id, thread_id = target["chat_id"], target.get("thread_id") or ""
+    req = {"id": sx.new_id(), "chat_id": str(chat_id), "thread_id": thread_id if thread_id.isdigit() else "",
+           "user_id": str(target["user_id"]), "session_key": target["session_key"], "label": label, "kind": kind,
+           "store": where, "title": " ".join(str(args.get("title") or label).split())[:100],
+           "username": str(args.get("username") or "")[:200], "url": str(args.get("url") or "")[:300],
+           "created": now, "expires_at": now + minutes * 60, "state": "pending",
+           "lang": _lang(str(chat_id), thread_id)}
+    superseded = []
+    with store.locked() as data:  # saved BEFORE the card goes out, so an instant reply is still caught
+        sx.prune(data, now)
+        for r in data.values():
+            if (isinstance(r, dict) and r.get("state") == "pending" and r.get("chat_id") == req["chat_id"]
+                    and (r.get("thread_id") or "") == req["thread_id"]):
+                r["state"] = "cancelled"
+                superseded.append(dict(r))
+        data[req["id"]] = req
+    for r in superseded:
+        _secret_card_edit(r, sx.s("cancelled", r.get("lang") or "zh", label=r["label"]))
+    res = _send_rich(target, sx.card_markdown(req, req["lang"], _secret_vault()))
+    if not res.get("ok"):
+        _secret_cancel(req["id"])
+        return _result(success=False, error=str(res.get("description") or "could not send the request card"))
+    mid = (res.get("result") or {}).get("message_id")
+    with store.locked() as data:
+        if req["id"] in data:
+            data[req["id"]]["card_mid"] = mid
+    return _result(success=True, id=req["id"], message_id=mid, store=where, expires_in_minutes=minutes,
+                   note="Card sent. End your turn now; the result arrives as a new [安全输入] turn.")
 
 
 # ---------------------------------------------------------------- guest mode
@@ -2193,6 +2514,7 @@ def register(ctx: Any) -> None:
     _state["reminders"] = JsonStore(root, "reminders.json")
     _state["decisions"] = JsonStore(root, "decisions.json")
     _state["widgets"] = JsonStore(root, "widgets.json")
+    _state["secret_reqs"] = JsonStore(root, "secrets.json")  # request metadata only; values never touch disk
     sys._hte_stop_button = _on_stop_button
     sys._hte_new_updates = _route_new_updates
     try:
@@ -2216,6 +2538,9 @@ def register(ctx: Any) -> None:
     ctx.register_tool(name="telegram_widget", toolset=TOOLSET, schema=WIDGET_SCHEMA,
                       handler=lambda args, **kw: telegram_widget(args or {}, **kw),
                       description="Interactive HTML widgets inside the message bubble", emoji="🧩")
+    ctx.register_tool(name="telegram_secret", toolset=TOOLSET, schema=SECRET_SCHEMA,
+                      handler=lambda args, **kw: telegram_secret(args or {}, **kw),
+                      description="Ask Alan for a password or code without it entering the conversation", emoji="🔐")
     ctx.register_tool(name="telegram_guest_reply", toolset=TOOLSET, schema=GUEST_SCHEMA,
                       handler=lambda args, **kw: telegram_guest_reply(args or {}, **kw),
                       description="Answer Telegram Guest Mode requests", emoji="👥")
