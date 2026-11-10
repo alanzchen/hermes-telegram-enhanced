@@ -1,0 +1,36 @@
+<!--hte {"desc":"叠方块小游戏（点一下落块，最高分存本机）。不需要 chat_data。"}-->
+<style>body{margin:0}#g{position:relative;background:linear-gradient(#3a1d6e,#120c2b);height:360px;overflow:hidden}canvas{display:block;width:100%;height:360px;touch-action:none}#s{position:absolute;top:14px;left:0;right:0;text-align:center;font:700 2.4em system-ui;color:#fff}#h{position:absolute;bottom:26px;left:0;right:0;text-align:center;font-size:.8em;color:#b9b3d9}</style>
+<div id="g"><canvas id="c"></canvas><div id="s">0</div><div id="h">点一下落块 · 最高 <b id="b">0</b></div></div>
+<script>
+const T=window.TelegramWidget,c=document.getElementById('c'),x=c.getContext('2d'),r=window.devicePixelRatio||1,S=document.getElementById('s'),B=document.getElementById('b');
+const w=c.offsetWidth||320,h=360,K=24,D=12;c.width=w*r;c.height=h*r;x.scale(r,r);
+let st,cu,dir,sp,sc,over,cam=0,bf=null,best=0;
+try{best=+localStorage.getItem('best')||0}catch(e){}
+B.textContent=best;
+function hz(k){try{T&&T.HapticFeedback&&T.HapticFeedback.impactOccurred(k)}catch(e){}}
+function reset(){st=[{x:w*.22,w:w*.56}];sc=0;over=0;S.textContent='0';spawn()}
+function spawn(){const t=st[st.length-1];cu={x:-t.w*.6,w:t.w};dir=1;sp=1.6+sc*.12}
+function col(i,l){return 'hsl('+((290+i*11)%360)+' 80% '+l+'%)'}
+function box(b,i,y){
+x.fillStyle=col(i,50);x.fillRect(b.x,y,b.w,K);
+x.fillStyle=col(i,66);x.beginPath();x.moveTo(b.x,y);x.lineTo(b.x+D,y-D);x.lineTo(b.x+b.w+D,y-D);x.lineTo(b.x+b.w,y);x.fill();
+x.fillStyle=col(i,36);x.beginPath();x.moveTo(b.x+b.w,y);x.lineTo(b.x+b.w+D,y-D);x.lineTo(b.x+b.w+D,y+K-D);x.lineTo(b.x+b.w,y+K);x.fill()}
+function frame(){
+if(!over){cu.x+=dir*sp;if(cu.x>w-cu.w*.35)dir=-1;if(cu.x<-cu.w*.65)dir=1}
+cam+=(Math.max(0,(st.length-7)*K)-cam)*.12;
+x.clearRect(0,0,w,h);const base=h-70+cam;
+for(let i=Math.max(0,st.length-16);i<st.length;i++)box(st[i],i,base-i*K);
+if(bf){bf.y+=bf.v;bf.v+=.6;box(bf,bf.i,bf.y);if(bf.y>h+40)bf=null}
+if(!over)box(cu,st.length,base-st.length*K);
+requestAnimationFrame(frame)}
+c.addEventListener('click',function(){
+if(over){reset();return}
+const t=st[st.length-1],l=Math.max(cu.x,t.x),rr=Math.min(cu.x+cu.w,t.x+t.w),y=h-70+cam-st.length*K;
+if(rr<=l){over=1;bf={x:cu.x,w:cu.w,i:st.length,y:y,v:0};cu.w=0;S.textContent=sc+' · 再点重来';hz('heavy');return}
+const cut=cu.x<t.x?{x:cu.x,w:t.x-cu.x}:{x:rr,w:cu.x+cu.w-rr};
+if(cut.w>.5)bf={x:cut.x,w:cut.w,i:st.length,y:y,v:0};
+st.push({x:l,w:rr-l});sc++;S.textContent=sc;hz('light');
+if(sc>best){best=sc;B.textContent=best;try{localStorage.setItem('best',best)}catch(e){}}
+spawn()});
+reset();frame();if(T&&T.ready)T.ready();
+</script>

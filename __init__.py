@@ -1560,10 +1560,24 @@ WIDGET_SCHEMA = {
         "redraws on the 'chatDataChanged' event; action=update replaces it on a sent widget (key 'chosen' is "
         "reserved). Limits: 32 KB HTML, 4 KB after zlib -9 (checked before sending), inline CSS/JS only, images "
         "only as data: URLs or inline SVG; no input/select/form elements. The message is sent immediately; do "
-        "not repeat it in your reply."),
+        "not repeat it in your reply. "
+        "TEMPLATES: reusable widgets that draw themselves from chat_data. action=templates lists them with a "
+        "description and an example chat_data; send with template=<name> + chat_data (no html). Built-ins: "
+        "weather, tracker (package/trip/long-task progress, update i in place), compare (option cards with "
+        "tap-to-choose; taps come from chat_data.o), stack (a small game). action=save_template stores a new "
+        "one (name, html that reads JSON.parse(TelegramWidget.chatData), desc, example) when Alan asks to keep "
+        "a widget for reuse."),
     "parameters": {"type": "object", "properties": {
-        "action": {"type": "string", "enum": ["send", "update"]},
-        "html": {"type": "string", "description": "send: the widget HTML (a fragment is fine)."},
+        "action": {"type": "string", "enum": ["send", "update", "templates", "save_template"]},
+        "html": {"type": "string", "description": "send: the widget HTML (a fragment is fine); save_template: "
+                                                  "the template HTML."},
+        "template": {"type": "string", "description": "send: a saved template name instead of html."},
+        "name": {"type": "string", "description": "save_template: template name (lowercase, - or _)."},
+        "desc": {"type": "string", "description": "save_template: what it shows and what chat_data it reads."},
+        "example": {"type": "object", "description": "save_template: example chat_data."},
+        "actions_from": {"type": "string", "description": (
+            "save_template: list field in chat_data whose items {k, n, v} become tap actions; the template "
+            "draws the matching data-action buttons itself and marks its root with data-hte-actions.")},
         "title": {"type": "string", "description": "send: what this widget is about (reported back with taps)."},
         "actions": {"type": "array", "description": (
             "send: up to 6 tappable actions, in Alan's language, e.g. [{key:'push', label:'现在推送', "
@@ -1590,6 +1604,16 @@ def telegram_widget(args: dict[str, Any], **_kw: Any) -> str:
     chat_id, thread_id = target["chat_id"], target.get("thread_id") or ""
     store: JsonStore = _state["widgets"]
     action = str(args.get("action") or "send").lower()
+    dirs = _template_dirs()
+    if action == "templates":
+        return _result(success=True, templates=wg.list_templates(dirs))
+    if action == "save_template":
+        try:
+            path = wg.save_template(dirs[-1], str(args.get("name") or ""), str(args.get("html") or ""),
+                                    str(args.get("desc") or ""), args.get("example"), str(args.get("actions_from") or ""))
+        except wg.WidgetError as exc:
+            return _result(success=False, error=str(exc))
+        return _result(success=True, saved=path.stem)
     try:
         data = wg.chat_data_obj(args.get("chat_data"))
         if action == "update":
@@ -1606,10 +1630,18 @@ def telegram_widget(args: dict[str, Any], **_kw: Any) -> str:
                 rec["chat_data"] = data
                 store.set(key, rec)
             return _result(success=True, action="updated", message_id=mid)
+        html = str(args.get("html") or "")
         actions = wg.normalize_actions(args.get("actions"))
+        if args.get("template"):
+            meta, html = wg.load_template(dirs, str(args["template"]))
+            if meta.get("example") and not data:
+                return _result(success=False, error="this template draws from chat_data; pass it (see example)",
+                               example=meta["example"])
+            if meta.get("actions_from") and not actions:
+                actions = wg.actions_from_data(data, str(meta["actions_from"]))
         if actions and not (target.get("session_key") and target.get("user_id")):
             return _result(success=False, error="no session/user bound; widget taps cannot route back")
-        doc = wg.build_html(str(args.get("html") or ""), actions)
+        doc = wg.build_html(html, actions)
         raw, packed = wg.check_size(doc)
         encoded = wg.encode_data(data) if data else None
     except wg.WidgetError as exc:
@@ -1643,6 +1675,11 @@ def telegram_widget(args: dict[str, Any], **_kw: Any) -> str:
                 "chat_data": data, "created_at": time.time()}
     logger.info("telegram-enhanced: widget sent mid=%s actions=%d html=%dB packed=%dB", mid, len(actions), raw, packed)
     return _result(success=True, message_id=mid, html_bytes=raw, compressed_bytes=packed)
+
+
+def _template_dirs() -> list[Path]:
+    """Built-in templates ship with the plugin; saved ones live in the profile (and override built-ins)."""
+    return [Path(__file__).resolve().parent / "templates", _profile_home() / "telegram-enhanced" / "widget-templates"]
 
 
 def _on_widget_query(raw: dict[str, Any]) -> None:

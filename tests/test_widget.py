@@ -171,6 +171,29 @@ class PluginFlow(unittest.TestCase):
         self.assertEqual(len(self.injected), 2)
         self.assertFalse([1 for m, _ in self.calls if m == "editMessageWidgetData"])
 
+    def test_send_from_template(self):
+        with mock.patch.object(self.p, "_template_dirs", lambda: [ROOT / "templates", Path(self.tmp.name)]):
+            res = json.loads(self.p.telegram_widget({"action": "send", "template": "compare"}))
+            self.assertFalse(res["success"])  # needs chat_data
+            self.assertIn("example", res)
+            data = res["example"]
+            res = json.loads(self.p.telegram_widget({"action": "send", "template": "compare", "chat_data": data,
+                                                     "title": "选哪个"}))
+            self.assertTrue(res["success"], res)
+            payload = self.calls[-1][1]
+            self.assertTrue(payload["allow_queries"])
+            self.assertEqual(json.loads(payload["chat_data"]), data)
+            self.query("a:b", qid="t1")
+            self.assertEqual(self.answers()[-1], {"ok": 1, "again": 0})
+            self.assertIn("「方案 B」", self.injected[-1][0])
+            self.assertIn("value: 选方案 B", self.injected[-1][0])
+            lst = json.loads(self.p.telegram_widget({"action": "templates"}))
+            self.assertIn("tracker", [t["name"] for t in lst["templates"]])
+            saved = json.loads(self.p.telegram_widget({"action": "save_template", "name": "note",
+                                                       "html": "<p>hi</p>", "desc": "d"}))
+            self.assertEqual(saved, {"success": True, "saved": "note"})
+            self.assertTrue((Path(self.tmp.name) / "note.html").exists())
+
     def test_rejects_before_any_api_call(self):
         res = json.loads(self.p.telegram_widget({"action": "send", "html": os.urandom(6000).hex()}))
         self.assertFalse(res["success"])
@@ -193,6 +216,43 @@ class PluginFlow(unittest.TestCase):
             self.p._extend_allowed_updates()
         self.assertIs(fake.Update.ALL_TYPES, held)
         self.assertIn("widget_query", held)
+
+
+class Templates(unittest.TestCase):
+    def test_builtins_parse_fit_and_list(self):
+        dirs = [ROOT / "templates"]
+        names = {t["name"] for t in wg.list_templates(dirs)}
+        self.assertTrue({"weather", "tracker", "compare", "stack"} <= names)
+        for name in names:
+            meta, body = wg.load_template(dirs, name)
+            self.assertNotIn("<!--hte", body)
+            self.assertTrue(meta.get("desc"), name)
+            acts = wg.actions_from_data(meta.get("example") or {}, meta.get("actions_from", ""))
+            raw, packed = wg.check_size(wg.build_html(body, acts))
+            self.assertLess(packed, 3800, name)  # headroom under the 4096-byte server limit
+            if meta.get("example"):
+                self.assertLessEqual(len(wg.encode_data(meta["example"]).encode()), wg.MAX_DATA, name)
+
+    def test_compare_taps_come_from_data(self):
+        meta, body = wg.load_template([ROOT / "templates"], "compare")
+        acts = wg.actions_from_data(meta["example"], meta["actions_from"])
+        self.assertEqual([a["key"] for a in acts], ["a", "b"])
+        doc = wg.build_html(body, acts)  # buttons are drawn by the template's script: no auto row
+        self.assertNotIn("margin:10px 0 18px", doc)
+        self.assertIn('var K=["a","b"]', doc)
+
+    def test_save_overrides_and_validates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dirs = [ROOT / "templates", Path(tmp)]
+            wg.save_template(tmp, "weather", "<p id=x></p>", "mine", {"a": 1})
+            meta, body = wg.load_template(dirs, "weather")
+            self.assertEqual((meta["desc"], meta["example"], body.strip()), ("mine", {"a": 1}, "<p id=x></p>"))
+            with self.assertRaises(wg.WidgetError):
+                wg.save_template(tmp, "Bad Name", "<p></p>")
+            with self.assertRaises(wg.WidgetError):
+                wg.save_template(tmp, "big", os.urandom(6000).hex())
+            with self.assertRaises(wg.WidgetError):
+                wg.load_template(dirs, "nope")
 
 
 class Adoption(unittest.TestCase):

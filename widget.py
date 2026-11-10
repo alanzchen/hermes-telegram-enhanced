@@ -103,11 +103,13 @@ def build_html(body: str, actions: list[dict[str, str]]) -> str:
         raise WidgetError("html is required")
     if actions:
         missing = [a for a in actions if f'data-action="{a["key"]}"' not in doc]
+        if "data-hte-actions" in doc:  # a template that draws its own data-action buttons from chat_data
+            missing = []
         if len(missing) == len(actions):
             doc += _buttons_html(actions)
         elif missing:
             raise WidgetError("html has data-action buttons but not for: " + ", ".join(a["key"] for a in missing))
-        doc += _RUNTIME.replace("__KEYS__", json.dumps([a["key"] for a in actions]))
+        doc += _RUNTIME.replace("__KEYS__", json.dumps([a["key"] for a in actions], separators=(",", ":")))
     return doc
 
 
@@ -162,6 +164,82 @@ def injection_text(rec: dict[str, Any], action: dict[str, str], who: str) -> str
         lines.append(f"问题: {rec['title']}")
     lines.append(f"widget: {rec.get('chat_id')}:{rec.get('message_id')}")
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------- templates
+# A template is one HTML file that draws itself from chat_data, so reusing it means: name + data.
+# Optional first line: <!--hte {"desc": "...", "example": {...}, "actions_from": "o"}--> (stripped before
+# sending). actions_from names a list in chat_data whose items {k, n, v?} become the tap actions.
+
+_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
+_META_RE = re.compile(r"^\s*<!--hte\s+(\{.*?\})\s*-->\s*", re.S)
+
+
+def parse_template(text: str) -> tuple[dict[str, Any], str]:
+    m = _META_RE.match(text or "")
+    if not m:
+        return {}, text or ""
+    try:
+        meta = json.loads(m.group(1))
+    except ValueError:
+        meta = {}
+    return (meta if isinstance(meta, dict) else {}), text[m.end():]
+
+
+def _template_files(dirs: list[Any]) -> dict[str, Any]:
+    """name -> path; later dirs win (user templates override built-ins)."""
+    from pathlib import Path
+    found: dict[str, Any] = {}
+    for d in dirs:
+        p = Path(d)
+        if p.is_dir():
+            for f in sorted(p.glob("*.html")):
+                if _NAME_RE.match(f.stem):
+                    found[f.stem] = f
+    return found
+
+
+def load_template(dirs: list[Any], name: str) -> tuple[dict[str, Any], str]:
+    path = _template_files(dirs).get(str(name or "").strip().lower())
+    if path is None:
+        raise WidgetError(f"no widget template {name!r}; action=templates lists them")
+    return parse_template(path.read_text(encoding="utf-8"))
+
+
+def list_templates(dirs: list[Any]) -> list[dict[str, Any]]:
+    out = []
+    for name, path in sorted(_template_files(dirs).items()):
+        meta, _ = parse_template(path.read_text(encoding="utf-8"))
+        out.append({"name": name, "desc": meta.get("desc", ""), "example": meta.get("example"),
+                    "taps": bool(meta.get("actions_from"))})
+    return out
+
+
+def save_template(directory: Any, name: str, doc: str, desc: str = "", example: Any = None,
+                  actions_from: str = "") -> Any:
+    from pathlib import Path
+    name = str(name or "").strip().lower()
+    if not _NAME_RE.match(name):
+        raise WidgetError("template name: 1-32 lowercase letters, digits, - or _")
+    _, body = parse_template(doc)
+    check_size(build_html(body, []))
+    meta: dict[str, Any] = {"desc": " ".join(str(desc or "").split())[:200]}
+    if example is not None:
+        meta["example"] = chat_data_obj(example)
+    if actions_from:
+        meta["actions_from"] = str(actions_from)
+    d = Path(directory)
+    d.mkdir(parents=True, exist_ok=True)
+    path = d / f"{name}.html"
+    path.write_text("<!--hte " + json.dumps(meta, ensure_ascii=False) + "-->\n" + body.strip() + "\n", encoding="utf-8")
+    return path
+
+
+def actions_from_data(data: dict[str, Any], field: str) -> list[dict[str, str]]:
+    items = data.get(field) if field else None
+    acts = [{"key": str(o.get("k")), "label": str(o.get("n") or o.get("k")), "value": str(o.get("v") or "")}
+            for o in (items if isinstance(items, list) else []) if isinstance(o, dict) and o.get("k")]
+    return normalize_actions(acts)
 
 
 def prune(data: dict[str, Any], now: float) -> None:
