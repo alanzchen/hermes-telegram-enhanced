@@ -2411,6 +2411,82 @@ def _patch_doc_burst(cls: Any) -> None:
     logger.info("telegram-enhanced: document burst merging enabled on %s.%s", cls.__module__, cls.__name__)
 
 
+_QUOTE_MARK = "_hte_rich_quote"
+
+
+def _flatten_rich(value: Any, depth: int = 0) -> str:
+    """Plain text of a Bot API rich-text value (string, list of segments, or entity dict)."""
+    if depth > 20 or value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (list, tuple)):
+        return "".join(_flatten_rich(v, depth + 1) for v in value)
+    if isinstance(value, dict):
+        for key in ("text", "texts", "content", "items"):
+            if key in value:
+                return _flatten_rich(value[key], depth + 1)
+    return ""
+
+
+def quote_rich_text(quote: Any) -> str | None:
+    """Text of a native quote chosen from a rich message (Bot API 10.4 ``TextQuote.rich_texts``), or
+    None when the quote has no such field. Mirrors upstream PR #153743; core's ``text`` is empty for
+    these quotes, so without it the reply context falls back to the WHOLE replied-to message."""
+    rich = getattr(quote, "rich_texts", None)
+    kwargs = getattr(quote, "api_kwargs", None)
+    if rich is None and kwargs is not None:
+        try:
+            rich = kwargs.get("rich_texts")
+        except Exception:
+            rich = None
+    if rich is None:
+        return None
+    try:
+        from plugins.platforms.telegram.telegram_entities import _rich_inline as flatten  # core's renderer
+    except Exception:
+        flatten = _flatten_rich
+    segments = rich if isinstance(rich, list) else [rich]
+    return "\n".join(t for t in (flatten(s) for s in segments) if t and t.strip())
+
+
+def _core_handles_rich_quotes() -> bool:
+    try:
+        from plugins.platforms.telegram import telegram_entities as te
+        return hasattr(te, "quote_rich_text")
+    except Exception:
+        return False
+
+
+def _patch_quote(cls: Any) -> None:
+    """Wrap ``_reply_context`` so a quote selected inside a rich message yields the selection, not the
+    whole message. Skipped once Hermes core ships its own fix (upstream #153743)."""
+    if (not isinstance(cls, type) or cls.__dict__.get(_QUOTE_MARK) or not hasattr(cls, "_reply_context")
+            or _core_handles_rich_quotes()):
+        return
+    cls._hte_orig_reply_context = cls.__dict__.get("_hte_orig_reply_context", cls._reply_context)
+
+    def _reply_context(self, message):
+        orig = type(self)._hte_orig_reply_context
+        quote = getattr(message, "quote", None) if getattr(message, "reply_to_message", None) else None
+        if quote is not None and not (getattr(quote, "text", None) or "").strip():
+            helper = getattr(sys, "_hte_quote_text", None)
+            try:
+                selected = helper(quote) if helper else None
+            except Exception:
+                selected = None
+            if selected is not None:
+                return str(message.reply_to_message.message_id), (selected or None)
+        return orig(self, message)
+
+    cls._reply_context = _reply_context
+    setattr(cls, _QUOTE_MARK, True)
+    logger.info("telegram-enhanced: rich-message quote fix enabled on %s.%s", cls.__module__, cls.__name__)
+
+
+sys._hte_quote_text = quote_rich_text  # resolved per call so a plugin reload takes effect
+
+
 _LIST_PATCH_MARK = "_hte_native_lists_v2"
 _LEGACY_LIST_PATCH_MARK = "_hte_native_lists"
 # Wrappers resolve helpers at call time, so a plugin reload updates the behaviour of an already-patched
@@ -2483,6 +2559,10 @@ def _patch_telegram_lists() -> None:
             _patch_snooze(cls)
         except Exception:
             logger.warning("telegram-enhanced: snooze patch failed", exc_info=True)
+        try:
+            _patch_quote(cls)
+        except Exception:
+            logger.warning("telegram-enhanced: quote patch failed", exc_info=True)
         if (not isinstance(cls, type) or cls.__dict__.get(_LIST_PATCH_MARK)
                 or not hasattr(cls, "_needs_rich_rendering") or not hasattr(cls, "format_message")):
             continue
