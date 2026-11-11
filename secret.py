@@ -66,9 +66,21 @@ def default_store(kind: str) -> str:
 def card_markdown(req: dict[str, Any], lang: str, vault: str) -> str:
     where = s("where_op", lang, vault=vault) if req["store"] == "1password" else s("where_temp", lang)
     mins = max(1, round((req["expires_at"] - req["created"]) / 60))
-    body = s("card", lang, label=req["label"], where=where, what=s("what_" + req["kind"], lang), mins=mins)
+    body = s("card", lang, label=_md(req["label"]), where=where, what=s("what_" + req["kind"], lang), mins=mins)
+    extra = []
+    if req.get("username"):
+        extra.append(("用户名" if lang == "zh" else "Username") + f": `{_md(req['username'])}`")
+    if req.get("url"):
+        extra.append(("网站" if lang == "zh" else "Website") + f": `{_md(req['url'])}`")
+    if extra:
+        body += "\n\n" + "\n".join(extra)
     btn = f'<tg-button type="callback_data" data="{PREFIX}{req["id"]}">{html.escape(s("cancel", lang))}</tg-button>'
     return body + "\n\n<tg-button-row>\n" + btn + "\n</tg-button-row>"
+
+
+def _md(text: Any) -> str:
+    """Neutralise Markdown/markup in agent-supplied fields shown on the card."""
+    return html.escape(str(text)).replace("`", "'").replace("*", "∗").replace("_", "‗").replace("[", "(").replace("]", ")")
 
 
 def parse_cancel(data: str) -> str | None:
@@ -76,13 +88,22 @@ def parse_cancel(data: str) -> str | None:
     return m.group(1) if m else None
 
 
+_PASS_COMMANDS = re.compile(r"^/(stop|cancel|help|new|reset|status)(@\w+)?(\s|$)", re.I)
+
+
+def is_passthrough_command(text: Any) -> bool:
+    """Only a few known bot commands go through while a request is pending; any other text starting
+    with "/" may be a password (1 in 64 base64 strings does) and must be captured, not leaked."""
+    return isinstance(text, str) and bool(_PASS_COMMANDS.match(text.strip()))
+
+
 def capture_value(text: Any) -> str | None:
-    """The secret in a captured message: surrounding whitespace (a pasted newline) removed."""
+    """The secret in a captured message: a pasted trailing newline removed, inner/edge spaces kept."""
     if not isinstance(text, str):
         return None
-    value = text.strip()
-    if not value or len(value) > MAX_LEN or value.startswith("/"):
-        return None  # empty, absurd, or a slash command (those pass through untouched)
+    value = text.strip("\r\n")
+    if not value.strip() or len(value) > MAX_LEN:
+        return None
     return value
 
 

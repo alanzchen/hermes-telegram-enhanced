@@ -1880,18 +1880,30 @@ def _secret_intercept(event: Any, src: Any, chat_id: str, thread_id: str) -> dic
     store: JsonStore | None = _state.get("secret_reqs")
     if store is None:
         return None
-    mtype = getattr(event, "message_type", None)
-    if str(getattr(mtype, "value", mtype) or "text").lower() != "text":
-        return None
     user_id = str(getattr(src, "user_id", "") or "")
     now = time.time()
-    if sx.match_request(store._read(), chat_id, thread_id, user_id, now) is None:  # cheap, lock-free check
+    try:
+        pending = sx.match_request(store._read(), chat_id, thread_id, user_id, now)
+    except Exception:  # cannot tell whether a secret is pending: hold the message rather than leak it
+        logger.warning("telegram-enhanced: secure-input store unreadable; message dropped", exc_info=True)
+        return {"action": "skip", "reason": "telegram-enhanced secure input (store error)"}
+    if pending is None:
         return None
     text = getattr(event, "text", None)
+    mid = getattr(event, "message_id", None) or getattr(src, "message_id", None)
+    if sx.is_passthrough_command(text):
+        return None  # /stop and friends keep working while a request waits
+    card_mid = pending.get("card_mid")
+    if not (card_mid and str(mid or "").isdigit() and int(mid) > int(card_mid)):
+        return None  # sent before the card existed: an ordinary message, not the answer
+    mtype = getattr(event, "message_type", None)
+    if str(getattr(mtype, "value", mtype) or "text").lower() != "text":
+        return {"action": "skip", "reason": "telegram-enhanced secure input (non-text dropped)"}  # captions may hold it
     cancel = sx.is_cancel_text(text)
     value = None if cancel else sx.capture_value(text)
-    if not cancel and value is None:
-        return None  # a slash command (e.g. /stop) or empty text passes through
+    if not cancel and value is None:  # empty or over-long paste: drop it, keep waiting, never pass it on
+        _spawn(_api, "deleteMessage", {"chat_id": _int_or_str(chat_id), "message_id": int(mid)})
+        return {"action": "skip", "reason": "telegram-enhanced secure input (rejected value)"}
     try:
         return _secret_claim(event, src, chat_id, thread_id, user_id, now, cancel, value)
     except Exception:  # fail closed: a message meant as a secret must never fall through to the agent
@@ -1919,7 +1931,7 @@ def _secret_claim(event: Any, src: Any, chat_id: str, thread_id: str, user_id: s
 
 def _secret_finish(req: dict[str, Any], value: str | None, message_id: Any) -> None:
     lang = req.get("lang") or "zh"
-    deleted = True
+    deleted = False
     if message_id and str(message_id).isdigit():
         res = _api("deleteMessage", {"chat_id": _int_or_str(req["chat_id"]), "message_id": int(message_id)})
         deleted = bool(res.get("ok"))
@@ -1931,6 +1943,7 @@ def _secret_finish(req: dict[str, Any], value: str | None, message_id: Any) -> N
     ref = error = ""
     if req["store"] == "1password":
         ref, error = _op_store(req, value)
+        error = sx.redact(error, value)
         state = "stored" if ref else "failed"
     else:
         _secret_values()

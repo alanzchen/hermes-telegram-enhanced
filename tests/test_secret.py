@@ -29,8 +29,9 @@ def load_plugin():
 
 class Helpers(unittest.TestCase):
     def test_capture_value(self):
-        self.assertEqual(sx.capture_value("  pw with space \n"), "pw with space")
-        self.assertIsNone(sx.capture_value("/stop"))
+        self.assertEqual(sx.capture_value("  pw with space \n"), "  pw with space ")
+        self.assertTrue(sx.is_passthrough_command("/stop"))
+        self.assertFalse(sx.is_passthrough_command("/9kF3x"))
         self.assertIsNone(sx.capture_value("   "))
         self.assertIsNone(sx.capture_value(None))
         self.assertTrue(sx.is_cancel_text(" 取消 "))
@@ -123,7 +124,7 @@ class Flow(unittest.TestCase):
         self.assertEqual(card["message_thread_id"], 55)
         self.assertIn("hx:" + res["id"], card["rich_message"]["markdown"])
 
-        out = self.p._on_pre_gateway_dispatch(self.event("  " + SECRET + "\n"))
+        out = self.p._on_pre_gateway_dispatch(self.event(SECRET + "\n"))
         self.assertEqual(out["action"], "skip")
         self.assertEqual(self.stored, [SECRET])
         self.assertIn(("deleteMessage", {"chat_id": 100, "message_id": 4242}), self.calls)
@@ -141,8 +142,25 @@ class Flow(unittest.TestCase):
         self.assertIsNone(self.p._on_pre_gateway_dispatch(self.event("/stop")))
         self.assertIsNone(self.p._on_pre_gateway_dispatch(self.event(SECRET, user="999")))
         self.assertIsNone(self.p._on_pre_gateway_dispatch(self.event(SECRET, thread="77")))
-        self.assertIsNone(self.p._on_pre_gateway_dispatch(self.event("voice", mtype="voice")))
+        self.assertEqual(self.p._on_pre_gateway_dispatch(self.event("cap", mtype="photo"))["action"], "skip")
+        self.assertIsNone(self.p._on_pre_gateway_dispatch(self.event("before the card", mid=899)))
         self.assertEqual(self.stored, [])
+
+    def test_review_fixes(self):
+        self.request()
+        out = self.p._on_pre_gateway_dispatch(self.event("/9kF3pass word "))  # slash-led password is captured
+        self.assertEqual(out["action"], "skip")
+        self.assertEqual(self.stored, ["/9kF3pass word "])  # inner/edge spaces kept, no strip
+        self.request()
+        with mock.patch.object(self.p._state["secret_reqs"], "_read", side_effect=OSError("disk")):
+            self.assertEqual(self.p._on_pre_gateway_dispatch(self.event(SECRET))["action"], "skip")
+        out = self.p._on_pre_gateway_dispatch(self.event("x" * 5000))  # over-long: dropped + deleted, still pending
+        self.assertEqual(out["action"], "skip")
+        self.assertIn(("deleteMessage", {"chat_id": 100, "message_id": 4242}), self.calls)
+        self.assertEqual(self.stored, ["/9kF3pass word "])
+        card = [p for m, p in self.calls if m == "sendRichMessage"][-1]["rich_message"]["markdown"]
+        self.assertIn("ups.com", card)  # the site the login will be filled into is shown
+        self.assertIn("alan", card)
 
     def test_expiry_and_sweep(self):
         res = self.request(minutes=1)
