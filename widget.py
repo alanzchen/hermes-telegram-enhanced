@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import html as _html
 import json
+import math
 import re
 import time
 import zlib
@@ -23,19 +24,29 @@ ACTION_PREFIX = "a:"
 STORE_TTL = 30 * 86400
 _KEY_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
 
-# ES2023 in QuickJS; only APIs the widget profile lists (querySelector, addEventListener, classList).
+# Inject before template scripts. All template innerHTML interpolation uses this escape helper.
+_TEMPLATE_RUNTIME = """<script>window.HTE={
+ esc:function(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]})},
+ state:function(){try{return JSON.parse(window.TelegramWidget.chatData||'{}')||{}}catch(e){return{}}},
+ mount:function(draw){var W=window.TelegramWidget;function render(){draw(window.HTE.state())}if(W)W.onEvent('chatDataChanged',render);render();if(W&&W.ready)W.ready()}
+};</script>"""
+
+# Bind newly created buttons after every template render; no event bubbling/MutationObserver needed.
+# Keys and pending requests are independent of DOM nodes. Redraw cancels an armed confirmation.
 _RUNTIME = (
     "<style>button.hte-chosen::before{content:'\\2713  '}</style>"
-    "<script>(function(){var W=window.TelegramWidget;if(!W)return;var K=__KEYS__;"
+    "<script>(function(){var W=window.TelegramWidget;if(!W)return;var K=__KEYS__,pending={};"
     "function S(){try{return JSON.parse(W.chatData||'{}')||{}}catch(e){return{}}}"
     "function B(k){return document.querySelector('[data-action=\"'+k+'\"]')}"
-    "function P(){var c=S().chosen;K.forEach(function(k){var b=B(k);if(!b||c==null)return;"
-    "b.disabled=true;if(k===c)b.classList.add('hte-chosen')})}"
-    "K.forEach(function(k){var b=B(k);if(b)b.addEventListener('click',function(){if(b.disabled)return;"
+    "function P(){var s=S(),c=s.chosen;K.forEach(function(k){var b=B(k);if(!b)return;"
+    "if(!b._hte){b._hte=1;b.addEventListener('click',function(){if(b.disabled||pending[k])return;"
+    "var s=S();if(s.chosen!=null||(s.exp&&s.exp<=Date.now()/1000)){P();return}"
     "var q=b.getAttribute('data-confirm');if(q&&!b._a){var o=b.textContent;b._a=1;b.textContent=q;"
     "setTimeout(function(){if(!b.disabled){b._a=0;b.textContent=o}},4000);return}"
-    "b.disabled=true;W.request('a:'+k).then(function(r){var d={};try{d=JSON.parse(r.result||'{}')}catch(x){}"
-    "if(!d.ok||d.again)b.disabled=false},function(){b.disabled=false})})});"
+    "pending[k]=1;b.disabled=true;W.request('a:'+k).then(function(r){var d={};try{d=JSON.parse(r.result||'{}')}catch(x){}"
+    "if(!d.ok||d.again){delete pending[k];P()}},function(){delete pending[k];P()})})}"
+    "b.disabled=!!pending[k]||c!=null||!!(s.exp&&s.exp<=Date.now()/1000);"
+    "if(k===c)b.classList.add('hte-chosen')})}"
     "W.onEvent('chatDataChanged',P);P();if(W.ready)W.ready()})();</script>"
 )
 
@@ -84,10 +95,24 @@ def chat_data_obj(value: Any) -> dict[str, Any]:
 
 
 def encode_data(obj: dict[str, Any]) -> str:
-    text = json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+    try:
+        text = json.dumps(obj, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+    except (ValueError, TypeError) as exc:
+        raise WidgetError("chat_data must contain only finite JSON values") from exc
     if len(text.encode()) > MAX_DATA:
         raise WidgetError(f"chat_data is {len(text.encode())} bytes; the limit is {MAX_DATA}")
     return text
+
+
+def check_action_data(data: dict[str, Any], actions: list[dict[str, str]]) -> None:
+    """Reserve enough state bytes to record any registered choice after a successful tap."""
+    encode_data(data)
+    if actions:
+        longest = max((a["key"] for a in actions), key=len)
+        try:
+            encode_data(dict(data, chosen=longest))
+        except WidgetError as exc:
+            raise WidgetError(f"chat_data needs room for reserved chosen state: {exc}") from exc
 
 
 def _buttons_html(actions: list[dict[str, str]]) -> str:
@@ -99,6 +124,8 @@ def _buttons_html(actions: list[dict[str, str]]) -> str:
 def build_html(body: str, actions: list[dict[str, str]]) -> str:
     """Model HTML + (auto buttons when the HTML has no data-action elements) + the tap runtime."""
     doc = str(body or "")
+    if "<!--hte-runtime-->" in doc:
+        doc = doc.replace("<!--hte-runtime-->", _TEMPLATE_RUNTIME, 1)
     if "\x00" in doc:
         raise WidgetError("html must not contain NUL")
     if not doc.strip():
@@ -210,26 +237,107 @@ def load_template(dirs: list[Any], name: str) -> tuple[dict[str, Any], str]:
     return parse_template(path.read_text(encoding="utf-8"))
 
 
+def validate_schema(value: Any, schema: dict[str, Any], path: str = "data") -> None:
+    """Small, dependency-free JSON Schema subset used by the shipped, versioned contracts.
+
+    Supports type/anyOf/enum, object properties/required/additionalProperties, array
+    items/prefixItems/minItems/maxItems, string minLength/maxLength/pattern, numeric bounds.
+    This is a data validator, not a general JSON Schema implementation.
+    """
+    if "anyOf" in schema:
+        for option in schema["anyOf"]:
+            try:
+                validate_schema(value, option, path)
+                return
+            except WidgetError:
+                pass
+        raise WidgetError(f"{path}: does not match any allowed type/value")
+    kind = schema.get("type")
+    if isinstance(kind, list):
+        validate_schema(value, {"anyOf": [dict(schema, type=t) for t in kind]}, path)
+        return
+    matches = {"object": isinstance(value, dict), "array": isinstance(value, list),
+               "string": isinstance(value, str), "boolean": type(value) is bool,
+               "integer": type(value) is int, "number": type(value) in (int, float),
+               "null": value is None}
+    if kind and not matches.get(kind, False):
+        raise WidgetError(f"{path}: expected {kind}")
+    if "enum" in schema and value not in schema["enum"]:
+        raise WidgetError(f"{path}: expected one of {schema['enum']}")
+    if type(value) in (int, float):
+        try:
+            finite = math.isfinite(value)
+        except OverflowError:
+            finite = False
+        if not finite:
+            raise WidgetError(f"{path}: expected a finite number")
+        for bound, fail in (("minimum", value < schema.get("minimum", value)),
+                            ("maximum", value > schema.get("maximum", value))):
+            if fail:
+                raise WidgetError(f"{path}: {bound} is {schema[bound]}")
+    if isinstance(value, str):
+        if any(ord(c) < 32 and c not in '\n\t\r' for c in value) or any(0xD800 <= ord(c) <= 0xDFFF for c in value):
+            raise WidgetError(f"{path}: invalid control character or Unicode surrogate")
+        if len(value) < schema.get("minLength", 0) or len(value) > schema.get("maxLength", len(value)):
+            raise WidgetError(f"{path}: length must be {schema.get('minLength', 0)}..{schema.get('maxLength', 'unlimited')}")
+        if schema.get("pattern") and not re.fullmatch(schema["pattern"], value):
+            raise WidgetError(f"{path}: must match {schema['pattern']}")
+    if isinstance(value, list):
+        if len(value) < schema.get("minItems", 0) or len(value) > schema.get("maxItems", len(value)):
+            raise WidgetError(f"{path}: array size must be {schema.get('minItems', 0)}..{schema.get('maxItems', 'unlimited')}")
+        prefix = schema.get("prefixItems", [])
+        for i, item in enumerate(value):
+            rule = prefix[i] if i < len(prefix) else schema.get("items", {})
+            validate_schema(item, rule, f"{path}[{i}]")
+    if isinstance(value, dict):
+        props = schema.get("properties", {})
+        for key in schema.get("required", []):
+            if key not in value:
+                raise WidgetError(f"{path}.{key}: required")
+        for key, item in value.items():
+            if key not in props and schema.get("additionalProperties") is False:
+                raise WidgetError(f"{path}.{key}: unknown field")
+            validate_schema(item, props.get(key, {}), f"{path}.{key}")
+
+
+def validate_template_data(meta: dict[str, Any], data: dict[str, Any]) -> None:
+    schema: dict[str, Any] = meta.get("schema") or {"type": "object"}  # legacy user templates
+    props: dict[str, Any] = dict(schema.get("properties", {}))
+    props.update(chosen={"type": ["string", "null"], "pattern": "[A-Za-z0-9_-]{1,32}"},
+                 exp={"type": "number", "minimum": 0})
+    validate_schema(data, dict(schema, properties=props))
+    if meta.get("contract") == "tracker" and data["i"] >= len(data["s"]):
+        raise WidgetError("data.i: must be a valid zero-based index in data.s")
+    if meta.get("actions_from"):
+        actions_from_data(data, meta["actions_from"])  # also reject duplicate action keys
+
+
 def list_templates(dirs: list[Any]) -> list[dict[str, Any]]:
     out = []
     for name, path in sorted(_template_files(dirs).items()):
         meta, _ = parse_template(path.read_text(encoding="utf-8"))
         out.append({"name": name, "desc": meta.get("desc", ""), "example": meta.get("example"),
+                    "schema": meta.get("schema", {"type": "object"}), "version": meta.get("version", 1),
                     "taps": bool(meta.get("actions_from"))})
     return out
 
 
 def save_template(directory: Any, name: str, doc: str, desc: str = "", example: Any = None,
-                  actions_from: str = "") -> Any:
+                  actions_from: str = "", schema: Any = None) -> Any:
     from pathlib import Path
     name = str(name or "").strip().lower()
     if not _NAME_RE.match(name):
         raise WidgetError("template name: 1-32 lowercase letters, digits, - or _")
-    _, body = parse_template(doc)
+    header, body = parse_template(doc)
     check_size(build_html(body, []))
-    meta: dict[str, Any] = {"desc": " ".join(str(desc or "").split())[:200]}
+    contract = schema if schema is not None else header.get("schema", {"type": "object"})
+    if not isinstance(contract, dict) or contract.get("type") != "object":
+        raise WidgetError("schema: expected an object schema with type=object")
+    meta: dict[str, Any] = {"desc": " ".join(str(desc or "").split())[:200],
+                            "schema": contract, "version": 1}
     if example is not None:
         meta["example"] = chat_data_obj(example)
+        validate_template_data(meta, meta["example"])
     if actions_from:
         meta["actions_from"] = str(actions_from)
     d = Path(directory)

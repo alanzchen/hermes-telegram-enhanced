@@ -35,6 +35,7 @@ from .core import (
 from . import i18n
 from . import followup as fu
 from . import widget as wg
+from . import charts
 from . import secret as sx
 
 logger = logging.getLogger("hermes_plugins.telegram_enhanced")
@@ -1560,34 +1561,40 @@ def telegram_wrapup(args: dict[str, Any], **_kw: Any) -> str:
 WIDGET_SCHEMA = {
     "name": "telegram_widget",
     "description": (
-        "Send an interactive HTML widget into the CURRENT Telegram private chat/topic (Bot API 10.4): one "
-        "self-contained HTML document drawn inside the message bubble, sandboxed (no network, no keyboard, "
-        "taps only), styled natively by Telegram (unstyled <button>s look like the client's buttons; use the "
-        "--tg-theme-* CSS variables, never hard-coded colors). Use it when an in-bubble view beats text: a "
-        "small dashboard, a comparison with tap-to-choose, a checklist, a progress view you update in place. "
-        "For a plain question with buttons prefer telegram_decisions / telegram_rich_send. "
-        "actions: each tap of an element with data-action=\"<key>\" comes back to you as a normal turn "
-        "('[Telegram 小组件] ... 点击了「label」' + value); if the HTML has no data-action elements the plugin "
-        "adds a button row. With once=true (default) the first tap locks the buttons and marks the chosen one. "
-        "chat_data: a JSON object (<=1024 bytes) the widget reads as JSON.parse(TelegramWidget.chatData) and "
-        "redraws on the 'chatDataChanged' event; action=update replaces it on a sent widget (key 'chosen' is "
-        "reserved). Limits: 32 KB HTML, 4 KB after zlib -9 (checked before sending), inline CSS/JS only, images "
-        "only as data: URLs or inline SVG; no input/select/form elements. The message is sent immediately; do "
-        "not repeat it in your reply. "
-        "TEMPLATES: reusable widgets that draw themselves from chat_data. action=templates lists them with a "
-        "description and an example chat_data; send with template=<name> + chat_data (no html). Built-ins: "
-        "weather, tracker (package/trip/long-task progress, update i in place), compare (option cards with "
-        "tap-to-choose; taps come from chat_data.o), approve (authorization card for an external, paid or "
-        "sensitive action: details, risk line, approve needs a second tap, expires_in shows a countdown and "
-        "late taps are refused). Use approve instead of a plain yes/no whenever Alan must authorize "
-        "something. action=save_template stores a new "
-        "one (name, html that reads JSON.parse(TelegramWidget.chatData), desc, example) when Alan asks to keep "
-        "a widget for reuse."),
+        "Send a sandboxed HTML widget immediately into the CURRENT Telegram private chat/topic; do not "
+        "repeat it in your reply. Prefer templates plus data over writing markup. For plain choices use "
+        "telegram_decisions/telegram_rich_send. Include a text caption; design at 320px and keep updates "
+        "within the initial height. No network, keyboard, external libraries or forms. QuickJS ES2023 with "
+        "small DOM: getElementById/querySelector, innerHTML, textContent, style, addEventListener. Inline "
+        "SVG path/rect/circle/line/polyline/text/g/viewBox/linearGradient work; no clipPath, mask, marker, "
+        "filters, SMIL or foreignObject. Use --tg-theme-text-color/hint-color/button-color/accent-text-color "
+        "with fallbacks. Final HTML <=32768 raw and <=4096 zlib-9 bytes. "
+        "TEMPLATES: action=templates returns versioned schemas/examples; send template=<name>, data={...} "
+        "(chat_data is an alias; never pass both). Python validates on send AND update. weather requires "
+        "city,t,c,hi,lo,fl,h,at (numeric temperatures; h:[[label,temp,code]], <=8); tracker requires t,s "
+        "(1-8 labels),i (zero-based index), optional eta,n,at; compare requires t,o (1-6 "
+        "{k,n,v?,p?,d?,best?,b?}), optional note; approve requires t,d ([[label,value]], <=8),o "
+        "(1-6 {k,n,v?}), optional risk,confirm. Use approve for authorization: first button needs two taps, "
+        "expires_in sets a countdown and server-side expiry. This UI does not replace execution permission. "
+        "CHART: template='chart', data={type:'line'|'bar',title?,unit?,x:[labels],series:[{name,values:"
+        "[number|null]}],y_min?,y_max?,highlight?}. Max 24 points, 3 series; highlight is an x index; "
+        "nulls break lines. Never write chart markup: Python compiles initial SVG, a tiny fixed renderer "
+        "redraws updates. Inspect returned warnings if the initial chart was sampled to fit. "
+        "UPDATE: action=update,message_id,data replaces the FULL display spec (<=1024 UTF-8 bytes). "
+        "Initial chart specs live in SVG, not this state limit. Templates redraw on chatDataChanged. "
+        "chosen/exp are reserved; expiry and choices are preserved. Action keys/order/values cannot change. "
+        "TAPS: registered data-action buttons send a:<key> through the injected runtime and return as a "
+        "normal conversation turn. Buttons are auto-added if absent; compare/approve derive actions from "
+        "data.o. once=true locks after the first accepted tap; owner/whitelist/expiry are checked server-side. "
+        "SAVE: action=save_template stores name/html/desc/example/schema/actions_from when asked to reuse "
+        "a widget. Custom template helpers: <!--hte-runtime-->, HTE.esc(value), HTE.mount(draw)."),
     "parameters": {"type": "object", "properties": {
         "action": {"type": "string", "enum": ["send", "update", "templates", "save_template"]},
         "html": {"type": "string", "description": "send: the widget HTML (a fragment is fine); save_template: "
                                                   "the template HTML."},
-        "template": {"type": "string", "description": "send: a saved template name instead of html."},
+        "template": {"type": "string", "description": "send: weather, tracker, compare, approve, chart, or a saved template name instead of html."},
+        "data": {"type": "object", "description": "send/update: template data or chart spec. Alias for chat_data; do not pass both."},
+        "schema": {"type": "object", "description": "save_template: JSON Schema subset (type/properties/required/additionalProperties, items/prefixItems, string/array length limits, numeric bounds, enum, anyOf)."},
         "name": {"type": "string", "description": "save_template: template name (lowercase, - or _)."},
         "desc": {"type": "string", "description": "save_template: what it shows and what chat_data it reads."},
         "example": {"type": "object", "description": "save_template: example chat_data."},
@@ -1628,45 +1635,89 @@ def telegram_widget(args: dict[str, Any], **_kw: Any) -> str:
     if action == "save_template":
         try:
             path = wg.save_template(dirs[-1], str(args.get("name") or ""), str(args.get("html") or ""),
-                                    str(args.get("desc") or ""), args.get("example"), str(args.get("actions_from") or ""))
+                                    str(args.get("desc") or ""), args.get("example"), str(args.get("actions_from") or ""),
+                                    args.get("schema"))
         except wg.WidgetError as exc:
             return _result(success=False, error=str(exc))
         return _result(success=True, saved=path.stem)
     try:
-        data = wg.chat_data_obj(args.get("chat_data"))
+        if args.get("data") is not None and args.get("chat_data") is not None:
+            raise wg.WidgetError("pass data or chat_data, not both")
+        data = wg.chat_data_obj(args.get("data", args.get("chat_data")))
+        # Copy: reserved state must never mutate the caller's input object.
+        data = dict(data)
         if action == "update":
             mid = int(args.get("message_id") or 0)
             key = wg.store_key(chat_id, mid)
             rec = store.get(key) or {}
-            if rec.get("chosen") is not None:
+            if not rec:
+                raise wg.WidgetError("widget record not found; send a new widget to establish its data contract")
+            if rec.get("thread_id", "") != thread_id:
+                raise wg.WidgetError("widget belongs to a different topic")
+            if rec.get("chosen") is not None and rec.get("once", True):
                 data["chosen"] = rec["chosen"]
+            else:
+                data.pop("chosen", None)
+            if rec.get("expires_at"):
+                data["exp"] = rec["expires_at"]
+            else:
+                data.pop("exp", None)
+            meta = rec.get("template_meta") or {}
+            if meta:
+                wg.validate_template_data(meta, data)
+            if rec.get("renderer") == "chart":
+                charts.validate_spec(data)
+            new_actions = rec.get("actions", [])
+            if meta.get("actions_from"):
+                new_actions = wg.actions_from_data(data, meta["actions_from"])
+                identity = lambda acts: [(a["key"], a.get("value", "")) for a in acts]
+                if identity(new_actions) != identity(rec.get("actions", [])):
+                    raise wg.WidgetError("data: action keys/order/values are immutable; send a new widget")
+                if meta.get("contract") == "approve" and data.get("confirm", True) != rec["chat_data"].get("confirm", True):
+                    raise wg.WidgetError("data.confirm: confirmation policy is immutable; send a new approval")
+            wg.check_action_data(data, new_actions)
             res = _api("editMessageWidgetData", {"chat_id": _int_or_str(chat_id), "message_id": mid,
                                                  "chat_data": wg.encode_data(data)})
             if not res.get("ok"):
                 return _result(success=False, error=str(res.get("description") or "editMessageWidgetData failed"))
-            if rec:
-                rec["chat_data"] = data
-                store.set(key, rec)
+            rec["chat_data"], rec["actions"] = data, new_actions
+            store.set(key, rec)
             return _result(success=True, action="updated", message_id=mid)
         html = str(args.get("html") or "")
         actions = wg.normalize_actions(args.get("actions"))
-        if args.get("template"):
-            meta, html = wg.load_template(dirs, str(args["template"]))
+        meta: dict[str, Any] = {}
+        template = str(args.get("template") or "").strip().lower()
+        if template:
+            meta, html = wg.load_template(dirs, template)
             if meta.get("example") and not data:
-                return _result(success=False, error="this template draws from chat_data; pass it (see example)",
+                return _result(success=False, error="this template draws from data/chat_data; pass it (see example)",
                                example=meta["example"])
-            if meta.get("actions_from") and not actions:
-                actions = wg.actions_from_data(data, str(meta["actions_from"]))
+            wg.validate_template_data(meta, data)
+            if meta.get("actions_from"):
+                derived = wg.actions_from_data(data, str(meta["actions_from"]))
+                if actions and actions != derived:
+                    raise wg.WidgetError("actions must match this template's data action list; omit actions")
+                actions = derived
         if actions and not (target.get("session_key") and target.get("user_id")):
             return _result(success=False, error="no session/user bound; widget taps cannot route back")
         expires_at = None
+        # chosen and exp are server-managed, never accepted as caller-supplied authorization state.
+        data.pop("chosen", None)
+        data.pop("exp", None)
         if str(args.get("expires_in") or "").isdigit() and int(args["expires_in"]) > 0:
             expires_at = int(time.time()) + int(args["expires_in"])
             data["exp"] = expires_at
-        doc = wg.build_html(html, actions)
+        warnings: list[str] = []
+        if meta.get("renderer") == "chart":
+            doc, warnings = charts.build_chart(data, actions)
+            # Initial SVG carries all chart content; only updates use the limited chat_data channel.
+            data = {"exp": expires_at} if expires_at else {}
+        else:
+            doc = wg.build_html(html, actions)
         raw, packed = wg.check_size(doc)
+        wg.check_action_data(data, actions)
         encoded = wg.encode_data(data) if data else None
-    except wg.WidgetError as exc:
+    except (wg.WidgetError, ValueError) as exc:
         return _result(success=False, error=str(exc))
     payload: dict[str, Any] = {"chat_id": _int_or_str(chat_id), "html": doc}
     if thread_id.isdigit():
@@ -1686,17 +1737,19 @@ def telegram_widget(args: dict[str, Any], **_kw: Any) -> str:
         return _result(success=False, error=str(res.get("description") or "sendWidget failed"),
                        html_bytes=raw, compressed_bytes=packed)
     mid = (res.get("result") or {}).get("message_id")
-    if actions:
-        with store.locked() as all_recs:
-            wg.prune(all_recs, time.time())
-            all_recs[wg.store_key(chat_id, mid)] = {
-                "chat_id": str(chat_id), "thread_id": thread_id, "message_id": mid,
-                "session_key": target["session_key"], "user_id": str(target["user_id"]),
-                "title": " ".join(str(args.get("title") or args.get("caption") or "").split())[:120],
-                "actions": actions, "once": args.get("once") is not False, "chosen": None,
-                "chat_data": data, "created_at": time.time(), "expires_at": expires_at}
+    # Persist contracts even for read-only templates, so updates cannot bypass validation.
+    with store.locked() as all_recs:
+        wg.prune(all_recs, time.time())
+        all_recs[wg.store_key(chat_id, mid)] = {
+            "chat_id": str(chat_id), "thread_id": thread_id, "message_id": mid,
+            "session_key": target["session_key"], "user_id": str(target["user_id"]),
+            "title": " ".join(str(args.get("title") or args.get("caption") or "").split())[:120],
+            "actions": actions, "once": args.get("once") is not False, "chosen": None,
+            "template": template, "renderer": meta.get("renderer"),
+            "template_meta": {k: meta[k] for k in ("schema", "version", "contract", "actions_from") if k in meta},
+            "chat_data": data, "created_at": time.time(), "expires_at": expires_at}
     logger.info("telegram-enhanced: widget sent mid=%s actions=%d html=%dB packed=%dB", mid, len(actions), raw, packed)
-    return _result(success=True, message_id=mid, html_bytes=raw, compressed_bytes=packed)
+    return _result(success=True, message_id=mid, html_bytes=raw, compressed_bytes=packed, warnings=warnings)
 
 
 def _template_dirs() -> list[Path]:

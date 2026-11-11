@@ -1,15 +1,15 @@
-<!--hte {"desc":"天气卡：当前温度、天气动画（晴/云/雨）、最高最低、未来几小时。c 是 WMO weather code（Open-Meteo 的 weather_code）；h 是 [时段, 温度, code] 列表；at 是更新时间。可用 action=update 原地刷新。","example":{"city":"Dallas","t":25,"c":2,"hi":25,"lo":16,"fl":25,"h":[["现在",25,2],["16时",24,3],["17时",24,3],["18时",23,3],["19时",22,2],["20时",21,0]],"at":"15:15"}}-->
+<!--hte {"desc":"天气卡：当前温度、天气动画（晴/云/雨）、最高最低、未来几小时。c 是 WMO weather code（Open-Meteo 的 weather_code）；h 是 [时段, 温度, code] 列表；at 是更新时间。可用 action=update 原地刷新。","example":{"city":"Dallas","t":25,"c":2,"hi":25,"lo":16,"fl":25,"h":[["现在",25,2],["16时",24,3],["17时",24,3],["18时",23,3],["19时",22,2],["20时",21,0]],"at":"15:15"},"version":1,"contract":"weather","schema":{"type":"object","properties":{"city":{"type":"string","minLength":1,"maxLength":64},"t":{"type":"number","minimum":-1000000,"maximum":1000000},"c":{"type":"integer","minimum":0,"maximum":99},"hi":{"type":"number","minimum":-1000000,"maximum":1000000},"lo":{"type":"number","minimum":-1000000,"maximum":1000000},"fl":{"type":"number","minimum":-1000000,"maximum":1000000},"h":{"type":"array","items":{"type":"array","minItems":3,"maxItems":3,"prefixItems":[{"type":"string","minLength":1,"maxLength":16},{"type":"number","minimum":-1000000,"maximum":1000000},{"type":"integer","minimum":0,"maximum":99}]},"minItems":0,"maxItems":8},"at":{"type":"string","minLength":0,"maxLength":40}},"required":["city","t","c","hi","lo","fl","h","at"],"additionalProperties":false}}-->
+<!--hte-runtime-->
 <style>body{margin:0}.w{position:relative;overflow:hidden;padding:14px 16px 30px;color:#fff;background:linear-gradient(165deg,#3f86d6,#9cc5f0)}.n{font-weight:600}.t{font:200 3.8em system-ui;line-height:1.05}.d{font-size:.9em;color:#eaf3ff}svg{position:absolute;right:4px;top:8px;width:150px;height:110px}#sun{transform-origin:62px 42px;animation:sp 18s linear infinite}#cl{animation:dr 5s ease-in-out infinite alternate}#rn line{animation:rf 1s linear infinite}@keyframes sp{to{transform:rotate(360deg)}}@keyframes dr{to{transform:translateX(-14px)}}@keyframes rf{from{transform:translateY(-6px)}to{transform:translateY(10px)}}.h{display:flex;margin-top:14px;padding:8px 4px;border-radius:12px;background:rgba(255,255,255,.2)}.h div{flex:1;text-align:center;font-size:.78em;line-height:1.5}.h b{display:block;font-size:1.5em;font-weight:400}.u{font-size:.72em;color:#e3eeff;margin-top:6px}</style>
 <div class="w"><div class="n" id="ci"></div><div class="t" id="te"></div><div class="d" id="de"></div>
 <svg viewBox="0 0 150 110"><g id="sun"><circle cx="62" cy="42" r="20" fill="#ffd54a"/><g stroke="#ffd54a" stroke-width="4" stroke-linecap="round"><line x1="62" y1="6" x2="62" y2="14"/><line x1="62" y1="70" x2="62" y2="78"/><line x1="26" y1="42" x2="34" y2="42"/><line x1="90" y1="42" x2="98" y2="42"/><line x1="37" y1="17" x2="42" y2="22"/><line x1="82" y1="62" x2="87" y2="67"/><line x1="37" y1="67" x2="42" y2="62"/><line x1="82" y1="22" x2="87" y2="17"/></g></g><g id="cl" fill="#fff"><circle cx="78" cy="62" r="20"/><circle cx="104" cy="56" r="25"/><circle cx="128" cy="68" r="16"/><rect x="62" y="64" width="80" height="22" rx="11"/></g><g id="rn" stroke="#dbeaff" stroke-width="3" stroke-linecap="round"><line x1="80" y1="92" x2="77" y2="100"/><line x1="100" y1="92" x2="97" y2="100"/><line x1="120" y1="92" x2="117" y2="100"/></g></svg>
 <div class="h" id="hr"></div><div class="u" id="up"></div></div>
-<script>
-const T=window.TelegramWidget,$=i=>document.getElementById(i);
+<script>(function(){
+const H=window.HTE,$=i=>document.getElementById(i),E=H.esc;
 const N=c=>c<1?'晴':c<2?'大致晴朗':c<3?'局部多云':c<4?'阴':c<50?'有雾':c<60?'毛毛雨':c<70?'雨':c<80?'雪':c<90?'阵雨':'雷雨';
-const E=c=>c<1?'☀️':c<3?'⛅':c<4?'☁️':c<50?'🌫️':c<70||(c>79&&c<90)?'🌧️':c<80?'❄️':'⛈️';
-function draw(){let s=null;try{s=JSON.parse(T&&T.chatData||'null')}catch(e){}if(!s)return;
-$('ci').textContent=s.city;$('te').textContent=s.t+'°';$('de').textContent=N(s.c)+' · 最高 '+s.hi+'° 最低 '+s.lo+'° · 体感 '+s.fl+'°';
+const icon=c=>c<1?'☀️':c<3?'⛅':c<4?'☁️':c<50?'🌫️':c<70||(c>79&&c<90)?'🌧️':c<80?'❄️':'⛈️';
+H.mount(function(s){
+$('ci').textContent=s.city||'';$('te').textContent=(s.t==null?'–':s.t)+'°';$('de').textContent=N(s.c)+' · 最高 '+s.hi+'° 最低 '+s.lo+'° · 体感 '+s.fl+'°';
 $('sun').style.display=s.c<3?'':'none';$('cl').style.display=s.c>0?'':'none';$('rn').style.display=s.c>50&&s.c<70||s.c>79?'':'none';
-$('hr').innerHTML=s.h.map(x=>'<div>'+x[0]+'<b>'+E(x[2])+'</b>'+x[1]+'°</div>').join('');$('up').textContent='更新于 '+s.at}
-if(T)T.onEvent('chatDataChanged',draw);draw();if(T&&T.ready)T.ready();
-</script>
+$('hr').innerHTML=(s.h||[]).map(x=>'<div>'+E(x[0])+'<b>'+icon(x[2])+'</b>'+E(x[1])+'°</div>').join('');$('up').textContent=s.at?'更新于 '+s.at:''
+});})();</script>

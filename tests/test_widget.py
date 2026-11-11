@@ -243,10 +243,10 @@ class Templates(unittest.TestCase):
     def test_builtins_parse_fit_and_list(self):
         dirs = [ROOT / "templates"]
         names = {t["name"] for t in wg.list_templates(dirs)}
-        self.assertEqual({"weather", "tracker", "compare", "approve"}, names)
+        self.assertEqual({"weather", "tracker", "compare", "approve", "chart"}, names)
         for name in names:
             meta, body = wg.load_template(dirs, name)
-            self.assertNotIn("<!--hte", body)
+            self.assertNotIn("<!--hte {", body)
             self.assertTrue(meta.get("desc"), name)
             acts = wg.actions_from_data(meta.get("example") or {}, meta.get("actions_from", ""))
             raw, packed = wg.check_size(wg.build_html(body, acts))
