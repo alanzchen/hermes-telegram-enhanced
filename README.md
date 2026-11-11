@@ -69,3 +69,30 @@ python -m unittest discover -s tests -v
 ## License
 
 MIT
+
+## JSON-driven Telegram Mini App
+
+The self-contained `miniapp/` package provides a versioned JSON component catalog and a
+vanilla JS/SVG renderer for decisions, forms, tables, charts, Gantt schedules, flowcharts,
+timelines and nested sections/tabs. It accepts data, never model-authored markup or code.
+Actions return through the existing conversation injection callback; they never execute
+operations themselves. Authenticated API requests verify Telegram initData HMAC, the issuing
+user, view binding, expiry, revision and the server-side action/value whitelist.
+
+The package exposes `miniapp.setup(...)` → `tool_schema`, `tool_handler`,
+`check_requirements()`, async `start()` / `stop()`, and `create_app()`. Integration details,
+callback payloads and the exact coordinator wiring are in `miniapp/INTEGRATION.md`; the
+model-facing schema is in `miniapp/CATALOG.md`, with a complete synthetic `miniapp/demo.json`.
+
+Enable only after wiring gateway lifecycle and an HTTPS reverse proxy. Each gateway profile
+must explicitly set its own `HTE_MINIAPP_PORT` and `HTE_MINIAPP_PUBLIC_URL`; otherwise the
+server stays disabled. Optional `HTE_MINIAPP_DIRECT_LINK` supports a BotFather app link.
+Serve `/m`, `/m/static/*`, `/api/spec/*` and `/api/action/*` unchanged through the proxy.
+This package's local tests and Chromium previews do not certify real Telegram-client or
+production gateway operation.
+
+```bash
+python -m unittest discover -s tests -p 'test_miniapp*.py' -v
+# Opt-in headless browser acceptance and PNGs (synthetic data, no Telegram sends):
+uv run --no-project --with playwright --with aiohttp python tests/test_miniapp_preview.py
+```
