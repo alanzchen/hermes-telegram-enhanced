@@ -118,7 +118,8 @@ def check_action_data(data: dict[str, Any], actions: list[dict[str, str]]) -> No
 def _buttons_html(actions: list[dict[str, str]]) -> str:
     btns = "".join(f'<button data-action="{a["key"]}">{_html.escape(a["label"])}</button>' for a in actions)
     # the message time sits over the widget's bottom corner when there is no caption: keep taps clear of it
-    return f'<div style="display:flex;flex-wrap:wrap;gap:8px;margin:10px 0 18px">{btns}</div>'
+    # side padding keeps buttons off the bubble edge; bottom keeps them clear of the timestamp
+    return f'<div style="display:flex;flex-wrap:wrap;gap:8px;padding:10px 12px 18px">{btns}</div>'
 
 
 def build_html(body: str, actions: list[dict[str, str]]) -> str:

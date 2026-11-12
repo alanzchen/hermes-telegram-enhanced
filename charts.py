@@ -100,7 +100,7 @@ def render_svg(spec: dict[str, Any], *, label_count: int = 5) -> str:
         return 58 + (i + .5) * 250 / n if bar else 58 + (i * 250 / (n - 1) if n > 1 else 125)
     def y(v: float) -> float:
         return 178 - (v - lo) / (hi - lo) * 128
-    parts = ['<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 260">']
+    parts = ['<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 222">']
     def text(tx: float, ty: float, value: Any, cls: str = '', anchor: str = 'start') -> None:
         parts.append(f'<text x="{_num(tx)}" y="{_num(ty)}" class="{cls}" text-anchor="{anchor}">{html.escape(str(value), quote=True)}</text>')
     text(10, 20, _short(spec.get('title', ''), 42), 'title')
@@ -138,8 +138,10 @@ def render_svg(spec: dict[str, Any], *, label_count: int = 5) -> str:
                 if (i == 0 or values[i - 1] is None) and (i == n - 1 or values[i + 1] is None):
                     parts.append(f'<circle class="f{k}" cx="{_num(x(i))}" cy="{_num(y(v))}" r="2.5"/>')
             parts.append(f'<path class="s{k}" d="{path}"/>')
-        parts.append(f'<path class="s{k}" d="M12 {214 + k * 15}h16"/>')
-        text(34, 217 + k * 15, _short(row['name'], 40), 'legend')
+        # one legend row right under the x labels (series side by side), so no dead space below
+        lx = 12 + k * 100
+        parts.append(f'<path class="s{k}" d="M{lx} 213h16"/>')
+        text(lx + 22, 216, _short(row['name'], 12), 'legend')
     parts.append('</svg>')
     return ''.join(parts)
 
