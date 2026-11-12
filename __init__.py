@@ -2714,11 +2714,19 @@ def _miniapp_register(ctx: Any) -> None:
     def deliver(payload: dict[str, Any]) -> bool:
         return bool(ctx.inject_message(payload["text"], session_key=payload["session_key"]))
 
+    env = dict(os.environ)
+    try:  # this profile's .env also counts, so a hot reload picks up new HTE_MINIAPP_* without a restart
+        for line in (_profile_home() / ".env").read_text(encoding="utf-8").splitlines():
+            key, sep, value = line.strip().partition("=")
+            if sep and key.startswith("HTE_MINIAPP_"):
+                env[key] = value.strip().strip("'\"")
+    except OSError:
+        pass
     try:
         ui = miniapp.setup(ctx, bot_token_getter=_token, deliver_action=deliver,
                            state_dir=_profile_home() / "telegram-enhanced",
                            current_target=_current_target,
-                           send_message=lambda payload: _api("sendMessage", payload))
+                           send_message=lambda payload: _api("sendMessage", payload), env=env)
     except Exception:
         logger.warning("telegram-enhanced: Mini App misconfigured; telegram_ui disabled", exc_info=True)
         return
