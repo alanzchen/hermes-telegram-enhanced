@@ -20,6 +20,7 @@ import os
 import re
 import secrets
 import sys
+import asyncio
 import threading
 import time
 import urllib.error
@@ -2684,6 +2685,75 @@ def _extend_allowed_updates() -> None:
         logger.debug("telegram-enhanced: could not extend allowed_updates", exc_info=True)
 
 
+def _miniapp_stop(only: Any = None) -> None:
+    """Stop the running Mini App server (a previous generation on hot reload) and free its port.
+    ``only``: stop it only if it belongs to that MiniApp instance (an old generation's unload must not
+    stop the server the new generation just started)."""
+    old = getattr(sys, "_hte_miniapp", None)
+    if not old or (only is not None and old[1] is not only):
+        return
+    sys._hte_miniapp = None
+    loop, ui, thread = old
+    try:
+        asyncio.run_coroutine_threadsafe(ui.stop(), loop).result(timeout=10)
+    except Exception:
+        logger.warning("telegram-enhanced: Mini App stop failed", exc_info=True)
+    loop.call_soon_threadsafe(loop.stop)
+    thread.join(timeout=5)
+
+
+def _miniapp_register(ctx: Any) -> None:
+    """telegram_ui: JSON-spec Mini App views (miniapp/). Enabled only when HTE_MINIAPP_PUBLIC_URL and
+    HTE_MINIAPP_PORT are set for this profile. The aiohttp server runs on its own long-lived loop thread."""
+    try:
+        from . import miniapp
+    except Exception:
+        logger.warning("telegram-enhanced: miniapp package unavailable", exc_info=True)
+        return
+
+    def deliver(payload: dict[str, Any]) -> bool:
+        return bool(ctx.inject_message(payload["text"], session_key=payload["session_key"]))
+
+    try:
+        ui = miniapp.setup(ctx, bot_token_getter=_token, deliver_action=deliver,
+                           state_dir=_profile_home() / "telegram-enhanced",
+                           current_target=_current_target,
+                           send_message=lambda payload: _api("sendMessage", payload))
+    except Exception:
+        logger.warning("telegram-enhanced: Mini App misconfigured; telegram_ui disabled", exc_info=True)
+        return
+    _state["miniapp"] = ui
+    ctx.register_tool(name="telegram_ui", toolset=TOOLSET, schema=ui.tool_schema,
+                      handler=ui.tool_handler, check_fn=ui.check_requirements,
+                      description="JSON-driven Telegram Mini App views (decisions, forms, tables, charts, Gantt, flowcharts)",
+                      emoji="🧭")
+    _miniapp_stop()  # previous generation releases the port before this one binds
+    if not ui.enabled:
+        return
+    loop = asyncio.new_event_loop()
+    started = threading.Event()
+
+    def run() -> None:
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(ui.start())
+            logger.info("telegram-enhanced: Mini App serving on %s:%s", ui.host, ui.port)
+        except Exception:
+            logger.warning("telegram-enhanced: Mini App failed to start", exc_info=True)
+            started.set()
+            loop.close()
+            return
+        started.set()
+        loop.run_forever()
+        loop.close()
+
+    thread = threading.Thread(target=run, name="tg-enhanced-miniapp", daemon=True)
+    thread.start()
+    started.wait(timeout=10)
+    if ui._runner is not None:
+        sys._hte_miniapp = (loop, ui, thread)
+
+
 def register(ctx: Any) -> None:
     _state["ctx"] = ctx
     _state["loaded_at"] = time.time()
@@ -2762,7 +2832,10 @@ def register(ctx: Any) -> None:
     sys._hte_reminder_gen = gen  # an older generation's scheduler thread sees this and exits
     threading.Thread(target=_reminder_loop, args=(gen,), name="tg-enhanced-reminders", daemon=True).start()
 
+    _miniapp_register(ctx)
+
     def _cleanup() -> None:
+        _miniapp_stop(only=_state.get("miniapp") or object())
         if getattr(sys, "_hte_reminder_gen", None) is gen:
             sys._hte_reminder_gen = None
         with _state["turns_lock"]:

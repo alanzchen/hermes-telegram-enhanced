@@ -11,6 +11,7 @@ provides_tools:
   - telegram_widget
   - telegram_secret
   - telegram_guest_reply
+  - telegram_ui
 provides_hooks:
   - pre_llm_call
   - post_llm_call
