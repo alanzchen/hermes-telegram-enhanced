@@ -2554,6 +2554,62 @@ def _patch_quote(cls: Any) -> None:
 sys._hte_quote_text = quote_rich_text  # resolved per call so a plugin reload takes effect
 
 
+_CLARIFY_MARK = "_hte_rich_clarify"
+
+
+def _patch_clarify(cls: Any) -> None:
+    """Send clarify prompts as rich cards (labelled buttons, like decision cards) instead of core's
+    numbered-button message. Callback data is core's own ``cl:<id>:<idx>``, so core still resolves the
+    tap, enforces "only this message", handles "Other" and timeouts. Any send failure falls back to core."""
+    if not isinstance(cls, type) or cls.__dict__.get(_CLARIFY_MARK) or not hasattr(cls, "send_clarify"):
+        return
+    cls._hte_orig_send_clarify = cls.__dict__.get("_hte_orig_send_clarify", cls.send_clarify)
+
+    async def send_clarify(self, chat_id, question, choices, clarify_id, session_key, metadata=None):
+        orig = type(self)._hte_orig_send_clarify
+        helper = getattr(sys, "_hte_rich_clarify", None)
+        if not choices or helper is None or not _setting("rich_clarify", True):
+            return await orig(self, chat_id, question, choices, clarify_id, session_key, metadata)
+        try:
+            res = await helper(self, chat_id, question, choices, clarify_id, session_key, metadata)
+        except Exception:
+            logger.warning("telegram-enhanced: rich clarify failed, using core prompt", exc_info=True)
+            res = None
+        if res is not None:
+            return res
+        return await orig(self, chat_id, question, choices, clarify_id, session_key, metadata)
+
+    cls.send_clarify = send_clarify
+    setattr(cls, _CLARIFY_MARK, True)
+    logger.info("telegram-enhanced: rich clarify cards enabled on %s.%s", cls.__module__, cls.__name__)
+
+
+async def _rich_clarify(adapter: Any, chat_id: Any, question: str, choices: list, clarify_id: str,
+                        session_key: str, metadata: Any) -> Any:
+    """Returns a SendResult on success, None to let core render it."""
+    from gateway.platforms.base import SendResult
+    from plugins.platforms.telegram.telegram_clarify_binding import ClarifyPrompt
+    thread_id = adapter._metadata_thread_id(metadata) if hasattr(adapter, "_metadata_thread_id") else None
+    lang = _lang(str(chat_id), str(thread_id or ""))
+    markdown = fu.clarify_markdown(question, list(choices), clarify_id, i18n.t("clarify_other", lang))
+    payload: dict[str, Any] = {"chat_id": _int_or_str(chat_id), "rich_message": {"markdown": markdown}}
+    if thread_id and str(thread_id).isdigit():
+        payload["message_thread_id"] = int(thread_id)
+    res = await asyncio.to_thread(_api, "sendRichMessage", payload)
+    if not res.get("ok"):
+        logger.info("telegram-enhanced: rich clarify send failed (%s); core fallback", res.get("description"))
+        return None
+    msg = res.get("result") or {}
+    mid = msg.get("message_id")
+    adapter._clarify_state[clarify_id] = ClarifyPrompt(
+        session_key, str((msg.get("chat") or {}).get("id", chat_id)), None if mid is None else str(mid),
+        None if msg.get("message_thread_id") is None else str(msg["message_thread_id"]))
+    return SendResult(success=True, message_id=str(mid))
+
+
+sys._hte_rich_clarify = _rich_clarify  # resolved per call so a plugin reload takes effect
+
+
 _LIST_PATCH_MARK = "_hte_native_lists_v2"
 _LEGACY_LIST_PATCH_MARK = "_hte_native_lists"
 # Wrappers resolve helpers at call time, so a plugin reload updates the behaviour of an already-patched
@@ -2630,6 +2686,10 @@ def _patch_telegram_lists() -> None:
             _patch_quote(cls)
         except Exception:
             logger.warning("telegram-enhanced: quote patch failed", exc_info=True)
+        try:
+            _patch_clarify(cls)
+        except Exception:
+            logger.warning("telegram-enhanced: clarify patch failed", exc_info=True)
         if (not isinstance(cls, type) or cls.__dict__.get(_LIST_PATCH_MARK)
                 or not hasattr(cls, "_needs_rich_rendering") or not hasattr(cls, "format_message")):
             continue

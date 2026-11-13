@@ -63,6 +63,7 @@ S: dict[str, dict[str, str]] = {
     "stop_confirm": {"zh": "要停止这一轮吗？不停的话，直接发消息就是插话",
                      "en": "Stop this turn? To keep it going, just send a message — it will be added as a steer."},
     "stop_label": {"zh": "⏹ 停止", "en": "⏹ Stop"},
+    "clarify_other": {"zh": "✏️ 其他（手动输入）", "en": "✏️ Other (type it)"},
     "stopped": {"zh": "已停止", "en": "Stopped"},
     "turn_over": {"zh": "这一轮已经结束了", "en": "This turn has already finished"},
     "stop_failed": {"zh": "停止失败，请发 /stop", "en": "Couldn't stop it — send /stop"},

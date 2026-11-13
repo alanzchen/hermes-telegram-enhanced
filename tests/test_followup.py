@@ -90,3 +90,22 @@ class Wrapup(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ClarifyCardTest(unittest.TestCase):
+    def test_labelled_buttons_keep_core_callback_data(self):
+        md = fu.clarify_markdown("Pick one", ["A", "B & C"], "abc123", "✏️ Other")
+        self.assertIn("**Pick one**", md)
+        self.assertIn('style="primary" data="cl:abc123:0">A</tg-button>', md)
+        self.assertIn('data="cl:abc123:1">B &amp; C</tg-button>', md)
+        self.assertIn('data="cl:abc123:other">✏️ Other</tg-button>', md)
+        self.assertNotIn("❓", md)  # core adds it when editing the answered card
+
+    def test_short_labels_pair_up_long_labels_listed_in_body(self):
+        short = fu.clarify_markdown("Q", ["一", "二", "三"], "x", "o")
+        self.assertEqual(short.count("<tg-button-row>"), 3)  # [一 二] [三] [other]
+        long_label = "x" * 60
+        md = fu.clarify_markdown("Q", [long_label, "ok"], "x", "o")
+        self.assertIn("1. " + long_label, md)  # full text in the body
+        self.assertIn("…</tg-button>", md)
+        self.assertEqual(md.count("<tg-button-row>"), 3)

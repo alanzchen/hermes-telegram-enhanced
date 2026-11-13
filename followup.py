@@ -190,3 +190,38 @@ def wrapup_markdown(title: str, lang: str, *, summary: str = "", changed: Any = 
         if lines:
             parts.append(f"**{s(key, lang)}**\n" + "\n".join(lines))
     return "\n\n".join(parts)
+
+
+# ---------------------------------------------------------------- clarify as a rich card
+
+CLARIFY_LABEL_MAX = 40
+
+
+def clarify_markdown(question: str, choices: list[Any], clarify_id: str, other_label: str) -> str:
+    """Rich-message body for a clarify prompt, styled like a decision card: the question in bold, one
+    button per choice carrying its own text (first = recommended, highlighted), then "Other".
+
+    Callback data stays core's ``cl:<id>:<idx|other>`` so Hermes resolves the tap exactly as before.
+    Choices too long for a button are listed in full in the body and the button gets a shortened label."""
+    q = str(question or "").strip()
+    labels = [" ".join(str(c or "").split()) for c in choices]
+    # no ❓ here: core prefixes one when it edits the card into its answered state
+    body = [f"**{q}**" if "\n" not in q else q]
+    long_ones = [(n, lab) for n, lab in enumerate(labels, 1) if len(lab) > CLARIFY_LABEL_MAX]
+    if long_ones:
+        body.append("\n".join(f"{n}. {html.escape(lab, quote=False)}" for n, lab in enumerate(labels, 1)))
+    short = all(len(lab) <= 14 for lab in labels)
+    rows: list[list[str]] = []
+    for idx, lab in enumerate(labels):
+        text = lab if len(lab) <= CLARIFY_LABEL_MAX else f"{idx + 1}. {lab[:CLARIFY_LABEL_MAX - 4]}…"
+        style = ' style="primary"' if idx == 0 else ""
+        tag = (f'<tg-button type="callback_data"{style} data="cl:{clarify_id}:{idx}">'
+               f"{html.escape(text, quote=False)}</tg-button>")
+        if short and rows and len(rows[-1]) < 2:
+            rows[-1].append(tag)
+        else:
+            rows.append([tag])
+    rows.append([f'<tg-button type="callback_data" data="cl:{clarify_id}:other">'
+                 f"{html.escape(other_label, quote=False)}</tg-button>"])
+    buttons = "\n".join("<tg-button-row>\n" + "\n".join(r) + "\n</tg-button-row>" for r in rows)
+    return "\n\n".join(body) + "\n\n" + buttons
