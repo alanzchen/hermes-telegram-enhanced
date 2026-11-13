@@ -2604,7 +2604,37 @@ async def _rich_clarify(adapter: Any, chat_id: Any, question: str, choices: list
     adapter._clarify_state[clarify_id] = ClarifyPrompt(
         session_key, str((msg.get("chat") or {}).get("id", chat_id)), None if mid is None else str(mid),
         None if msg.get("message_thread_id") is None else str(msg["message_thread_id"]))
+    if mid is not None:
+        task = asyncio.ensure_future(_clarify_close_when_done(adapter, clarify_id, chat_id, int(mid), question, lang))
+        _state.setdefault("clarify_watch", set()).add(task)
+        task.add_done_callback(lambda t: _state.get("clarify_watch", set()).discard(t))
     return SendResult(success=True, message_id=str(mid))
+
+
+async def _clarify_close_when_done(adapter: Any, clarify_id: str, chat_id: Any, mid: int, question: str,
+                                   lang: str) -> None:
+    """Core leaves an unanswered card's buttons live after the clarify times out (a late tap only then
+    says "expired"), and a typed "Other" answer leaves it saying "waiting for your answer". Once the
+    clarify is no longer pending, close the card: answered (typed) -> show the answer; timed out /
+    cancelled -> "expired", buttons removed. Button answers are already closed by core (state popped)."""
+    from tools import clarify_gateway as cg
+    entry = cg.get_pending(clarify_id)
+    while entry is not None and cg.get_pending(clarify_id) is entry:
+        await asyncio.sleep(3)
+    if clarify_id not in getattr(adapter, "_clarify_state", {}):
+        return  # resolved by a button tap: core already edited the card
+    adapter._clarify_state.pop(clarify_id, None)
+    resp = getattr(entry, "response", None) if entry is not None else None
+    q = " ".join(str(question or "").split())
+    if isinstance(resp, str) and resp and resp != getattr(cg, "CANCELLED", object()):
+        tail = i18n.t("clarify_answered", lang, answer=resp[:300])
+    else:
+        tail = i18n.t("clarify_expired", lang)
+    res = await asyncio.to_thread(_api, "editMessageText", {
+        "chat_id": _int_or_str(chat_id), "message_id": mid,
+        "rich_message": {"markdown": f"**{q}**\n\n{tail}"}})
+    logger.info("telegram-enhanced: clarify %s closed (%s) msg=%s ok=%s %s", clarify_id,
+                "answered" if tail.startswith("✅") else "expired", mid, res.get("ok"), res.get("description") or "")
 
 
 sys._hte_rich_clarify = _rich_clarify  # resolved per call so a plugin reload takes effect

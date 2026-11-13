@@ -204,7 +204,8 @@ def clarify_markdown(question: str, choices: list[Any], clarify_id: str, other_l
     Callback data stays core's ``cl:<id>:<idx|other>`` so Hermes resolves the tap exactly as before.
     Choices too long for a button are listed in full in the body and the button gets a shortened label."""
     q = str(question or "").strip()
-    labels = [" ".join(str(c or "").split()) for c in choices]
+    # core tags the first choice " (Recommended)"; the highlighted first button already says that
+    labels = [re.sub(r"\s*\((?:Recommended|推荐)\)$", "", " ".join(str(c or "").split())) for c in choices]
     # no ❓ here: core prefixes one when it edits the card into its answered state
     body = [f"**{q}**" if "\n" not in q else q]
     long_ones = [(n, lab) for n, lab in enumerate(labels, 1) if len(lab) > CLARIFY_LABEL_MAX]

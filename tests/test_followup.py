@@ -109,3 +109,7 @@ class ClarifyCardTest(unittest.TestCase):
         self.assertIn("1. " + long_label, md)  # full text in the body
         self.assertIn("…</tg-button>", md)
         self.assertEqual(md.count("<tg-button-row>"), 3)
+
+    def test_recommended_suffix_dropped_from_label(self):
+        md = fu.clarify_markdown("Q", ["Go (Recommended)", "Stop"], "x", "o")
+        self.assertIn('style="primary" data="cl:x:0">Go</tg-button>', md)
