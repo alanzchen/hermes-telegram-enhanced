@@ -3,6 +3,9 @@
 
   approved_mail.py request MESSAGE.eml --title "..."   -> creates the approval request, posts the card
                                                           to the current Telegram chat/topic, prints {id, sha256}
+                                                          Allowlisted recipients (e.g. Instinct) are approved by
+                                                          the service on creation: no button, sent at once
+                                                          (add --no-send to only create the request)
   approved_mail.py status ID                          -> pending / approved / rejected / expired / consumed
   approved_mail.py send ID                            -> broker sends exactly the version Alan approved
                                                           (after his edits, if any); preferred
@@ -60,13 +63,17 @@ def mail_summary(raw: str | bytes) -> tuple[str, str]:
         return "（无法解析主题）", ""
 
 
-def post_card(title: str, link: str, subject: str, to: str) -> dict:
+def post_card(title: str, link: str, subject: str, to: str, auto: bool = False) -> dict:
     chat = os.environ.get("HERMES_SESSION_CHAT_ID") or env("APPROVED_MAIL_DEFAULT_CHAT")
     thread = os.environ.get("HERMES_SESSION_THREAD_ID") or ""
-    text = (f"📧 待批准发信：{title}\n主题：{subject}\n收件人：{to}\n"
-            f"点按钮查看完整原文，批准后才会发送，10 分钟内有效。")
-    body = {"chat_id": int(chat) if chat.lstrip("-").isdigit() else chat, "text": text,
-            "reply_markup": {"inline_keyboard": [[{"text": "查看并审批", "url": link}]]}}
+    if auto:  # allowlisted recipient: approved by the service on creation, no button
+        text = f"📧 免审批发信：{title}\n主题：{subject}\n收件人：{to}\n收件人在免审批名单上，直接发送。"
+        markup = {"inline_keyboard": []}
+    else:
+        text = (f"📧 待批准发信：{title}\n主题：{subject}\n收件人：{to}\n"
+                f"点按钮查看完整原文，批准后才会发送，10 分钟内有效。")
+        markup = {"inline_keyboard": [[{"text": "查看并审批", "url": link}]]}
+    body = {"chat_id": int(chat) if chat.lstrip("-").isdigit() else chat, "text": text, "reply_markup": markup}
     if thread.isdigit():
         body["message_thread_id"] = int(thread)
     req = urllib.request.Request(f"https://api.telegram.org/bot{env('TELEGRAM_BOT_TOKEN')}/sendMessage",
@@ -159,6 +166,13 @@ def watch(rid: str) -> None:
         time.sleep(max(3, min(15, exp - time.time() + 2)))
 
 
+def send_request(rid: str, raw: bytes) -> tuple[int, dict]:
+    return http("POST", _cfg("CLIBROKER_URL") + "/execute", env("CLIBROKER_TOKEN_APPROVED_MAIL"),
+                {"tool": "himalaya_approved", "argv": ["message", "send", "--account", "agent",
+                                                       "--approval-id", rid], "stdin": raw.decode("utf-8")},
+                timeout=180)
+
+
 def main() -> int:
     if len(sys.argv) < 2 or (len(sys.argv) < 3 and sys.argv[1] != "sweep"):
         print(__doc__)
@@ -174,7 +188,8 @@ def main() -> int:
             return 1
         assert res["sha256"] == hashlib.sha256(raw).hexdigest(), "server hash differs from local file"
         subject, to = mail_summary(raw)
-        card = post_card(title, res["direct_link"], subject, to)
+        auto = res.get("status") == "approved" and str(res.get("approved_by") or "").startswith("auto:")
+        card = post_card(title, res["direct_link"], subject, to, auto=auto)
         if card.get("ok"):
             cards = _cards()
             cards[res["id"]] = {"chat_id": card["chat_id"], "message_id": card["message_id"], "text": card["text"],
@@ -185,8 +200,16 @@ def main() -> int:
                              stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                              start_new_session=True)
         card.pop("text", None)
-        print(json.dumps({"ok": True, "id": res["id"], "sha256": res["sha256"], "card": card}, ensure_ascii=False))
-        return 0
+        out = {"ok": True, "id": res["id"], "sha256": res["sha256"], "status": res.get("status"),
+               "approved_by": res.get("approved_by"), "card": card}
+        if auto and "--no-send" not in sys.argv:  # send now; the broker still checks the approval
+            code, sres = send_request(res["id"], b"")
+            out["sent"] = code == 200 and sres.get("ok") and sres.get("exit_code", 0) == 0
+            out["send_result"] = {k: sres.get(k) for k in ("ok", "exit_code", "stderr") if k in sres}
+            if out["sent"]:
+                finalize_card(res["id"], "consumed")
+        print(json.dumps(out, ensure_ascii=False))
+        return 0 if out.get("sent", True) else 1
     if cmd == "watch":
         watch(sys.argv[2])
         return 0
@@ -204,10 +227,7 @@ def main() -> int:
     if cmd == "send":  # without a file the broker fetches the exact version Alan approved (possibly edited)
         rid = sys.argv[2]
         raw = open(sys.argv[3], "rb").read() if len(sys.argv) > 3 else b""
-        code, res = http("POST", _cfg("CLIBROKER_URL") + "/execute", env("CLIBROKER_TOKEN_APPROVED_MAIL"),
-                         {"tool": "himalaya_approved", "argv": ["message", "send", "--account", "agent",
-                                                                "--approval-id", rid], "stdin": raw.decode("utf-8")},
-                         timeout=180)
+        code, res = send_request(rid, raw)
         print(json.dumps({"status_code": code, **res}, ensure_ascii=False)[:3000])
         return 0 if code == 200 and res.get("ok") and res.get("exit_code", 0) == 0 else 1
     print(__doc__)
