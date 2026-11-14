@@ -111,9 +111,38 @@ def _int_or_str(value: str) -> Any:
     return int(value) if str(value).lstrip("-").isdigit() else value
 
 
+def _webhook_target() -> tuple[dict[str, str] | None, str | None]:
+    """A webhook run whose route delivers to a Telegram chat posts into that chat/topic.
+
+    Button presses are injected into that topic's own Telegram session (the webhook run has
+    already finished by then), so the decision lands where Alan reads the report.
+    """
+    user_id = _session("HERMES_SESSION_USER_ID")
+    route = user_id[len("webhook:"):] if user_id.startswith("webhook:") else ""
+    home = os.environ.get("HERMES_HOME") or "/opt/data"
+    try:
+        routes = json.loads(Path(home, "webhook_subscriptions.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        routes = {}
+    cfg = routes.get(route) if route and isinstance(routes, dict) else None
+    extra = (cfg or {}).get("deliver_extra") or {}
+    chat_id = str(extra.get("chat_id") or "")
+    if not cfg or cfg.get("deliver") != "telegram" or not chat_id.lstrip("-").isdigit():
+        return None, "only works inside a Telegram conversation (or a webhook route delivering to Telegram)"
+    thread = str(extra.get("thread_id") or "")
+    profile = (_session("HERMES_SESSION_KEY").split(":") + ["", "main"])[1] or "main"
+    is_dm = not chat_id.startswith("-")
+    key = f"agent:{profile}:telegram:{'dm' if is_dm else 'group'}:{chat_id}" + (f":{thread}" if thread else "")
+    return {"chat_id": chat_id, "thread_id": thread, "session_key": key,
+            "user_id": chat_id if is_dm else "", "chat_type": "dm" if is_dm else "group",
+            "message_id": "", "user_name": ""}, None
+
+
 def _current_target() -> tuple[dict[str, str] | None, str | None]:
     platform = (_session("HERMES_SESSION_PLATFORM") or "").lower()
     chat_id = _session("HERMES_SESSION_CHAT_ID")
+    if platform == "webhook":
+        return _webhook_target()
     if platform != "telegram" or not chat_id:
         return None, "only works inside a Telegram conversation"
     return {
