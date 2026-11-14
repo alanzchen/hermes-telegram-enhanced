@@ -96,3 +96,13 @@ python -m unittest discover -s tests -p 'test_miniapp*.py' -v
 # Opt-in headless browser acceptance and PNGs (synthetic data, no Telegram sends):
 uv run --no-project --with playwright --with aiohttp python tests/test_miniapp_preview.py
 ```
+
+## Approved mail cards (`scripts/approved_mail.py`)
+
+Sends mail from the agent account only after the owner approves the exact message in a Telegram Mini App.
+`request MSG.eml --title ...` posts an approval card showing the subject and recipients; once the request is
+final the card is edited in place (approved / sent / rejected / expired) with the subject and recipients of
+the version that was actually approved, including edits made on the approval page.
+Configuration comes from the environment or `APPROVED_MAIL_ENV` (default `/opt/data/.env`):
+`TG_APPROVAL_URL`, `CLIBROKER_URL`, `APPROVED_MAIL_DEFAULT_CHAT`, `TELEGRAM_BOT_TOKEN`,
+`TG_APPROVAL_CREATOR_TOKEN`, `CLIBROKER_TOKEN_APPROVED_MAIL`.
