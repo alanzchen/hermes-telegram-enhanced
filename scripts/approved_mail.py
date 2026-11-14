@@ -192,7 +192,10 @@ def main() -> int:
         subject, to = mail_summary(raw)
         auto = res.get("status") == "approved" and str(res.get("approved_by") or "").startswith("auto:")
         try:
-            card = post_card(title, res["direct_link"], subject, to, auto=auto)
+            if auto and "--silent" in sys.argv:  # background agent-to-agent mail: no card in the chat
+                card = {"ok": None, "skipped": "silent"}
+            else:
+                card = post_card(title, res["direct_link"], subject, to, auto=auto)
         except Exception as e:  # a card failure must not strand an auto-approved send
             card = {"ok": False, "error": f"{type(e).__name__}: {e}"[:200]}
         if card.get("ok"):
