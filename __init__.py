@@ -1735,8 +1735,12 @@ def telegram_widget(args: dict[str, Any], **_kw: Any) -> str:
         payload["reply_parameters"] = {"message_id": int(args["reply_to"]), "allow_sending_without_reply": True}
     res = _api("sendWidget", payload)
     if not res.get("ok"):
-        return _result(success=False, error=str(res.get("description") or "sendWidget failed"),
-                       html_bytes=raw, compressed_bytes=packed)
+        desc = str(res.get("description") or "sendWidget failed")
+        if "WIDGET_NOT_ALLOWED" in desc:
+            # Telegram turned widgets off for general bots on 2026-11-13 (tdlib/telegram-bot-api#947).
+            desc += (" — Telegram currently refuses widgets from bots. Do not retry; show the same content "
+                     "with telegram_ui (Mini App: table/chart/decision views) or telegram_rich_send instead.")
+        return _result(success=False, error=desc, html_bytes=raw, compressed_bytes=packed)
     mid = (res.get("result") or {}).get("message_id")
     # Persist contracts even for read-only templates, so updates cannot bypass validation.
     with store.locked() as all_recs:
