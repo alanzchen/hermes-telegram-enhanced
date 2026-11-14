@@ -64,8 +64,10 @@ def mail_summary(raw: str | bytes) -> tuple[str, str]:
 
 
 def post_card(title: str, link: str, subject: str, to: str, auto: bool = False) -> dict:
-    chat = os.environ.get("HERMES_SESSION_CHAT_ID") or env("APPROVED_MAIL_DEFAULT_CHAT")
+    chat = os.environ.get("HERMES_SESSION_CHAT_ID") or ""
     thread = os.environ.get("HERMES_SESSION_THREAD_ID") or ""
+    if not chat.lstrip("-").isdigit():  # non-Telegram session (e.g. webhook): use the default chat
+        chat, thread = env("APPROVED_MAIL_DEFAULT_CHAT"), ""
     if auto:  # allowlisted recipient: approved by the service on creation, no button
         text = f"📧 免审批发信：{title}\n主题：{subject}\n收件人：{to}\n收件人在免审批名单上，直接发送。"
         markup = {"inline_keyboard": []}
@@ -189,7 +191,10 @@ def main() -> int:
         assert res["sha256"] == hashlib.sha256(raw).hexdigest(), "server hash differs from local file"
         subject, to = mail_summary(raw)
         auto = res.get("status") == "approved" and str(res.get("approved_by") or "").startswith("auto:")
-        card = post_card(title, res["direct_link"], subject, to, auto=auto)
+        try:
+            card = post_card(title, res["direct_link"], subject, to, auto=auto)
+        except Exception as e:  # a card failure must not strand an auto-approved send
+            card = {"ok": False, "error": f"{type(e).__name__}: {e}"[:200]}
         if card.get("ok"):
             cards = _cards()
             cards[res["id"]] = {"chat_id": card["chat_id"], "message_id": card["message_id"], "text": card["text"],
