@@ -86,6 +86,7 @@ class SpecStore:
         openui=None,
         sources=(),
         openui_actions=(),
+        sensitive_sources=False,
     ):
         if renderer == "json":
             spec = validate_spec(spec)
@@ -98,6 +99,8 @@ class SpecStore:
             openui = validate_openui(openui)
             sources = copy.deepcopy(list(sources))
             openui_actions = validate_openui_actions(list(openui_actions))
+            if type(sensitive_sources) is not bool:
+                raise SpecError("OpenUI source sensitivity must be boolean")
         else:
             raise SpecError("Unknown Mini App renderer")
         text(title, "title", 200, False)
@@ -130,6 +133,7 @@ class SpecStore:
                 openui=openui,
                 sources=sources,
                 openui_actions=openui_actions,
+                sensitive_sources=sensitive_sources,
             )
         with self.transaction() as data:
             for k in [k for k, v in data.items() if v["expires_at"] <= now]:

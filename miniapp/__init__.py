@@ -89,12 +89,14 @@ TOOL_SCHEMA = {
 }
 
 
-def injection_text(rec, action, who):
+def injection_text(rec, action, who, *, sensitive=False):
     # Quoted JSON is intentionally data, not model-authored code or an executable command.
-    body = {"key": action["key"], "label": action["label"], "value": action["value"]}
-    for name in ("selection_labels", "field_labels", "meaning"):
-        if name in action:
-            body[name] = action[name]
+    body = {"key": action["key"], "value": action["value"]}
+    if not sensitive:
+        body["label"] = action["label"]
+        for name in ("selection_labels", "field_labels", "meaning"):
+            if name in action:
+                body[name] = action[name]
     return (
         f"[Telegram Mini App] {who} submitted a UI action.\nQuestion: {rec['title']}\n"
         + json.dumps(body, ensure_ascii=False)
@@ -184,7 +186,7 @@ class MiniApp:
         if args.get("spec") is not None:
             raise SpecError("OpenUI views do not accept a JSON spec")
         bindings = validate_bindings(args.get("sources"), self.registry, self.profile_name)
-        openui = validate_template(args.get("openui"), bindings)
+        openui = validate_template(args.get("openui"), bindings, self.registry, self.profile_name)
         actions = validate_openui_actions(args.get("actions"))
         validate_button_action_types(openui, actions)
         return {
@@ -194,6 +196,10 @@ class MiniApp:
             "openui": openui,
             "sources": bindings,
             "openui_actions": actions,
+            "sensitive_sources": any(
+                self.registry.sensitivity(binding["name"], self.profile_name) == "sensitive"
+                for binding in bindings
+            ),
         }
 
     def _current_target(self):
@@ -221,6 +227,7 @@ class MiniApp:
             openui=template.get("openui"),
             sources=template.get("sources", []),
             openui_actions=template.get("openui_actions", []),
+            sensitive_sources=template.get("sensitive_sources", False),
         )
         view_id = rec["id"]
         url = self.public_url + "/m?" + urlencode({"id": view_id})
@@ -351,6 +358,44 @@ class MiniApp:
         rec, _ = self._authenticate(request)
         return web.json_response(await self._public_record(rec))
 
+    def _has_sensitive_sources(self, rec):
+        if rec.get("renderer", "json") != "openui":
+            return False
+        if "sensitive_sources" in rec:
+            return bool(rec["sensitive_sources"])
+        # Saved records from before the persisted flag fail closed if a source is
+        # no longer available to classify.
+        try:
+            return any(
+                self.registry.sensitivity(binding["name"], self.profile_name) == "sensitive"
+                for binding in rec.get("sources", [])
+            )
+        except SourceError:
+            return True
+
+    @staticmethod
+    def _sensitive_chat_action(rec, action):
+        policy = next(
+            (item for item in rec.get("openui_actions", []) if item["key"] == action["key"]),
+            {},
+        )
+        fields = policy.get("fields", [])
+        submitted = action.get("value")
+        form = submitted.get("form") if isinstance(submitted, dict) else None
+        return {
+            "key": action["key"],
+            "value": {
+                "form": {
+                    field: copy.deepcopy(form[field])
+                    for field in fields
+                    if isinstance(form, dict) and field in form
+                }
+            },
+            "component_id": action["component_id"],
+            "kind": action["kind"],
+            "once": action["once"],
+        }
+
     async def _action(self, request):
         initial, user = self._authenticate(request)
         if request.content_type != "application/json":
@@ -448,11 +493,18 @@ class MiniApp:
                     "revision",
                 )
             }
+            sensitive = self._has_sensitive_sources(rec)
+            chat_action = self._sensitive_chat_action(rec, act) if sensitive else act
             payload.update(
-                action=copy.deepcopy(act),
+                action=copy.deepcopy(chat_action),
                 event_id=result["event_id"],
                 request_id=rid,
-                text=injection_text(rec, act, user.get("first_name") or "user"),
+                text=injection_text(
+                    rec,
+                    chat_action,
+                    user.get("first_name") or "user",
+                    sensitive=sensitive,
+                ),
             )
         outcome = "uncertain"
         try:

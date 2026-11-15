@@ -1,8 +1,9 @@
-"""OpenUI view validation, safe source interpolation, and named saved views."""
+"""OpenUI validation, schema-checked projections, and saved view storage."""
 
 from __future__ import annotations
 
 import copy
+import datetime as dt
 import json
 import os
 from pathlib import Path
@@ -19,8 +20,11 @@ from .spec import SpecError, key, text
 MAX_OPENUI_BYTES = 65536
 MAX_BINDINGS = 12
 MAX_OPENUI_ACTIONS = 64
+MAX_OPENUI_ACTION_FIELDS = 32
 VIEW_NAME = re.compile(r"^[A-Za-z0-9_-]{1,48}$")
-PLACEHOLDER = re.compile(r"\{\{\s*([A-Za-z0-9_-]{1,48}(?:\.[A-Za-z0-9_-]{1,48})*)\s*\}\}")
+PLACEHOLDER = re.compile(r"\{\{\s*(?P<expression>[^{}]+?)\s*\}\}")
+PATH_SEGMENT = re.compile(r"^[A-Za-z0-9_-]{1,48}$")
+PATH = re.compile(r"^[A-Za-z0-9_-]{1,48}(?:\.[A-Za-z0-9_-]{1,48})*$")
 OPENUI_COMPONENTS = {
     "Card",
     "CardHeader",
@@ -66,7 +70,7 @@ def _outside_strings(value: str) -> str:
                 quote = None
             out.append(" ")
             continue
-        if char in ("\"", "'"):
+        if char in ('"', "'"):
             quote = char
             out.append(" ")
         else:
@@ -81,7 +85,9 @@ def validate_openui(value: Any) -> str:
     value = text(value, "openui", MAX_OPENUI_BYTES, False)
     if len(value.encode()) > MAX_OPENUI_BYTES:
         raise SpecError("openui: exceeds 64 KiB")
-    code = _outside_strings(value)
+    # Field formatter syntax uses @ inside a server-side placeholder only. Strip
+    # every complete marker before rejecting all other directives and bindings.
+    code = PLACEHOLDER.sub("placeholder", _outside_strings(value))
     if "@" in code or "$" in code:
         raise SpecError("openui: directives and bindings are not supported")
     pairs = {"(": ")", "[": "]", "{": "}"}
@@ -142,7 +148,7 @@ def _inside_string(value: str, position: int) -> bool:
                 escaped = True
             elif char == quote:
                 quote = None
-        elif char in ("\"", "'"):
+        elif char in ('"', "'"):
             quote = char
     return quote is not None
 
@@ -164,20 +170,169 @@ def _component_ranges(value: str, component: str) -> list[tuple[int, int]]:
     return ranges
 
 
-def validate_template(openui: Any, bindings: list[dict[str, Any]]) -> str:
+def _parse_formatter(name: str, argument: str | None) -> dict[str, Any]:
+    if name == "money":
+        if argument in (None, ""):
+            return {"kind": "money", "currency": "USD", "precision": 2}
+        parts = re.split(r"[:,]", argument)
+        if len(parts) != 2 or parts[0] != "USD" or not re.fullmatch(r"[0-6]", parts[1]):
+            raise SpecError("openui: money formatter must be money or money:USD:2")
+        return {"kind": "money", "currency": "USD", "precision": int(parts[1])}
+    if name == "date":
+        if argument != "MM/DD":
+            raise SpecError("openui: date formatter must be date:MM/DD")
+        return {"kind": "date", "format": "MM/DD"}
+    if name == "percent":
+        if argument in (None, ""):
+            return {"kind": "percent", "precision": 0}
+        if not re.fullmatch(r"[0-4]", argument):
+            raise SpecError("openui: percent formatter precision must be 0–4")
+        return {"kind": "percent", "precision": int(argument)}
+    raise SpecError("openui: unsupported placeholder projection or formatter")
+
+
+def _parse_field_specs(raw: str) -> list[dict[str, Any]]:
+    if not raw:
+        raise SpecError("openui: projection requires one or more declared fields")
+    fields = []
+    for item in raw.split(","):
+        if item.count("@") > 1:
+            raise SpecError("openui: a projected field accepts at most one formatter")
+        field, separator, formatter_raw = item.partition("@")
+        if not PATH_SEGMENT.fullmatch(field):
+            raise SpecError("openui: projection field names must be simple declared keys")
+        formatter = None
+        if separator:
+            name, colon, argument = formatter_raw.partition(":")
+            formatter = _parse_formatter(name, argument if colon else None)
+        fields.append({"name": field, "formatter": formatter})
+    return fields
+
+
+def _parse_placeholder(match: re.Match[str]) -> dict[str, Any]:
+    expression = match.group("expression").strip()
+    parts = expression.split("|")
+    if len(parts) not in (1, 2) or not PATH.fullmatch(parts[0]):
+        raise SpecError("openui: invalid source placeholder")
+    path = parts[0]
+    result: dict[str, Any] = {"path": path, "kind": "raw"}
+    if len(parts) == 1:
+        return result
+    operation, colon, argument = parts[1].partition(":")
+    if operation in {"pluck", "table", "items"}:
+        if not colon:
+            raise SpecError("openui: projection requires a field list")
+        fields = _parse_field_specs(argument)
+        if operation == "pluck" and len(fields) != 1:
+            raise SpecError("openui: pluck requires exactly one field")
+        if operation == "items" and len(fields) != 2:
+            raise SpecError("openui: items requires value,label fields")
+        result.update(kind=operation, fields=fields)
+        return result
+    if operation in {"money", "date", "percent"}:
+        result.update(kind="formatter", formatter=_parse_formatter(operation, argument if colon else None))
+        return result
+    raise SpecError("openui: unsupported placeholder projection or formatter")
+
+
+def _schema_types(schema: dict[str, Any]) -> set[str]:
+    value = schema.get("type")
+    if isinstance(value, str):
+        return {value}
+    if isinstance(value, list) and all(isinstance(item, str) for item in value):
+        return set(value)
+    return set()
+
+
+def _schema_property(schema: dict[str, Any], field: str, context: str) -> dict[str, Any]:
+    if "object" not in _schema_types(schema) and not isinstance(schema.get("properties"), dict):
+        raise SpecError(f"openui: {context} is not an object in its declared source output")
+    properties = schema.get("properties")
+    if not isinstance(properties, dict) or field not in properties or not isinstance(properties[field], dict):
+        raise SpecError(f"openui: {context} does not declare field {field}")
+    return properties[field]
+
+
+def _schema_path(schema: dict[str, Any], dotted: str, context: str) -> dict[str, Any]:
+    current = schema
+    if not dotted:
+        return current
+    for field in dotted.split("."):
+        current = _schema_property(current, field, context)
+    return current
+
+
+def _array_item_schema(schema: dict[str, Any], context: str) -> dict[str, Any]:
+    if "array" not in _schema_types(schema) or not isinstance(schema.get("items"), dict):
+        raise SpecError(f"openui: {context} must be an array in its declared source output")
+    return schema["items"]
+
+
+def _require_types(schema: dict[str, Any], allowed: set[str], context: str) -> None:
+    types = _schema_types(schema)
+    if types and not types <= allowed:
+        raise SpecError(f"openui: {context} has an incompatible declared source type")
+
+
+def _validate_placeholder_schema(spec: dict[str, Any], schema: dict[str, Any]) -> None:
+    context = "placeholder " + spec["path"]
+    if spec["kind"] == "raw":
+        return
+    if spec["kind"] == "formatter":
+        formatter = spec["formatter"]
+        if formatter["kind"] in {"money", "percent"}:
+            _require_types(schema, {"number", "integer", "null"}, context)
+        else:
+            _require_types(schema, {"string", "null"}, context)
+        return
+    item = _array_item_schema(schema, context)
+    fields = spec["fields"]
+    for field in fields:
+        field_schema = _schema_property(item, field["name"], context)
+        formatter = field["formatter"]
+        if formatter is None:
+            continue
+        if formatter["kind"] in {"money", "percent"}:
+            _require_types(field_schema, {"number", "integer", "null"}, context + "." + field["name"])
+        else:
+            _require_types(field_schema, {"string", "null"}, context + "." + field["name"])
+    if spec["kind"] == "items":
+        _require_types(
+            _schema_property(item, fields[0]["name"], context),
+            {"string"},
+            context + "." + fields[0]["name"],
+        )
+        _require_types(
+            _schema_property(item, fields[1]["name"], context),
+            {"string", "number", "integer", "boolean", "null"},
+            context + "." + fields[1]["name"],
+        )
+
+
+def validate_template(
+    openui: Any,
+    bindings: list[dict[str, Any]],
+    registry: SourceRegistry,
+    profile: str,
+) -> str:
     template = validate_openui(openui)
-    aliases = {binding["alias"] for binding in bindings}
+    schemas = {
+        binding["alias"]: registry.output_schema(binding["name"], profile)
+        for binding in bindings
+    }
     button_ranges = _component_ranges(template, "Button")
     for match in PLACEHOLDER.finditer(template):
         if _inside_string(template, match.start()):
             raise SpecError("openui: source placeholders must be whole values, not quoted strings")
         if any(start <= match.start() <= end for start, end in button_ranges):
             raise SpecError("openui: source placeholders may not be used in Button actions")
-        alias = match.group(1).split(".", 1)[0]
-        if alias not in aliases:
+        spec = _parse_placeholder(match)
+        alias, *rest = spec["path"].split(".")
+        if alias not in schemas:
             raise SpecError("openui: placeholder refers to an undeclared source alias")
+        _validate_placeholder_schema(spec, _schema_path(schemas[alias], ".".join(rest), "placeholder " + spec["path"]))
     if "{{" in template or "}}" in template:
-        # Every template marker must be a whole, safe dot path. Partial markers are rejected.
+        # Every template marker must be a whole, safe placeholder expression.
         scrubbed = PLACEHOLDER.sub("", template)
         if "{{" in scrubbed or "}}" in scrubbed:
             raise SpecError("openui: invalid source placeholder")
@@ -193,8 +348,8 @@ def validate_openui_actions(value: Any) -> list[dict[str, Any]]:
     actions = []
     for i, item in enumerate(value):
         path = f"actions[{i}]"
-        if not isinstance(item, dict) or set(item) - {"key", "label", "once"} or not {"key", "label"} <= set(item):
-            raise SpecError(path + ": expected key, label and optional once")
+        if not isinstance(item, dict) or set(item) - {"key", "label", "once", "fields"} or not {"key", "label"} <= set(item):
+            raise SpecError(path + ": expected key, label, optional once and optional fields")
         action_key = key(item["key"], path + ".key")
         if action_key in found:
             raise SpecError(path + ": duplicate action key")
@@ -203,7 +358,19 @@ def validate_openui_actions(value: Any) -> list[dict[str, Any]]:
         once = item.get("once", True)
         if type(once) is not bool:
             raise SpecError(path + ".once: expected boolean")
-        actions.append({"key": action_key, "label": label, "once": once})
+        action: dict[str, Any] = {"key": action_key, "label": label, "once": once}
+        if "fields" in item:
+            fields = item["fields"]
+            if not isinstance(fields, list) or len(fields) > MAX_OPENUI_ACTION_FIELDS:
+                raise SpecError(path + f".fields: expected 0–{MAX_OPENUI_ACTION_FIELDS} items")
+            clean_fields = []
+            for j, field in enumerate(fields):
+                clean_field = key(field, f"{path}.fields[{j}]")
+                if clean_field in clean_fields:
+                    raise SpecError(path + ".fields: duplicate field")
+                clean_fields.append(clean_field)
+            action["fields"] = clean_fields
+        actions.append(action)
     return actions
 
 
@@ -221,6 +388,17 @@ def validate_button_action_types(template: str, actions: list[dict[str, Any]]) -
             raise SpecError("openui: Button type is not declared in actions")
 
 
+def _selected_form_fields(value: Any, fields: list[str]) -> dict[str, Any]:
+    form = value.get("form") if isinstance(value, dict) else None
+    form_name = value.get("form_name") if isinstance(value, dict) else None
+    clean_form = {
+        field: copy.deepcopy(form[field])
+        for field in fields
+        if isinstance(form, dict) and field in form
+    }
+    return {"form": clean_form, "form_name": form_name if isinstance(form_name, str) else None}
+
+
 def validate_openui_action(record: dict[str, Any], action_key: Any, value: Any) -> dict[str, Any]:
     if not isinstance(action_key, str):
         raise SpecError("key: unknown action")
@@ -233,6 +411,8 @@ def validate_openui_action(record: dict[str, Any], action_key: Any, value: Any) 
     clean = _json_copy(value, "value")
     if len(json.dumps(clean, ensure_ascii=False, separators=(",", ":")).encode()) > 8192:
         raise SpecError("value: exceeds 8 KiB")
+    if "fields" in action:
+        clean = _selected_form_fields(clean, action["fields"])
     return {
         "key": action["key"],
         "label": action["label"],
@@ -245,11 +425,97 @@ def validate_openui_action(record: dict[str, Any], action_key: Any, value: Any) 
 
 def _lookup(source: Any, dotted: str) -> Any:
     current = source
+    if not dotted:
+        return current
     for segment in dotted.split("."):
         if not isinstance(current, dict) or segment not in current:
             raise SourceError("Saved view data no longer matches its source contract")
         current = current[segment]
     return current
+
+
+def _project_row_value(row: Any, field: str) -> Any:
+    if not isinstance(row, dict) or field not in row:
+        raise SourceError("Saved view data no longer matches its source contract")
+    return row[field]
+
+
+def _format_value(value: Any, formatter: dict[str, Any]) -> str:
+    if value is None:
+        return "—"
+    kind = formatter["kind"]
+    if kind == "money":
+        if type(value) not in (int, float):
+            raise SourceError("Saved view data no longer matches its source contract")
+        return f"${value:,.{formatter['precision']}f}"
+    if kind == "percent":
+        if type(value) not in (int, float):
+            raise SourceError("Saved view data no longer matches its source contract")
+        percentage = value * 100 if -1 <= value <= 1 else value
+        return f"{percentage:.{formatter['precision']}f}%"
+    if kind == "date":
+        if not isinstance(value, str):
+            raise SourceError("Saved view data no longer matches its source contract")
+        try:
+            date_value = dt.datetime.fromisoformat(value.replace("Z", "+00:00")).date()
+        except ValueError:
+            try:
+                date_value = dt.date.fromisoformat(value)
+            except ValueError as exc:
+                raise SourceError("Saved view data no longer matches its source contract") from exc
+        return f"{date_value.month:02d}/{date_value.day:02d}"
+    raise SourceError("Saved view data no longer matches its source contract")
+
+
+def _option_text(value: Any) -> str:
+    if value is None:
+        return "—"
+    if value is True:
+        return "true"
+    if value is False:
+        return "false"
+    return str(value)
+
+
+def _project_value(value: Any, spec: dict[str, Any]) -> Any:
+    kind = spec["kind"]
+    if kind == "raw":
+        return value
+    if kind == "formatter":
+        return _format_value(value, spec["formatter"])
+    if not isinstance(value, list):
+        raise SourceError("Saved view data no longer matches its source contract")
+    fields = spec["fields"]
+    if kind == "pluck":
+        field = fields[0]
+        return [
+            _format_value(_project_row_value(row, field["name"]), field["formatter"])
+            if field["formatter"]
+            else _project_row_value(row, field["name"])
+            for row in value
+        ]
+    if kind == "table":
+        return [
+            [
+                _format_value(_project_row_value(row, field["name"]), field["formatter"])
+                if field["formatter"]
+                else _project_row_value(row, field["name"])
+                for field in fields
+            ]
+            for row in value
+        ]
+    if kind == "items":
+        value_field, label_field = fields
+        return [
+            {
+                "value": _option_text(_project_row_value(row, value_field["name"])),
+                "label": _format_value(_project_row_value(row, label_field["name"]), label_field["formatter"])
+                if label_field["formatter"]
+                else _option_text(_project_row_value(row, label_field["name"])),
+            }
+            for row in value
+        ]
+    raise SourceError("Saved view data no longer matches its source contract")
 
 
 def hydrate_openui(template: str, bindings: list[dict[str, Any]], registry: SourceRegistry, profile: str) -> str:
@@ -260,9 +526,11 @@ def hydrate_openui(template: str, bindings: list[dict[str, Any]], registry: Sour
     }
 
     def replace(match: re.Match[str]) -> str:
-        path = match.group(1)
-        alias, *rest = path.split(".")
-        value = _lookup(values[alias], ".".join(rest)) if rest else values[alias]
+        spec = _parse_placeholder(match)
+        alias, *rest = spec["path"].split(".")
+        if alias not in values:
+            raise SourceError("Saved view data no longer matches its source contract")
+        value = _project_value(_lookup(values[alias], ".".join(rest)), spec)
         return json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
 
     return PLACEHOLDER.sub(replace, template)

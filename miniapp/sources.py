@@ -125,6 +125,14 @@ class SourceRegistry:
             raise SourceError("Source arguments must be an object")
         return clean
 
+    def output_schema(self, name: str, profile: str) -> dict[str, Any]:
+        """Return a source contract for save-time placeholder validation only."""
+        return copy.deepcopy(self._source(name, profile).output_schema)
+
+    def sensitivity(self, name: str, profile: str) -> str:
+        """Return a source classification without fetching provider data."""
+        return self._source(name, profile).sensitivity
+
     def manifest(self, profile: str) -> list[dict[str, Any]]:
         """Return contracts only. Never invoke a provider or include result data."""
         return [

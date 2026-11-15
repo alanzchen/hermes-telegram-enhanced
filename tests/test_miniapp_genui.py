@@ -118,8 +118,18 @@ class SavedOpenUIViewTests(unittest.IsolatedAsyncioTestCase):
                     name="finance.balance",
                     title="Balance",
                     args_schema={"type": "object", "additionalProperties": False},
-                    output_schema={"type": "object"},
-                    sensitivity="sensitive",
+                    output_schema={
+                        "type": "object",
+                        "properties": {
+                            "source": {"type": "string"},
+                            "generated_at": {"type": "string"},
+                            "data": {
+                                "type": "object",
+                                "properties": {"label": {"type": "string"}},
+                            },
+                        },
+                    },
+                    sensitivity="private",
                     profiles=("coordinator",),
                     query=fetch,
                 )
