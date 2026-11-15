@@ -234,11 +234,16 @@ _CRON_WRAP = re.compile(r"\ACronjob Response: (?P<name>[^\n]*)\n\(job_id: (?P<id
                         r"(?P<body>.*?)\n\nTo stop or manage this job, send me a new message[^\n]*\Z", re.S)
 
 
-def pretty_cron(text: str) -> str:
-    """Replace core's English cron wrapper (header, job_id, dashes, footer) with one quiet title line.
+def pretty_cron(text: str, rich: bool = True) -> str:
+    """Replace core's English cron wrapper (header, job_id, dashes, footer) with a quiet title line; the
+    management hint goes into a folded <details> block (rich) or one italic line (plain fallback).
     Anything not matching the exact wrapper is returned unchanged."""
     m = _CRON_WRAP.match(text or "")
     if not m:
         return text
-    name, body = " ".join(m["name"].split()), m["body"].strip()
-    return f"⏰ **{name}**\n\n{body}" if name else body
+    name, jid, body = " ".join(m["name"].split()), m["id"].strip(), m["body"].strip()
+    head = f"⏰ **{name}**\n\n{body}" if name else body
+    hint = f"任务 ID `{jid}`。要暂停、修改或停止，直接发消息告诉我" + (f"，比如「停止 {name}」" if name else "")
+    if rich:
+        return f"{head}\n\n<details>\n<summary>管理这个定时任务</summary>\n\n{hint}\n\n</details>"
+    return f"{head}\n\n_{hint}_"

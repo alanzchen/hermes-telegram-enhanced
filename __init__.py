@@ -2690,10 +2690,11 @@ def _list_needs_rich_or_cron(content: Any) -> bool:
 
 
 def _format_plain(content: str) -> str:
-    return bulletize_plain(fu.pretty_cron(content))
+    return bulletize_plain(fu.pretty_cron(content, rich=False))
 
 
 sys._hte_list_helpers = (_list_needs_rich_or_cron, _format_plain)
+sys._hte_cron_pretty = fu.pretty_cron
 
 
 def _patch_telegram_lists() -> None:
@@ -2761,6 +2762,20 @@ def _patch_telegram_lists() -> None:
             _patch_clarify(cls)
         except Exception:
             logger.warning("telegram-enhanced: clarify patch failed", exc_info=True)
+        if (isinstance(cls, type) and hasattr(cls, "_rich_message_payload")
+                and not cls.__dict__.get("_hte_cron_payload")):
+            # The rich lane builds from RAW markdown (not format_message). Indirect through sys so a hot
+            # reload swaps the formatter without re-wrapping the class.
+            orig_payload = cls._rich_message_payload
+
+            def _rich_payload(self, content, *args, _orig=orig_payload, **kwargs):
+                pretty = getattr(sys, "_hte_cron_pretty", None)
+                if pretty and isinstance(content, str):
+                    content = pretty(content)
+                return _orig(self, content, *args, **kwargs)
+
+            cls._rich_message_payload = _rich_payload
+            cls._hte_cron_payload = True
         if (not isinstance(cls, type) or cls.__dict__.get(_LIST_PATCH_MARK)
                 or not hasattr(cls, "_needs_rich_rendering") or not hasattr(cls, "format_message")):
             continue

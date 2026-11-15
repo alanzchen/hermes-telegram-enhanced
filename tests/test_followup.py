@@ -119,7 +119,11 @@ class CronPrettyTest(unittest.TestCase):
     def test_wrapper_becomes_title(self):
         raw = ("Cronjob Response: 交接 · X\n(job_id: b041c9395344)\n-------------\n\n**Body** line\n\nmore\n\n"
                "To stop or manage this job, send me a new message (e.g. \"stop reminder 交接 · X\").")
-        self.assertEqual(fu.pretty_cron(raw), "⏰ **交接 · X**\n\n**Body** line\n\nmore")
+        out = fu.pretty_cron(raw)
+        self.assertTrue(out.startswith("⏰ **交接 · X**\n\n**Body** line\n\nmore\n\n<details>"))
+        self.assertIn("b041c9395344", out)
+        self.assertNotIn("Cronjob Response", out)
+        self.assertNotIn("<details>", fu.pretty_cron(raw, rich=False))
 
     def test_other_text_untouched(self):
         self.assertEqual(fu.pretty_cron("hello\nCronjob Response: x"), "hello\nCronjob Response: x")
