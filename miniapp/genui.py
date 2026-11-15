@@ -341,6 +341,20 @@ def validate_openui(value: Any) -> str:
         raise SpecError("openui: unsupported component " + ", ".join(unknown))
     if len(calls) > 200:
         raise SpecError("openui: at most 200 component calls")
+    interactive = {"TextInput", "DateInput", "Checkbox", *(_INTERACTIVE_ITEMS_ARGS)}
+    for call in calls:
+        if str(call.value) not in interactive:
+            continue
+        args = call.children or []
+        if not args or args[0].kind != "string":
+            raise SpecError("openui: interactive control field names must be static strings")
+        index = _INTERACTIVE_ITEMS_ARGS.get(str(call.value))
+        if index is not None:
+            if len(args) <= index:
+                raise SpecError("openui: interactive controls require items")
+            items = args[index]
+            if items.kind != "placeholder" and _static_option_values(items) is None:
+                raise SpecError("openui: interactive control items must be a placeholder or static options; placeholders cannot be indirect")
     return value
 
 
@@ -713,8 +727,17 @@ def _static_option_values(node: _Node) -> set[str] | None:
         return None
     values: set[str] = set()
     for item in node.children or []:
+        if item.kind != "object":
+            return None
+        pairs = item.children or []
+        if any(str(pair.value) not in {"value", "label", "description"} for pair in pairs):
+            return None
         value = _object_value(item, "value")
-        if value is None or value.kind != "string":
+        label = _object_value(item, "label")
+        description = _object_value(item, "description")
+        if value is None or label is None or value.kind != "string" or label.kind != "string":
+            return None
+        if description is not None and description.kind != "string":
             return None
         values.add(str(value.value))
     return values

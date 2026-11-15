@@ -9,8 +9,10 @@ import copy
 import json
 import os
 from pathlib import Path
+import shutil
 import sys
 import tempfile
+import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -328,6 +330,128 @@ async def main():
     }
     (output / "results.json").write_text(json.dumps(report, indent=2))
     print(json.dumps(report, indent=2))
+
+
+class ChromiumOpenUISmokeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_real_openui_shell_keeps_finance_view_after_submit(self):
+        """Exercise the real plugin server and strict OpenUI CSP in Chromium."""
+        from test_miniapp_finance_dashboard import DASHBOARD, finance_registry
+
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("Node is unavailable; Chromium OpenUI smoke requires Playwright")
+        repo = Path(__file__).resolve().parents[1]
+        browser_modules = [
+            Path(os.environ["HTE_PLAYWRIGHT_NODE_PATH"])
+            if os.environ.get("HTE_PLAYWRIGHT_NODE_PATH")
+            else None,
+            repo / "node_modules",
+            Path("/opt/data/cache/scratch/openui-step1/harness/node_modules"),
+        ]
+        module_dir = next((path for path in browser_modules if path and (path / "playwright/package.json").is_file()), None)
+        if module_dir is None:
+            self.skipTest("Playwright is unavailable; set HTE_PLAYWRIGHT_NODE_PATH to its node_modules directory")
+        browser_candidates = [
+            Path(os.environ["HTE_CHROMIUM_EXECUTABLE_PATH"])
+            if os.environ.get("HTE_CHROMIUM_EXECUTABLE_PATH")
+            else None,
+            *Path("/opt/data/cache/scratch/playwright-browsers").glob("chromium-*/chrome-linux*/chrome"),
+            *Path("/opt/opencli-runtime/browser-cache").glob("chromium-*/chrome"),
+        ]
+        chromium = next((path for path in browser_candidates if path and path.is_file()), None)
+        if chromium is None:
+            self.skipTest("Chromium is unavailable; set HTE_CHROMIUM_EXECUTABLE_PATH")
+
+        tmp = tempfile.TemporaryDirectory()
+        events = []
+        registry, _calls = finance_registry()
+        service = setup(
+            None,
+            lambda: TOKEN,
+            lambda payload: events.append(payload) or True,
+            state_dir=tmp.name,
+            current_target=lambda: (TARGET, None),
+            send_message=lambda _payload: {"ok": True, "result": {"message_id": 101}},
+            env={
+                "HTE_MINIAPP_PUBLIC_URL": "https://ui.example.test/coordinator",
+                "HTE_MINIAPP_PORT": "8787",
+                "HTE_MINIAPP_PROFILE": "coordinator",
+                "HTE_MINIAPP_OWNER_USER_ID": "42",
+            },
+            registry=registry,
+        )
+        service._serving = True
+        server = TestServer(service.create_app())
+        await server.start_server()
+        try:
+            browser_openui = DASHBOARD
+            for source, replacement in {
+                'CardHeader("财务总览", "合成演示数据")': 'CardHeader("Finance overview", "Synthetic dashboard")',
+                '"近三月消费"': '"Last three months"',
+                'value: "overview", trigger: "概览"': 'value: "overview", trigger: "Overview"',
+                'value: "cards", trigger: "卡款"': 'value: "cards", trigger: "Cards"',
+                'value: "spending", trigger: "消费"': 'value: "spending", trigger: "Spending"',
+                'value: "review", trigger: "待确认"': 'value: "review", trigger: "Review"',
+                'Button("提交确认"': 'Button("Submit review"',
+            }.items():
+                browser_openui = browser_openui.replace(source, replacement)
+            browser_openui = browser_openui.replace(
+                'spendingChart = BarChart({{spending.rows|pluck:key}}, {{spending.rows|pluck:amount}}, "Last three months", "money")',
+                'spendingChart = BarChart(["Refund"], [-50], "Last three months", "money")',
+            )
+            request = {
+                "action": "save",
+                "name": "chromium-finance-dashboard",
+                "title": "Finance dashboard",
+                "renderer": "openui",
+                "openui": browser_openui,
+                "sources": [
+                    {"alias": "overview", "name": "finance.overview", "args": {}},
+                    {"alias": "cards", "name": "finance.cards", "args": {}},
+                    {"alias": "spending", "name": "finance.spending", "args": {"group_by": "month", "days": 120, "limit": 6}},
+                    {"alias": "categories", "name": "finance.categories", "args": {"days": 120, "limit": 5}},
+                    {"alias": "review_queue", "name": "finance.review_queue", "args": {"days": 45}},
+                ],
+                "actions": [{"key": "submit_review", "label": "Submit review", "fields": ["transaction_ids"]}],
+            }
+            saved = json.loads(service.tool_handler(request))
+            self.assertTrue(saved["success"], saved)
+            views = {}
+            for theme in ("light", "dark"):
+                opened = json.loads(service.tool_handler({
+                    "action": "open_saved", "name": "chromium-finance-dashboard", "expires_in": 60,
+                }))
+                self.assertTrue(opened["success"], opened)
+                views[theme] = {"id": opened["id"], "initData": signed(opened["id"])}
+            script = repo / "miniapp" / "testing" / "openui_browser_smoke.cjs"
+            environment = dict(os.environ)
+            environment.update({
+                "NODE_PATH": str(module_dir),
+                "CHROMIUM_EXECUTABLE_PATH": str(chromium),
+                "HTE_OPENUI_BROWSER_BASE_URL": str(server.make_url("/")).rstrip("/"),
+                "HTE_OPENUI_BROWSER_VIEWS": json.dumps(views),
+                "HTE_OPENUI_BROWSER_EVIDENCE": "/opt/data/cache/scratch/openui-step1/evidence/round5",
+            })
+            process = await asyncio.create_subprocess_exec(
+                node, str(script), stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, env=environment,
+            )
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=120)
+            output = (stdout + stderr).decode("utf-8", "replace")
+            if process.returncode == 77:
+                self.skipTest(output.strip() or "Chromium is unavailable")
+            self.assertEqual(process.returncode, 0, output)
+            report = json.loads(stdout)
+            self.assertTrue(report["passed"])
+            self.assertEqual({item["theme"] for item in report["reports"]}, {"light", "dark"})
+            self.assertEqual(len(events), 2)
+            for event in events:
+                self.assertEqual(event["action"]["value"], {"form": {"transaction_ids": ["txn-002"]}})
+            evidence = Path(environment["HTE_OPENUI_BROWSER_EVIDENCE"])
+            for theme in ("light", "dark"):
+                self.assertTrue((evidence / f"openui-finance-{theme}-390x844-after-submit.png").is_file())
+        finally:
+            await server.close()
+            tmp.cleanup()
 
 
 if __name__ == "__main__":

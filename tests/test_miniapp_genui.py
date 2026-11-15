@@ -86,6 +86,12 @@ class OpenUIAssetTests(unittest.TestCase):
         static = Path(__file__).resolve().parents[1] / "miniapp" / "static"
         html = (static / "index.html").read_text()
         self.assertNotIn('rel="stylesheet" href="m/static/openui.css"', html)
+        self.assertIn('rel="stylesheet" href="m/static/shell.css"', html)
+        shell = (static / "shell.css").read_text()
+        for selector in ("html,body", "main", "header", "#title", "#meta", ".error", "#retry"):
+            self.assertIn(selector, shell)
+        for forbidden in ("--accent", "button{", "table{", "p{", "h3{"):
+            self.assertNotIn(forbidden, shell)
         self.assertIn('m/static/openui.js', html)
         bundle_path = static / "openui.js"
         css_path = static / "openui.css"

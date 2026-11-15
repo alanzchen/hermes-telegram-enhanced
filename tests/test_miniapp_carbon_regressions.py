@@ -129,6 +129,37 @@ btn = Button("Refresh", {type: "refresh", params: {tab: "cards"}})'''
         parsed = validate_template(source, bindings(("queue", "finance.queue")), registry(), "coordinator")
         validate_button_action_types(parsed, [{"key": "refresh", "label": "Refresh", "once": True}])
 
+    def test_r3_5_interactive_controls_require_static_names_and_safe_items(self):
+        controls = {
+            "TextInput": 'field = "note"\nroot = Card([TextInput(field)])',
+            "DateInput": 'field = "date"\nroot = Card([DateInput(field)])',
+            "Checkbox": 'field = "approved"\nroot = Card([Checkbox(field, "Approved")])',
+            "Select": 'field = "choice"\nroot = Card([Select(field, [{value: "one", label: "One"}])])',
+            "CheckboxGroup": 'field = "choices"\nroot = Card([CheckboxGroup(field, [{value: "one", label: "One"}])])',
+            "RadioGroup": 'field = "choice"\nroot = Card([RadioGroup(field, [{value: "one", label: "One"}])])',
+        }
+        for name, source in controls.items():
+            with self.subTest(control=name):
+                self.assert_template_rejected(source, [])
+        for name in ("Select", "CheckboxGroup", "RadioGroup"):
+            with self.subTest(control=name, items="identifier"):
+                self.assert_template_rejected(
+                    f'items = [{{value: "one", label: "One"}}]\nroot = Card([{name}("choice", items)])', []
+                )
+            with self.subTest(control=name, items="invalid static"):
+                for items in ('["one"]', '[{value: "one"}]'):
+                    with self.subTest(items=items):
+                        self.assert_template_rejected(f'root = Card([{name}("choice", {items})])', [])
+            with self.subTest(control=name, items="valid static"):
+                validate_template(
+                    f'root = Card([{name}("choice", [{{value: "one", label: "One"}}])])', [], registry(), "coordinator"
+                )
+            with self.subTest(control=name, items="valid placeholder"):
+                validate_template(
+                    f'root = Card([{name}("choice", {{{{queue.rows|items:transaction_id,merchant}}}})])',
+                    bindings(("queue", "finance.queue")), registry(), "coordinator",
+                )
+
     def test_m6_negative_money_percent_and_timezone_are_explicit(self):
         self.assertEqual(_format_value(-42.5, {"kind": "money", "precision": 2}), "-$42.50")
         self.assertEqual(_format_value(0.99, {"kind": "percent", "precision": 1}), "1.0%")

@@ -445,11 +445,15 @@ class FinanceDashboardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(catalog["saved_views"], [])
     def test_live_saved_finance_dashboard_and_docs_examples_validate_against_schema_only_manifest(self):
         """This reads no ledger and never invokes finance_sources.py query."""
-        script = Path(
-            os.environ.get(FINANCE_SOURCES_PATH_ENV, "/opt/data/tools/plaid-finance-export/finance_sources.py")
-        )
+        script_override = os.environ.get(FINANCE_SOURCES_PATH_ENV)
+        saved_override = os.environ.get("HTE_MINIAPP_SAVED_VIEWS_PATH")
+        if not script_override or not saved_override:
+            self.skipTest(
+                f"set {FINANCE_SOURCES_PATH_ENV} and HTE_MINIAPP_SAVED_VIEWS_PATH to validate the live saved dashboard"
+            )
+        script = Path(script_override)
         if not script.is_file():
-            self.skipTest(f"finance provider script missing: set {FINANCE_SOURCES_PATH_ENV}")
+            self.skipTest(f"finance provider script missing: {script}")
         manifest = json.loads(
             subprocess.check_output([sys.executable, "-I", str(script), "describe"], text=True)
         )

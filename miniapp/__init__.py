@@ -652,7 +652,7 @@ class MiniApp:
 
         async def static(request):
             name = request.match_info["name"]
-            if name not in ("app.js", "renderer.js", "layout.js", "style.css", "openui.js", "openui.css"):
+            if name not in ("app.js", "renderer.js", "layout.js", "style.css", "shell.css", "openui.js", "openui.css"):
                 raise web.HTTPNotFound()
             return web.Response(
                 body=(STATIC / name).read_bytes(),

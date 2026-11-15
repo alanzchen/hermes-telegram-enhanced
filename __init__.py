@@ -117,7 +117,8 @@ def _guest_topic_marker(user_id: str, thread_id: str) -> bool:
         topics = (_state.get("meta").get("guest_topic") or {})
     except Exception:
         return False
-    return isinstance(topics, dict) and str(topics.get(str(user_id), "")) == str(thread_id or "")
+    stored = topics.get(str(user_id)) if isinstance(topics, dict) else None
+    return bool(thread_id and stored and str(stored) == str(thread_id))
 
 
 def _webhook_target() -> tuple[dict[str, Any] | None, str | None]:
@@ -2296,6 +2297,10 @@ async def _on_guest_message(update: Any, _context: Any) -> None:
                  "the request, with only what the request needs and nothing else private.")
     owner = user_id
     thread = _guest_topic(owner, _lang(owner, ""))
+    if not thread:
+        _api("editMessageText", {"inline_message_id": inline_id,
+                                 "rich_message": {"markdown": i18n.t("guest_fail", lang, name=name)}})
+        return
     adapter = _state.get("adapter")
     ok = False
     try:
@@ -2957,7 +2962,7 @@ def _miniapp_register(ctx: Any) -> None:
     try:  # this profile's .env also counts, so a hot reload picks up new HTE_MINIAPP_* without a restart
         for line in (_profile_home() / ".env").read_text(encoding="utf-8").splitlines():
             key, sep, value = line.strip().partition("=")
-            if sep and key.startswith("HTE_MINIAPP_"):
+            if sep and (key.startswith("HTE_MINIAPP_") or (key == "TELEGRAM_ALLOWED_USERS" and key not in env)):
                 env[key] = value.strip().strip("'\"")
     except OSError:
         pass

@@ -341,7 +341,7 @@ class PublicUrlTests(unittest.TestCase):
         script = (repo / "miniapp/static/app.js").read_text()
         page = "https://hte-ui.cool.zenan.ch/research/m"
         self.assertNotIn('"/m/static/', html)
-        for asset in ("layout.js", "renderer.js", "openui.js", "app.js"):
+        for asset in ("shell.css", "layout.js", "renderer.js", "openui.js", "app.js"):
             self.assertIn(f'm/static/{asset}', html)
             self.assertEqual(
                 urljoin(page, f"m/static/{asset}"),
@@ -516,7 +516,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("session_key", data)
         self.assertEqual(data["revision"], 1)
         self.assertEqual(response.headers["Cache-Control"], "no-store")
-        for asset in ("openui.js", "openui.css"):
+        for asset in ("shell.css", "openui.js", "openui.css"):
             static = await self.client.get("/m/static/" + asset)
             self.assertEqual(static.status, 200)
             self.assertIn("nosniff", static.headers["X-Content-Type-Options"])
