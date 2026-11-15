@@ -139,3 +139,11 @@ class CronPrettyTest(unittest.TestCase):
 
     def test_other_text_untouched(self):
         self.assertEqual(fu.pretty_cron("hello\nCronjob Response: x"), "hello\nCronjob Response: x")
+
+
+class ClarifySkipTest(unittest.TestCase):
+    def test_hint_removed_and_skip_button(self):
+        md = fu.clarify_markdown('选哪个？\n回复“skip”即可跳过此问题。', ["A", "B"], "c1", "其他", "跳过")
+        self.assertNotIn("skip", md)
+        self.assertIn('data="hk:c1">跳过', md)
+        self.assertEqual(fu.strip_skip_hint('Q?\nReply "skip" to skip this question.'), "Q?")

@@ -197,13 +197,23 @@ def wrapup_markdown(title: str, lang: str, *, summary: str = "", changed: Any = 
 CLARIFY_LABEL_MAX = 40
 
 
-def clarify_markdown(question: str, choices: list[Any], clarify_id: str, other_label: str) -> str:
+CLARIFY_SKIP_PREFIX = "hk:"
+_SKIP_HINT = re.compile(r"\n[^\n]*[\"“「«']skip[\"”」»'][^\n]*\s*$", re.I)
+
+
+def strip_skip_hint(question: str) -> str:
+    """Core appends a localized 'reply "skip" to skip' line for messaging adapters; the card has a button."""
+    return _SKIP_HINT.sub("", str(question or "")).rstrip()
+
+
+def clarify_markdown(question: str, choices: list[Any], clarify_id: str, other_label: str,
+                     skip_label: str = "") -> str:
     """Rich-message body for a clarify prompt, styled like a decision card: the question in bold, one
     button per choice carrying its own text (first = recommended, highlighted), then "Other".
 
     Callback data stays core's ``cl:<id>:<idx|other>`` so Hermes resolves the tap exactly as before.
     Choices too long for a button are listed in full in the body and the button gets a shortened label."""
-    q = str(question or "").strip()
+    q = strip_skip_hint(question).strip()
     # core tags the first choice " (Recommended)"; the highlighted first button already says that
     labels = [re.sub(r"\s*\((?:Recommended|推荐)\)$", "", " ".join(str(c or "").split())) for c in choices]
     # no ❓ here: core prefixes one when it edits the card into its answered state
@@ -222,8 +232,12 @@ def clarify_markdown(question: str, choices: list[Any], clarify_id: str, other_l
             rows[-1].append(tag)
         else:
             rows.append([tag])
-    rows.append([f'<tg-button type="callback_data" data="cl:{clarify_id}:other">'
-                 f"{html.escape(other_label, quote=False)}</tg-button>"])
+    last = [f'<tg-button type="callback_data" data="cl:{clarify_id}:other">'
+            f"{html.escape(other_label, quote=False)}</tg-button>"]
+    if skip_label:
+        last.append(f'<tg-button type="callback_data" data="{CLARIFY_SKIP_PREFIX}{clarify_id}">'
+                    f"{html.escape(skip_label, quote=False)}</tg-button>")
+    rows.append(last)
     buttons = "\n".join("<tg-button-row>\n" + "\n".join(r) + "\n</tg-button-row>" for r in rows)
     return "\n\n".join(body) + "\n\n" + buttons
 

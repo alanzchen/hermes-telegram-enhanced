@@ -1175,9 +1175,12 @@ async def _route_new_updates(update: Any, context: Any) -> None:
                     getattr(msg, "message_id", "?"), time.time() - msg.date.timestamp())
     query = getattr(update, "callback_query", None)
     data = str(getattr(query, "data", "") or "") if query is not None else ""
-    if data.startswith((fu.SNOOZE_PREFIX, fu.DECISION_PREFIX, CALLBACK_PREFIX, sx.PREFIX, fu.CRON_PREFIX)):
+    if data.startswith((fu.SNOOZE_PREFIX, fu.DECISION_PREFIX, CALLBACK_PREFIX, sx.PREFIX, fu.CRON_PREFIX,
+                        fu.CLARIFY_SKIP_PREFIX)):
         try:
-            if data.startswith(fu.CRON_PREFIX):
+            if data.startswith(fu.CLARIFY_SKIP_PREFIX):
+                await _on_clarify_skip(query, data)
+            elif data.startswith(fu.CRON_PREFIX):
                 await _on_cron_button(query, data)
             elif data.startswith(sx.PREFIX):
                 await _on_secret_button(query, data)
@@ -2626,7 +2629,9 @@ async def _rich_clarify(adapter: Any, chat_id: Any, question: str, choices: list
     from plugins.platforms.telegram.telegram_clarify_binding import ClarifyPrompt
     thread_id = adapter._metadata_thread_id(metadata) if hasattr(adapter, "_metadata_thread_id") else None
     lang = _lang(str(chat_id), str(thread_id or ""))
-    markdown = fu.clarify_markdown(question, list(choices), clarify_id, i18n.t("clarify_other", lang))
+    question = fu.strip_skip_hint(question)
+    markdown = fu.clarify_markdown(question, list(choices), clarify_id, i18n.t("clarify_other", lang),
+                                   i18n.t("clarify_skip", lang))
     payload: dict[str, Any] = {"chat_id": _int_or_str(chat_id), "rich_message": {"markdown": markdown}}
     if thread_id and str(thread_id).isdigit():
         payload["message_thread_id"] = int(thread_id)
@@ -2661,7 +2666,9 @@ async def _clarify_close_when_done(adapter: Any, clarify_id: str, chat_id: Any, 
     adapter._clarify_state.pop(clarify_id, None)
     resp = getattr(entry, "response", None) if entry is not None else None
     q = " ".join(str(question or "").split())
-    if isinstance(resp, str) and resp and resp != getattr(cg, "CANCELLED", object()):
+    if resp == getattr(cg, "SKIPPED", object()):
+        tail = i18n.t("clarify_skipped", lang)
+    elif isinstance(resp, str) and resp and resp != getattr(cg, "CANCELLED", object()):
         tail = i18n.t("clarify_answered", lang, answer=resp[:300])
     else:
         tail = i18n.t("clarify_expired", lang)
@@ -2669,7 +2676,7 @@ async def _clarify_close_when_done(adapter: Any, clarify_id: str, chat_id: Any, 
         "chat_id": _int_or_str(chat_id), "message_id": mid,
         "rich_message": {"markdown": f"**{q}**\n\n{tail}"}})
     logger.info("telegram-enhanced: clarify %s closed (%s) msg=%s ok=%s %s", clarify_id,
-                "answered" if tail.startswith("✅") else "expired", mid, res.get("ok"), res.get("description") or "")
+                "answered" if tail.startswith("✅") else "skipped" if tail.startswith("⏭") else "expired", mid, res.get("ok"), res.get("description") or "")
 
 
 sys._hte_rich_clarify = _rich_clarify  # resolved per call so a plugin reload takes effect
@@ -2712,6 +2719,18 @@ def _cron_state(job_id: str) -> str:
 def _cron_pretty_rich(content: str) -> str:
     jid = fu.cron_job_id(content)
     return fu.pretty_cron(content, state=_cron_state(jid) if jid else "gone")
+
+
+async def _on_clarify_skip(query: Any, data: str) -> None:
+    """跳过 button on a rich clarify card: resolve it as core's SKIPPED (the card closes itself)."""
+    msg = getattr(query, "message", None)
+    lang = _lang(str(getattr(msg, "chat_id", "") or ""), str(getattr(msg, "message_thread_id", "") or ""))
+    if not _press_allowed(query):
+        await query.answer(text=i18n.t("not_yours", lang))
+        return
+    from tools import clarify_gateway as cg
+    ok = cg.resolve_gateway_clarify(data[len(fu.CLARIFY_SKIP_PREFIX):], cg.SKIPPED)
+    await query.answer(text=i18n.t("clarify_skipped" if ok else "clarify_expired", lang))
 
 
 async def _on_cron_button(query: Any, data: str) -> None:
