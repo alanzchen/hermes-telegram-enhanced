@@ -9,6 +9,7 @@ import secrets
 import threading
 import time
 from contextlib import contextmanager
+from .genui import validate_openui, validate_openui_actions
 from .spec import SpecError, validate_spec, text, number
 
 MAX_STORE_BYTES = 20 * 1024 * 1024
@@ -74,8 +75,31 @@ class SpecStore:
         ):
             raise SpecError("No Mini App in the current conversation with that id")
 
-    def create(self, spec, title, target, expires_in=3600):
-        spec = validate_spec(spec)
+    def create(
+        self,
+        spec,
+        title,
+        target,
+        expires_in=3600,
+        *,
+        renderer="json",
+        openui=None,
+        sources=(),
+        openui_actions=(),
+    ):
+        if renderer == "json":
+            spec = validate_spec(spec)
+            openui = None
+            sources = []
+            openui_actions = []
+        elif renderer == "openui":
+            if spec is not None:
+                raise SpecError("OpenUI views do not accept a JSON spec")
+            openui = validate_openui(openui)
+            sources = copy.deepcopy(list(sources))
+            openui_actions = validate_openui_actions(list(openui_actions))
+        else:
+            raise SpecError("Unknown Mini App renderer")
         text(title, "title", 200, False)
         if type(expires_in) is not int:
             raise SpecError("expires_in must be integer seconds")
@@ -85,7 +109,7 @@ class SpecStore:
         now = time.time()
         rec = dict(
             id=secrets.token_urlsafe(18),
-            spec=spec,
+            renderer=renderer,
             title=title,
             created_at=now,
             expires_at=now + expires_in,
@@ -99,6 +123,14 @@ class SpecStore:
                 for k in ("chat_id", "thread_id", "user_id", "session_key", "chat_type")
             },
         )
+        if renderer == "json":
+            rec["spec"] = spec
+        else:
+            rec.update(
+                openui=openui,
+                sources=sources,
+                openui_actions=openui_actions,
+            )
         with self.transaction() as data:
             for k in [k for k, v in data.items() if v["expires_at"] <= now]:
                 data.pop(k)
@@ -114,6 +146,8 @@ class SpecStore:
         with self.transaction() as data:
             rec = data.get(id)
             self.owned(rec, target)
+            if rec.get("renderer", "json") != "json":
+                raise SpecError("OpenUI views are replaced by saving a new named view")
             if rec["closed"] or rec["expires_at"] <= time.time():
                 raise SpecError("Mini App is closed or expired")
             if any(
@@ -151,8 +185,15 @@ class SpecStore:
                 self._write(data)
 
 
-def public_record(rec):
-    return {
+def public_record(rec, *, openui=None):
+    record = {
         k: copy.deepcopy(rec[k])
-        for k in ("id", "title", "spec", "revision", "closed", "expires_at", "results")
+        for k in ("id", "title", "revision", "closed", "expires_at", "results")
     }
+    renderer = rec.get("renderer", "json")
+    record["renderer"] = renderer
+    if renderer == "openui":
+        record["openui"] = copy.deepcopy(rec["openui"] if openui is None else openui)
+    else:
+        record["spec"] = copy.deepcopy(rec["spec"])
+    return record

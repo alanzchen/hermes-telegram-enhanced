@@ -2911,7 +2911,7 @@ def _miniapp_stop(only: Any = None) -> None:
 
 
 def _miniapp_register(ctx: Any) -> None:
-    """telegram_ui: JSON-spec Mini App views (miniapp/). Enabled only when HTE_MINIAPP_PUBLIC_URL and
+    """telegram_ui: JSON-spec and OpenUI Mini App views (miniapp/). Enabled only when HTE_MINIAPP_PUBLIC_URL and
     HTE_MINIAPP_PORT are set for this profile. The aiohttp server runs on its own long-lived loop thread."""
     try:
         from . import miniapp
@@ -2941,7 +2941,7 @@ def _miniapp_register(ctx: Any) -> None:
     _state["miniapp"] = ui
     ctx.register_tool(name="telegram_ui", toolset=TOOLSET, schema=ui.tool_schema,
                       handler=ui.tool_handler, check_fn=ui.check_requirements,
-                      description="JSON-driven Telegram Mini App views (decisions, forms, tables, charts, Gantt, flowcharts)",
+                      description="JSON and OpenUI Telegram Mini App views with authenticated read-only sources",
                       emoji="🧭")
     _miniapp_stop()  # previous generation releases the port before this one binds
     if not ui.enabled:

@@ -82,7 +82,19 @@ user, view binding, expiry, revision and the server-side action/value whitelist.
 The package exposes `miniapp.setup(...)` → `tool_schema`, `tool_handler`,
 `check_requirements()`, async `start()` / `stop()`, and `create_app()`. Integration details,
 callback payloads and the exact coordinator wiring are in `miniapp/INTEGRATION.md`; the
-model-facing schema is in `miniapp/CATALOG.md`, with a complete synthetic `miniapp/demo.json`.
+model-facing JSON catalog is in `miniapp/CATALOG.md`, the generative OpenUI contract is in
+`miniapp/OPENUI.md`, with a complete synthetic `miniapp/demo.json` for the legacy renderer.
+
+### Read-only generative views
+
+`telegram_ui` also supports vetted OpenUI Lang views. A view declares its renderer, named
+read-only data sources, and a fixed action allowlist. The model sees only source manifests;
+source values are fetched by the Mini App server after Telegram initData authentication and
+are interpolated into the OpenUI response for that browser only. `save` stores a named template
+without fetched data; `open_saved` launches it later and refreshes live data without generating
+a new UI. Finance sources are available only to the `default` and `coordinator` source profiles;
+`basecamp.projects` demonstrates a non-finance read-only provider. The local bundle is vendored
+as `miniapp/static/openui.{js,css}`—no CDN runtime dependency.
 
 Enable only after wiring gateway lifecycle and an HTTPS reverse proxy. Each gateway profile
 must explicitly set its own `HTE_MINIAPP_PORT` and `HTE_MINIAPP_PUBLIC_URL`; otherwise the

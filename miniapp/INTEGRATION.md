@@ -96,6 +96,7 @@ view and issue a new one if needed. Updates never silently clear successful clai
 | `HTE_MINIAPP_PORT` | Explicit unique TCP port. Example 8787; **required to enable**. No auto-binding every profile to 8787. |
 | `HTE_MINIAPP_HOST` | Bind host, default `127.0.0.1`. Set `0.0.0.0` only if container routing requires it; firewall to proxy. |
 | `HTE_MINIAPP_DIRECT_LINK` | Optional BotFather app URL `https://t.me/BotName/AppName` or configured main app `https://t.me/BotName`. Adds `startapp=<id>`. |
+| `HTE_MINIAPP_PROFILE` | Optional source-registry profile. Finance sources are exposed only for `default` or `coordinator`; if omitted, those URL path prefixes infer the matching profile. |
 
 Leave PUBLIC_URL or PORT unset to disable. Example profile allocation: coordinator 8787 at
 `https://hte-ui.cool.zenan.ch/coordinator`, ea 8788 at `/ea`, research 8789 at `/research`,
@@ -108,7 +109,7 @@ environment or gateway configuration.
 Proxy each prefixed route over the dedicated HTTPS origin:
 
 - GET `/m` — static shell; no spec or credentials embedded.
-- GET `/m/static/{app.js,renderer.js,layout.js,style.css}`.
+- GET `/m/static/{app.js,renderer.js,layout.js,style.css,openui.js,openui.css}`.
 - GET `/api/spec/<id>?id=<id>` — requires `Authorization: tma <Telegram.WebApp.initData>`.
 - POST `/api/action/<id>?id=<id>` — same auth, JSON body `{key,value,revision,request_id}`.
 

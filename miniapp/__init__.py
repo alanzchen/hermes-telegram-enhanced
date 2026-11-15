@@ -15,7 +15,17 @@ from urllib.parse import urlsplit, urlencode
 
 from aiohttp import web
 from .auth import AuthError, verify_init_data
-from .spec import SpecError, obj, text, validate_action
+from .genui import (
+    SavedViewStore,
+    hydrate_openui,
+    validate_bindings,
+    validate_button_action_types,
+    validate_openui_action,
+    validate_openui_actions,
+    validate_template,
+)
+from .sources import SourceError, SourceRegistry, default_registry
+from .spec import SpecError, obj, text, validate_action, validate_spec
 from .store import SpecStore, MAX_RESULTS, public_record
 
 LOG = logging.getLogger(__name__)
@@ -28,14 +38,15 @@ CSP = (
 TOOL_SCHEMA = {
     "name": "telegram_ui",
     "description": (
-        "Send/update/close a Telegram Mini App in the CURRENT chat/topic. Model writes versioned JSON DATA, "
-        "never HTML or JavaScript. Fixed catalog: heading, text (markdown bool), callout, kv, table, list, "
-        "checklist, choice, form, buttons, chart (line/bar/hbar/pie-lite), gantt, flow, timeline, image, "
-        "divider, tabs, section. Actions only send a new user event to this conversation; they execute "
-        "nothing. Never collect passwords, payment credentials or authentication codes; use telegram_secret. "
-        "Call action=catalog for exact field contracts and example. send needs title+spec; update needs "
-        "id+full replacement spec (not a patch). Existing one-time claims remain consumed after updates. "
-        "Use a new send to ask again. After sending interactive controls, end the turn and wait."
+    "Send, save, or reopen read-only Telegram Mini App views in the CURRENT chat/topic. "
+    "Legacy JSON specs remain supported. For generative UI use renderer=openui with an OpenUI Lang "
+    "description, a declared source list, {{alias.path}} placeholders, and an action allowlist. "
+    "catalog returns the local component grammar, saved views, and data-source manifests only—never "
+    "sensitive values. Source values are fetched only after Telegram initData authentication when a "
+    "page opens or refreshes. OpenUI buttons/forms only return a conversation event; they never execute "
+    "an operation. save stores a named template without data; open_saved creates a fresh expiring page "
+    "from it without generating a new UI. Never collect passwords, payment credentials or authentication "
+    "codes; use telegram_secret."
     ),
     "parameters": {
         "type": "object",
@@ -43,19 +54,34 @@ TOOL_SCHEMA = {
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["send", "update", "close", "catalog"],
+                "enum": ["send", "update", "close", "catalog", "save", "open_saved", "list_saved"],
             },
             "title": {"type": "string", "maxLength": 200},
+            "name": {"type": "string", "maxLength": 48},
+            "renderer": {"type": "string", "enum": ["json", "openui"]},
             "spec": {
                 "type": "object",
-                "description": "{version:1,components:[...]} — action=catalog documents each component.",
+                "description": "Legacy JSON renderer: {version:1,components:[...]}",
+            },
+            "openui": {
+                "type": "string",
+                "maxLength": 65536,
+                "description": "OpenUI Lang using only catalog components and {{alias.path}} source placeholders.",
+            },
+            "sources": {
+                "type": "array",
+                "description": "OpenUI only: [{alias,name,args}]. Values are never returned to the model.",
+            },
+            "actions": {
+                "type": "array",
+                "description": "OpenUI only: [{key,label,once?}]. Only declared actions may return to chat.",
             },
             "id": {"type": "string"},
             "expires_in": {
                 "type": "integer",
                 "minimum": 60,
                 "maximum": 86400,
-                "description": "send: TTL seconds, default 3600.",
+                "description": "send/open_saved: TTL seconds, default 3600.",
             },
         },
         "required": ["action"],
@@ -97,6 +123,7 @@ class MiniApp:
         current_target,
         send_message,
         env=None,
+        registry: SourceRegistry | None = None,
     ):
         env = os.environ if env is None else env
         self.ctx = ctx
@@ -104,13 +131,20 @@ class MiniApp:
         self.deliver_action = deliver_action
         self.current_target = current_target
         self.send_message = send_message
-        self.store = SpecStore(Path(state_dir) / "miniapps.json")
+        state_dir = Path(state_dir)
+        self.store = SpecStore(state_dir / "miniapps.json")
+        self.saved_views = SavedViewStore(state_dir / "miniapp-saved-views.json")
+        self.profile_name = env.get("HTE_MINIAPP_PROFILE", "")
+        self.registry = registry if registry is not None else default_registry()
         self.host = env.get("HTE_MINIAPP_HOST", "127.0.0.1")
         self.port = int(env.get("HTE_MINIAPP_PORT") or "8787")
         if not 1 <= self.port <= 65535:
             raise ValueError("HTE_MINIAPP_PORT must be 1–65535")
         self.public_url = env.get("HTE_MINIAPP_PUBLIC_URL", "").rstrip("/")
         self.direct_link = env.get("HTE_MINIAPP_DIRECT_LINK", "").rstrip("/")
+        if not self.profile_name and self.public_url:
+            inferred = urlsplit(self.public_url).path.lstrip("/")
+            self.profile_name = inferred if inferred in ("default", "coordinator") else ""
         # Explicit port is opt-in, avoiding four independently loaded profiles racing for one default.
         self.enabled = bool(self.public_url and env.get("HTE_MINIAPP_PORT"))
         if self.public_url:
@@ -138,12 +172,101 @@ class MiniApp:
     def check_requirements(self):
         return self.enabled and self._serving and bool(self.bot_token_getter())
 
+    def _template_from_args(self, args):
+        renderer = args.get("renderer", "json")
+        title = text(args.get("title"), "title", 200, False)
+        if renderer == "json":
+            if any(args.get(name) is not None for name in ("openui", "sources", "actions")):
+                raise SpecError("Legacy JSON views do not accept OpenUI fields")
+            return {"title": title, "renderer": "json", "spec": validate_spec(args.get("spec"))}
+        if renderer != "openui":
+            raise SpecError("renderer must be json or openui")
+        if args.get("spec") is not None:
+            raise SpecError("OpenUI views do not accept a JSON spec")
+        bindings = validate_bindings(args.get("sources"), self.registry, self.profile_name)
+        openui = validate_template(args.get("openui"), bindings)
+        actions = validate_openui_actions(args.get("actions"))
+        validate_button_action_types(openui, actions)
+        return {
+            "title": title,
+            "renderer": "openui",
+            "spec": None,
+            "openui": openui,
+            "sources": bindings,
+            "openui_actions": actions,
+        }
+
+    def _current_target(self):
+        target = self.current_target()
+        if isinstance(target, tuple):
+            target, error = target
+            if error:
+                raise SpecError(error)
+        if not target:
+            raise SpecError("Only available in a current Telegram conversation")
+        return target
+
+    def _launch(self, template, target, expires_in):
+        private = target.get("chat_type") in ("dm", "private") or (
+            not target.get("chat_type") and str(target.get("chat_id", "")).isdigit()
+        )
+        if not private and not self.direct_link:
+            raise SpecError("Group chats need HTE_MINIAPP_DIRECT_LINK configured in BotFather")
+        rec = self.store.create(
+            template.get("spec"),
+            template["title"],
+            target,
+            expires_in,
+            renderer=template["renderer"],
+            openui=template.get("openui"),
+            sources=template.get("sources", []),
+            openui_actions=template.get("openui_actions", []),
+        )
+        view_id = rec["id"]
+        url = self.public_url + "/m?" + urlencode({"id": view_id})
+        direct = self.direct_link + "?" + urlencode({"startapp": view_id}) if self.direct_link else None
+        button = {"text": "Open · " + rec["title"][:50]}
+        if private:
+            button["web_app"] = {"url": url}
+        else:
+            button["url"] = direct
+        rows = [[button]]
+        if private and direct:
+            rows.append([{"text": "Open via Telegram link", "url": direct}])
+        payload = {
+            "chat_id": int(target["chat_id"]),
+            "text": rec["title"],
+            "reply_markup": {"inline_keyboard": rows},
+            "disable_notification": False,
+        }
+        if target.get("thread_id"):
+            payload["message_thread_id"] = int(target["thread_id"])
+        try:
+            response = self.send_message(payload)
+        except Exception as exc:
+            self.store.close(view_id, target)
+            raise SpecError("Launch message failed; view closed (" + type(exc).__name__ + ")") from exc
+        if not response.get("ok") or not (response.get("result") or {}).get("message_id"):
+            self.store.close(view_id, target)
+            raise SpecError("Telegram rejected the launch message; view closed")
+        message_id = response["result"]["message_id"]
+        self.store.message(view_id, message_id)
+        return {
+            "success": True,
+            "id": view_id,
+            "message_id": message_id,
+            "url": url,
+            "direct_link": direct,
+            "expires_at": rec["expires_at"],
+            "renderer": rec["renderer"],
+        }
+
     def tool_handler(self, args, **_kw):
         try:
             obj(
                 args,
                 "arguments",
-                ("action", "title", "spec", "id", "expires_in"),
+                ("action", "title", "name", "renderer", "spec", "openui", "sources", "actions", "id", "expires_in"),
                 ("action",),
             )
             operation = args["action"]
@@ -152,117 +275,42 @@ class MiniApp:
                     {
                         "success": True,
                         "catalog": (Path(__file__).parent / "CATALOG.md").read_text(),
-                        "example": json.loads(
-                            (Path(__file__).parent / "demo.json").read_text()
-                        ),
+                        "example": json.loads((Path(__file__).parent / "demo.json").read_text()),
+                        "openui": (Path(__file__).parent / "OPENUI.md").read_text(),
+                        "sources": self.registry.manifest(self.profile_name),
+                        "saved_views": self.saved_views.manifest(),
                     },
                     ensure_ascii=False,
                 )
-            if not self.enabled:
-                raise SpecError(
-                    "Mini App disabled: configure HTE_MINIAPP_PUBLIC_URL and a unique HTE_MINIAPP_PORT for this profile"
-                )
-            if not self._serving:
-                raise SpecError(
-                    "Mini App listener is not running; no launch message sent"
-                )
-            target = self.current_target()
-            if isinstance(target, tuple):
-                target, error = target
-                if error:
-                    raise SpecError(error)
-            if not target:
-                raise SpecError("Only available in a current Telegram conversation")
-            if operation == "send":
-                private = target.get("chat_type") in ("dm", "private") or (
-                    not target.get("chat_type")
-                    and str(target.get("chat_id", "")).isdigit()
-                )
-                if not private and not self.direct_link:
-                    raise SpecError(
-                        "Group chats need HTE_MINIAPP_DIRECT_LINK configured in BotFather"
-                    )
-                rec = self.store.create(
-                    args.get("spec"),
-                    args.get("title"),
-                    target,
-                    args.get("expires_in", 3600),
-                )
-                id = rec["id"]
-                url = self.public_url + "/m?" + urlencode({"id": id})
-                direct = (
-                    self.direct_link + "?" + urlencode({"startapp": id})
-                    if self.direct_link
-                    else None
-                )
-                button = {"text": "Open · " + rec["title"][:50]}
-                if private:
-                    button["web_app"] = {"url": url}
-                else:
-                    button["url"] = direct
-                rows = [[button]]
-                if private and direct:
-                    rows.append([{"text": "Open via Telegram link", "url": direct}])
-                payload = {
-                    "chat_id": int(target["chat_id"]),
-                    "text": rec["title"],
-                    "reply_markup": {"inline_keyboard": rows},
-                    "disable_notification": False,
-                }
-                if target.get("thread_id"):
-                    payload["message_thread_id"] = int(target["thread_id"])
-                try:
-                    response = self.send_message(payload)
-                except Exception as exc:
-                    self.store.close(id, target)
-                    raise SpecError(
-                        "Launch message failed; view closed ("
-                        + type(exc).__name__
-                        + ")"
-                    ) from exc
-                if not response.get("ok") or not (response.get("result") or {}).get(
-                    "message_id"
-                ):
-                    self.store.close(id, target)
-                    raise SpecError("Telegram rejected the launch message; view closed")
-                mid = response["result"]["message_id"]
-                self.store.message(id, mid)
+            if operation == "list_saved":
+                return json.dumps({"success": True, "saved_views": self.saved_views.manifest()}, ensure_ascii=False)
+            if operation == "save":
+                template = self._template_from_args(args)
+                name = args.get("name")
+                stored = self.saved_views.save(name, template)
                 return json.dumps(
-                    {
-                        "success": True,
-                        "id": id,
-                        "message_id": mid,
-                        "url": url,
-                        "direct_link": direct,
-                        "expires_at": rec["expires_at"],
-                    }
+                    {"success": True, "name": stored["name"], "renderer": stored["renderer"], "title": stored["title"]},
+                    ensure_ascii=False,
                 )
+            if not self.enabled:
+                raise SpecError("Mini App disabled: configure HTE_MINIAPP_PUBLIC_URL and a unique HTE_MINIAPP_PORT for this profile")
+            if not self._serving:
+                raise SpecError("Mini App listener is not running; no launch message sent")
+            target = self._current_target()
+            if operation == "send":
+                return json.dumps(self._launch(self._template_from_args(args), target, args.get("expires_in", 3600)))
+            if operation == "open_saved":
+                return json.dumps(self._launch(self.saved_views.get(args.get("name")), target, args.get("expires_in", 3600)))
             if operation not in ("update", "close"):
                 raise SpecError("Unknown action")
             text(args.get("id"), "id", 48, False)
-            rec = (
-                self.store.update(args["id"], args.get("spec"), target)
-                if operation == "update"
-                else self.store.close(args["id"], target)
-            )
-            return json.dumps(
-                {
-                    "success": True,
-                    "id": rec["id"],
-                    "revision": rec["revision"],
-                    "closed": rec["closed"],
-                }
-            )
-        except (SpecError, ValueError, TypeError) as exc:
+            rec = self.store.update(args["id"], args.get("spec"), target) if operation == "update" else self.store.close(args["id"], target)
+            return json.dumps({"success": True, "id": rec["id"], "revision": rec["revision"], "closed": rec["closed"]})
+        except (SpecError, SourceError, ValueError, TypeError) as exc:
             return json.dumps({"success": False, "error": str(exc)})
         except Exception:
             LOG.exception("Mini App tool failed")
-            return json.dumps(
-                {
-                    "success": False,
-                    "error": "Mini App storage/transport failure; no success claimed",
-                }
-            )
+            return json.dumps({"success": False, "error": "Mini App storage/transport failure; no success claimed"})
 
     def _authenticate(self, request):
         id = request.match_info["id"]
@@ -284,9 +332,24 @@ class MiniApp:
             raise ApiError(410, "This view expired. Ask for a new one.")
         return rec, auth["user"]
 
+    async def _public_record(self, rec):
+        if rec.get("renderer", "json") != "openui":
+            return public_record(rec)
+        try:
+            openui = await asyncio.to_thread(
+                hydrate_openui,
+                rec["openui"],
+                rec.get("sources", []),
+                self.registry,
+                self.profile_name,
+            )
+        except SourceError as exc:
+            raise ApiError(503, "Live view data is unavailable. Reopen to refresh.") from exc
+        return public_record(rec, openui=openui)
+
     async def _spec(self, request):
         rec, _ = self._authenticate(request)
-        return web.json_response(public_record(rec))
+        return web.json_response(await self._public_record(rec))
 
     async def _action(self, request):
         initial, user = self._authenticate(request)
@@ -319,7 +382,11 @@ class MiniApp:
                     409,
                     "This view changed. Review the latest version before submitting.",
                 )
-            act = validate_action(rec["spec"], body["key"], body.get("value"))
+            act = (
+                validate_openui_action(rec, body["key"], body.get("value"))
+                if rec.get("renderer", "json") == "openui"
+                else validate_action(rec["spec"], body["key"], body.get("value"))
+            )
             fingerprint = json.dumps(
                 {"key": act["key"], "value": act["value"], "revision": rec["revision"]},
                 sort_keys=True,
@@ -417,7 +484,7 @@ class MiniApp:
                 raise ApiError(410, "View expired during submission")
             rec["results"][act["key"]]["status"] = outcome
             rec["receipts"][rid]["status"] = outcome
-            result = public_record(rec)
+            result_record = copy.deepcopy(rec)
         if outcome == "failed":
             raise ApiError(503, "Conversation delivery failed; retry this submission.")
         if outcome == "uncertain":
@@ -425,7 +492,7 @@ class MiniApp:
                 503,
                 "Conversation delivery is uncertain. Check the conversation; do not submit again.",
             )
-        return web.json_response({"ok": True, "record": result})
+        return web.json_response({"ok": True, "record": await self._public_record(result_record)})
 
     def create_app(self):
         @web.middleware
@@ -466,7 +533,7 @@ class MiniApp:
 
         async def static(request):
             name = request.match_info["name"]
-            if name not in ("app.js", "renderer.js", "layout.js", "style.css"):
+            if name not in ("app.js", "renderer.js", "layout.js", "style.css", "openui.js", "openui.css"):
                 raise web.HTTPNotFound()
             return web.Response(
                 body=(STATIC / name).read_bytes(),
@@ -537,6 +604,7 @@ def setup(
     current_target,
     send_message,
     env=None,
+    registry: SourceRegistry | None = None,
 ):
     """Return MiniApp; coordinator registers tool/lifecycle. No global state or startup side effects.
 
@@ -554,4 +622,5 @@ def setup(
         current_target=current_target,
         send_message=send_message,
         env=env,
+        registry=registry,
     )
