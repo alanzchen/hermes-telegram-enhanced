@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -17,6 +19,9 @@ from miniapp import setup
 from miniapp.genui import validate_bindings, validate_button_action_types, validate_openui_actions, validate_template
 from miniapp.sources import DataSource, SourceRegistry
 from test_miniapp import TARGET, TOKEN, signed
+
+
+FINANCE_SOURCES_PATH_ENV = "HTE_FINANCE_SOURCES_PATH"
 
 
 DASHBOARD = '''root = Card([header, tabs])
@@ -269,6 +274,7 @@ class FinanceDashboardTests(unittest.IsolatedAsyncioTestCase):
                 "HTE_MINIAPP_PUBLIC_URL": "https://ui.example.test/coordinator",
                 "HTE_MINIAPP_PORT": "8787",
                 "HTE_MINIAPP_PROFILE": "coordinator",
+                "HTE_MINIAPP_OWNER_USER_ID": "42",
             },
             registry=self.registry,
         )
@@ -437,37 +443,43 @@ class FinanceDashboardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.calls, [])
         catalog = json.loads(self.service.tool_handler({"action": "list_saved"}))
         self.assertEqual(catalog["saved_views"], [])
-    def test_live_saved_finance_dashboard_validates_against_schema_only_provider_manifest(self):
+    def test_live_saved_finance_dashboard_and_docs_examples_validate_against_schema_only_manifest(self):
         """This reads no ledger and never invokes finance_sources.py query."""
-        saved_path = Path("/opt/data/telegram-enhanced/miniapp-saved-views.json")
-        self.assertTrue(saved_path.is_file(), "the deployed finance-dashboard template must be present")
-        saved = json.loads(saved_path.read_text())
-        self.assertIn("finance-dashboard", saved)
-        view = saved["finance-dashboard"]
+        script = Path(
+            os.environ.get(FINANCE_SOURCES_PATH_ENV, "/opt/data/tools/plaid-finance-export/finance_sources.py")
+        )
+        if not script.is_file():
+            self.skipTest(f"finance provider script missing: set {FINANCE_SOURCES_PATH_ENV}")
         manifest = json.loads(
-            subprocess.check_output(
-                [sys.executable, "/opt/data/tools/plaid-finance-export/finance_sources.py", "describe"],
-                text=True,
-            )
+            subprocess.check_output([sys.executable, "-I", str(script), "describe"], text=True)
         )
         calls: list[dict] = []
         registry = SourceRegistry(
             [
                 DataSource(
-                    name=entry["name"],
-                    title=entry["title"],
-                    args_schema=entry["args"],
-                    output_schema=entry["output"],
-                    sensitivity="sensitive",
-                    profiles=("default", "coordinator"),
+                    name=entry["name"], title=entry["title"], args_schema=entry["args"],
+                    output_schema=entry["output"], sensitivity="sensitive", profiles=("default", "coordinator"),
                     query=lambda args: calls.append(args) or {},
                 )
                 for entry in manifest["sources"]
             ]
         )
-        bindings = validate_bindings(view["sources"], registry, "coordinator")
-        template = validate_template(view["openui"], bindings, registry, "coordinator")
-        validate_button_action_types(template, validate_openui_actions(view.get("openui_actions", [])))
+
+        saved_override = os.environ.get("HTE_MINIAPP_SAVED_VIEWS_PATH")
+        saved_path = Path(saved_override) if saved_override else script.parents[2] / "telegram-enhanced" / "miniapp-saved-views.json"
+        self.assertTrue(saved_path.is_file(), "the deployed finance-dashboard template must be present")
+        saved = json.loads(saved_path.read_text())
+        self.assertIn("finance-dashboard", saved)
+        examples = [saved["finance-dashboard"]]
+
+        docs = (Path(__file__).resolve().parents[1] / "miniapp" / "OPENUI.md").read_text(encoding="utf-8")
+        for match in re.finditer(r"```json\s*\n(.*?)\n```", docs, re.DOTALL):
+            examples.append(json.loads(match.group(1)))
+        self.assertGreaterEqual(len(examples), 3)
+        for view in examples:
+            bindings = validate_bindings(view["sources"], registry, "coordinator")
+            template = validate_template(view["openui"], bindings, registry, "coordinator")
+            validate_button_action_types(template, validate_openui_actions(view.get("actions", view.get("openui_actions", []))))
         self.assertEqual(calls, [])
 
 

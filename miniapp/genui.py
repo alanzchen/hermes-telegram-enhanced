@@ -98,9 +98,11 @@ class _OpenUITokenizer:
             if char.isdigit() or (char == "-" and self.index + 1 < len(self.source) and self.source[self.index + 1].isdigit()):
                 self._number()
                 continue
-            if char.isalpha() or char == "_":
+            if char == "_" or (char.isascii() and char.isalpha()):
                 self._identifier()
                 continue
+            if char.isalpha() or char == "_":
+                raise SpecError("openui: identifiers must use ASCII letters, digits, or _")
             raise SpecError("openui: unsupported syntax")
         self.tokens.append(_Token("EOF", None, len(self.source), len(self.source)))
         return self.tokens
@@ -130,8 +132,22 @@ class _OpenUITokenizer:
                     part = self.source[self.index : self.index + 4]
                     if len(part) != 4 or not re.fullmatch(r"[0-9a-fA-F]{4}", part):
                         raise SpecError("openui: invalid string escape")
-                    out.append(chr(int(part, 16)))
+                    code = int(part, 16)
                     self.index += 4
+                    if 0xD800 <= code <= 0xDBFF:
+                        low_prefix = self.source[self.index : self.index + 2]
+                        low_part = self.source[self.index + 2 : self.index + 6]
+                        if low_prefix != "\\u" or len(low_part) != 4 or not re.fullmatch(r"[0-9a-fA-F]{4}", low_part):
+                            raise SpecError("openui: invalid unicode surrogate pair")
+                        low = int(low_part, 16)
+                        if not 0xDC00 <= low <= 0xDFFF:
+                            raise SpecError("openui: invalid unicode surrogate pair")
+                        self.index += 6
+                        out.append(chr(0x10000 + ((code - 0xD800) << 10) + (low - 0xDC00)))
+                    elif 0xDC00 <= code <= 0xDFFF:
+                        raise SpecError("openui: invalid unicode surrogate pair")
+                    else:
+                        out.append(chr(code))
                 elif char in escapes:
                     out.append(escapes[char])
                 else:
@@ -146,6 +162,8 @@ class _OpenUITokenizer:
                 return
             if char in "\r\n":
                 raise SpecError("openui: unterminated string")
+            if 0xD800 <= ord(char) <= 0xDFFF:
+                raise SpecError("openui: invalid unicode surrogate pair")
             if char == "{" and self.index < len(self.source) and self.source[self.index] == "{":
                 raise SpecError("openui: source placeholders must be whole component values")
             out.append(char)
@@ -163,17 +181,31 @@ class _OpenUITokenizer:
     def _identifier(self) -> None:
         start = self.index
         match = re.match(r"[A-Za-z_][A-Za-z0-9_]*", self.source[self.index :])
-        assert match is not None
+        if match is None:
+            raise SpecError("openui: identifiers must use ASCII letters, digits, or _")
         value = match.group(0)
         self.index += len(value)
         self.tokens.append(_Token("IDENT", value, start, self.index))
 
 
 class _OpenUIParser:
+    MAX_DEPTH = 32
+
     def __init__(self, source: str):
         self.source = source
         self.tokens = _OpenUITokenizer(source).tokenize()
         self.index = 0
+        self.depth = 0
+
+    def _nested(self, parse):
+        self.depth += 1
+        if self.depth > self.MAX_DEPTH:
+            self.depth -= 1
+            raise SpecError("openui: maximum nesting depth is 32")
+        try:
+            return parse()
+        finally:
+            self.depth -= 1
 
     def parse(self) -> list[_Assignment]:
         assignments: list[_Assignment] = []
@@ -195,14 +227,14 @@ class _OpenUIParser:
             self.index += 1
             return _Node("number", token.value, start=token.start, end=token.end)
         if token.kind == "[":
-            return self._array()
+            return self._nested(self._array)
         if token.kind == "{":
-            return self._object()
+            return self._nested(self._object)
         if token.kind == "IDENT":
             self.index += 1
             name = str(token.value)
             if self._at("("):
-                return self._call(name, token.start)
+                return self._nested(lambda: self._call(name, token.start))
             if name in ("true", "false", "null"):
                 return _Node("literal", {"true": True, "false": False, "null": None}[name], start=token.start, end=token.end)
             return _Node("identifier", name, start=token.start, end=token.end)
@@ -585,20 +617,19 @@ def _validate_placeholder_positions(
     *,
     restricted: bool,
 ) -> None:
-    for assignment in assignments:
-        if assignment.value.kind == "placeholder":
-            raise SpecError("openui: source placeholders may not be assigned to variables")
+    """Only direct, allowlisted component arguments may contain placeholders."""
+    all_placeholders = {
+        id(node)
+        for assignment in assignments
+        for node in _placeholder_nodes(assignment.value)
+    }
+    approved: set[int] = set()
     for call in _call_nodes(assignments):
         name = str(call.value)
         args = call.children or []
-        if name == "Button" and _placeholder_nodes(call):
-            raise SpecError("openui: source placeholders may not be used in Button actions")
         for index, arg in enumerate(args):
-            placeholders = _non_call_placeholder_nodes(arg)
-            if not placeholders:
-                continue
             if arg.kind != "placeholder":
-                raise SpecError("openui: source placeholders must be whole component values")
+                continue
             if name in _INTERACTIVE_ITEMS_ARGS and index == _INTERACTIVE_ITEMS_ARGS[name]:
                 spec = _placeholder_for_node(arg)
                 if spec["kind"] != "items":
@@ -617,6 +648,9 @@ def _validate_placeholder_positions(
                 _schema_path(schemas[alias], ".".join(rest), "placeholder " + spec["path"]),
                 restricted=restricted and spec["kind"] == "items",
             )
+            approved.add(id(arg))
+    if all_placeholders != approved:
+        raise SpecError("openui: source placeholders must be direct allowlisted component arguments")
 
 
 def validate_template(openui: Any, bindings: list[dict[str, Any]], registry: SourceRegistry, profile: str) -> str:
@@ -674,11 +708,67 @@ def validate_button_action_types(template: str, actions: list[dict[str, Any]]) -
             _validate_button(call, allowed)
 
 
+def _static_option_values(node: _Node) -> set[str] | None:
+    if node.kind != "array":
+        return None
+    values: set[str] = set()
+    for item in node.children or []:
+        value = _object_value(item, "value")
+        if value is None or value.kind != "string":
+            return None
+        values.add(str(value.value))
+    return values
+
+
+def restricted_static_allowed_values(template: str, actions: list[dict[str, Any]], *, restricted: bool) -> dict[str, list[str | bool]]:
+    """Validate restricted action fields and record literal choice values server-side."""
+    if not restricted:
+        return {}
+    allowed: dict[str, set[str | bool]] = {}
+    dynamic_fields: set[str] = set()
+    free_text_fields: set[str] = set()
+    for call in _call_nodes(_program(template)):
+        name = str(call.value)
+        args = call.children or []
+        if not args or args[0].kind != "string":
+            continue
+        field = str(args[0].value)
+        if name in {"TextInput", "DateInput"}:
+            free_text_fields.add(field)
+        elif name == "Checkbox":
+            allowed.setdefault(field, set()).update({False, True})
+        elif name in _INTERACTIVE_ITEMS_ARGS:
+            index = _INTERACTIVE_ITEMS_ARGS[name]
+            if len(args) <= index:
+                continue
+            items = args[index]
+            if items.kind == "placeholder":
+                dynamic_fields.add(field)
+            else:
+                values = _static_option_values(items)
+                if values is not None:
+                    allowed.setdefault(field, set()).update(values)
+    for action in actions:
+        for field in action.get("fields", []):
+            if field in free_text_fields:
+                raise SpecError("Restricted views cannot submit TextInput or DateInput fields")
+            if field not in allowed and field not in dynamic_fields:
+                raise SpecError("Restricted action fields must use a declared choice or Checkbox control")
+    return {
+        field: sorted(values, key=lambda value: (type(value).__name__, str(value)))
+        for field, values in sorted(allowed.items())
+    }
+
+
 def _selected_form_fields(value: Any, fields: list[str]) -> dict[str, Any]:
     form = value.get("form") if isinstance(value, dict) else None
-    form_name = value.get("form_name") if isinstance(value, dict) else None
-    clean_form = {field: copy.deepcopy(form[field]) for field in fields if isinstance(form, dict) and field in form}
-    return {"form": clean_form, "form_name": form_name if isinstance(form_name, str) else None}
+    return {
+        "form": {
+            field: copy.deepcopy(form[field])
+            for field in fields
+            if isinstance(form, dict) and field in form
+        }
+    }
 
 
 def validate_openui_action(record: dict[str, Any], action_key: Any, value: Any) -> dict[str, Any]:
@@ -690,8 +780,7 @@ def validate_openui_action(record: dict[str, Any], action_key: Any, value: Any) 
     clean = _json_copy(value, "value")
     if len(json.dumps(clean, ensure_ascii=False, separators=(",", ":")).encode()) > 8192:
         raise SpecError("value: exceeds 8 KiB")
-    if "fields" in action:
-        clean = _selected_form_fields(clean, action["fields"])
+    clean = _selected_form_fields(clean, action.get("fields", []))
     allowed_values = record.get("openui_allowed_values")
     if allowed_values is not None:
         if not isinstance(allowed_values, dict):
@@ -699,14 +788,15 @@ def validate_openui_action(record: dict[str, Any], action_key: Any, value: Any) 
         for field in action.get("fields", []):
             allowed = allowed_values.get(field)
             submitted = clean["form"].get(field)
-            if not isinstance(allowed, list):
+            if not isinstance(allowed, list) or any(type(item) not in (str, bool) for item in allowed):
                 raise SpecError("This view must be reopened before submitting")
+            def is_allowed(item: Any) -> bool:
+                return any(type(item) is type(candidate) and item == candidate for candidate in allowed)
             if isinstance(submitted, list):
-                if any(type(item) is not str or item not in allowed for item in submitted):
+                if any(not is_allowed(item) for item in submitted):
                     raise SpecError("Submitted value is not available in this view")
-            elif submitted is not None:
-                if type(submitted) is not str or submitted not in allowed:
-                    raise SpecError("Submitted value is not available in this view")
+            elif submitted is not None and not is_allowed(submitted):
+                raise SpecError("Submitted value is not available in this view")
     return {
         "key": action["key"], "label": action["label"], "value": clean,
         "component_id": "openui", "kind": "openui", "once": action["once"],
@@ -884,7 +974,7 @@ def hydrate_openui(
         items = projected.get(id(node))
         if not isinstance(items, list) or any(not isinstance(item, dict) or type(item.get("value")) is not str for item in items):
             raise SourceError("Saved view data no longer matches its source contract")
-        allowed[field] = sorted({item["value"] for item in items})
+        allowed[field] = sorted(set(allowed.get(field, [])).union(item["value"] for item in items))
     return hydrated, allowed
 
 
@@ -896,6 +986,7 @@ class SavedViewStore:
         self.max_records = max_records
         self.lock = threading.RLock()
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.path.parent.chmod(0o700)
 
     def _read(self) -> dict[str, dict[str, Any]]:
         if not self.path.exists():
@@ -950,6 +1041,16 @@ class SavedViewStore:
             if not record:
                 raise SpecError("No saved view with that name")
             return copy.deepcopy(record)
+
+    def delete(self, name: str) -> None:
+        if not isinstance(name, str) or not VIEW_NAME.fullmatch(name):
+            raise SpecError("name: use 1–48 letters, digits, _ or -")
+        with self.lock:
+            records = self._read()
+            if name not in records:
+                raise SpecError("No saved view with that name")
+            records.pop(name)
+            self._write(records)
 
     def manifest(self) -> list[dict[str, Any]]:
         with self.lock:

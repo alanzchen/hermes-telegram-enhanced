@@ -3,6 +3,7 @@
 from __future__ import annotations
 import asyncio
 import copy
+import hashlib
 import inspect
 import json
 import logging
@@ -18,6 +19,7 @@ from .auth import AuthError, verify_init_data
 from .genui import (
     SavedViewStore,
     hydrate_openui,
+    restricted_static_allowed_values,
     validate_bindings,
     validate_button_action_types,
     validate_openui_action,
@@ -55,7 +57,7 @@ TOOL_SCHEMA = {
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["send", "update", "close", "catalog", "save", "open_saved", "list_saved"],
+                "enum": ["send", "update", "close", "catalog", "save", "open_saved", "delete_saved", "list_saved"],
             },
             "title": {"type": "string", "maxLength": 200},
             "name": {"type": "string", "maxLength": 48},
@@ -117,6 +119,20 @@ class ApiError(Exception):
         self.message = message
 
 
+def _owner_user_id(env) -> str | None:
+    explicit = str(env.get("HTE_MINIAPP_OWNER_USER_ID", "")).strip()
+    if explicit:
+        if not re.fullmatch(r"[1-9][0-9]{0,19}", explicit):
+            raise ValueError("HTE_MINIAPP_OWNER_USER_ID must be one positive Telegram user id")
+        return explicit
+    allowed = {item.strip() for item in str(env.get("TELEGRAM_ALLOWED_USERS", "")).split(",") if item.strip()}
+    if len(allowed) == 1:
+        candidate = next(iter(allowed))
+        if re.fullmatch(r"[1-9][0-9]{0,19}", candidate):
+            return candidate
+    return None
+
+
 class MiniApp:
     tool_schema = TOOL_SCHEMA
 
@@ -142,6 +158,7 @@ class MiniApp:
         self.store = SpecStore(state_dir / "miniapps.json")
         self.saved_views = SavedViewStore(state_dir / "miniapp-saved-views.json")
         self.profile_name = env.get("HTE_MINIAPP_PROFILE", "")
+        self.owner_user_id = _owner_user_id(env)
         self._provided_registry = registry
         self.host = env.get("HTE_MINIAPP_HOST", "127.0.0.1")
         self.port = int(env.get("HTE_MINIAPP_PORT") or "8787")
@@ -196,6 +213,10 @@ class MiniApp:
         openui = validate_template(args.get("openui"), bindings, self.registry, self.profile_name)
         actions = validate_openui_actions(args.get("actions"))
         validate_button_action_types(openui, actions)
+        restricted = any(
+            self.registry.sensitivity(binding["name"], self.profile_name) in {"private", "sensitive"}
+            for binding in bindings
+        )
         return {
             "title": title,
             "renderer": "openui",
@@ -203,10 +224,8 @@ class MiniApp:
             "openui": openui,
             "sources": bindings,
             "openui_actions": actions,
-            "sensitive_sources": any(
-                self.registry.sensitivity(binding["name"], self.profile_name) in {"private", "sensitive"}
-                for binding in bindings
-            ),
+            "static_allowed_values": restricted_static_allowed_values(openui, actions, restricted=restricted),
+            "sensitive_sources": restricted,
         }
 
     def _current_target(self):
@@ -220,10 +239,20 @@ class MiniApp:
         return target
 
     @staticmethod
-    def _is_private_owner_target(target):
+    def _is_private_target(target):
         return (
             target.get("chat_type") in ("dm", "private")
             and str(target.get("chat_id", "")) == str(target.get("user_id", ""))
+        )
+
+    def _is_private_owner_target(self, target):
+        return bool(
+            self.owner_user_id
+            and target.get("origin", "telegram") == "telegram"
+            and not target.get("guest_mode")
+            and not target.get("webhook")
+            and self._is_private_target(target)
+            and str(target.get("user_id", "")) == self.owner_user_id
         )
 
     def _validated_saved_template(self, saved):
@@ -247,8 +276,11 @@ class MiniApp:
         )
 
     def _launch(self, template, target, expires_in):
-        private = self._is_private_owner_target(target)
-        if not private and not self.direct_link:
+        private_chat = self._is_private_target(target)
+        private_owner = self._is_private_owner_target(target)
+        if template.get("sensitive_sources") and not private_owner:
+            raise SpecError("Restricted views require the configured owner in a private Telegram DM")
+        if not private_chat and not self.direct_link:
             raise SpecError("Group chats need HTE_MINIAPP_DIRECT_LINK configured in BotFather")
         rec = self.store.create(
             template.get("spec"),
@@ -260,17 +292,18 @@ class MiniApp:
             sources=template.get("sources", []),
             openui_actions=template.get("openui_actions", []),
             sensitive_sources=template.get("sensitive_sources", False),
+            static_allowed_values=template.get("static_allowed_values"),
         )
         view_id = rec["id"]
         url = self.public_url + "/m?" + urlencode({"id": view_id})
         direct = self.direct_link + "?" + urlencode({"startapp": view_id}) if self.direct_link else None
         button = {"text": "Open · " + rec["title"][:50]}
-        if private:
+        if private_chat:
             button["web_app"] = {"url": url}
         else:
             button["url"] = direct
         rows = [[button]]
-        if private and direct:
+        if private_chat and direct:
             rows.append([{"text": "Open via Telegram link", "url": direct}])
         payload = {
             "chat_id": int(target["chat_id"]),
@@ -323,6 +356,12 @@ class MiniApp:
                 )
             if operation == "list_saved":
                 return json.dumps({"success": True, "saved_views": self.saved_views.manifest()}, ensure_ascii=False)
+            if operation == "delete_saved":
+                target = self._current_target()
+                if not self._is_private_owner_target(target):
+                    raise SpecError("Deleting saved views is allowed only in the owner's private Telegram DM")
+                self.saved_views.delete(args.get("name"))
+                return json.dumps({"success": True, "name": args.get("name")}, ensure_ascii=False)
             if operation == "save":
                 target = self._current_target()
                 if not self._is_private_owner_target(target):
@@ -355,7 +394,7 @@ class MiniApp:
             LOG.exception("Mini App tool failed")
             return json.dumps({"success": False, "error": "Mini App storage/transport failure; no success claimed"})
 
-    def _authenticate(self, request):
+    async def _authenticate(self, request):
         id = request.match_info["id"]
         if not re.fullmatch(r"[A-Za-z0-9_-]{24}", id):
             raise AuthError("Invalid view id")
@@ -363,16 +402,22 @@ class MiniApp:
         raw = header[4:] if header.startswith("tma ") else ""
         # Verify the full Telegram HMAC before a potentially large state-store read.
         verify_init_data(raw, self.bot_token_getter(), user_id=None, spec_id=None)
-        rec = self.store.get(id)
+        rec = await asyncio.to_thread(self.store.get, id)
         if rec is None:
             raise AuthError("View unavailable; reopen its Telegram launch button")
+        restricted = self._has_sensitive_sources(rec)
+        expected_user_id = self.owner_user_id if restricted else rec["user_id"]
+        if restricted and not expected_user_id:
+            raise AuthError("Restricted views are unavailable without a configured owner")
         auth = verify_init_data(
             raw,
             self.bot_token_getter(),
-            user_id=rec["user_id"],
+            user_id=expected_user_id,
             spec_id=id,
             query_id=request.query.get("id"),
         )
+        if restricted and str(rec.get("user_id")) != self.owner_user_id:
+            raise AuthError("Restricted views are unavailable; reopen from the owner DM")
         if rec["expires_at"] <= time.time():
             raise ApiError(410, "This view expired. Ask for a new one.")
         return rec, auth["user"]
@@ -381,6 +426,12 @@ class MiniApp:
         if rec.get("renderer", "json") != "openui":
             return public_record(rec)
         try:
+            restricted = self._has_sensitive_sources(rec)
+            hydration = (
+                await asyncio.to_thread(self.store.begin_openui_hydration, rec["id"])
+                if restricted
+                else None
+            )
             openui, allowed_values = await asyncio.to_thread(
                 hydrate_openui,
                 rec["openui"],
@@ -389,14 +440,19 @@ class MiniApp:
                 self.profile_name,
                 collect_allowed_values=True,
             )
-            if self._has_sensitive_sources(rec):
-                await asyncio.to_thread(self.store.set_openui_allowed_values, rec["id"], allowed_values)
+            if hydration is not None:
+                await asyncio.to_thread(
+                    self.store.set_openui_allowed_values,
+                    rec["id"],
+                    allowed_values,
+                    hydration,
+                )
         except SourceError as exc:
             raise ApiError(503, "Live view data is unavailable. Reopen to refresh.") from exc
         return public_record(rec, openui=openui)
 
     async def _spec(self, request):
-        rec, _ = self._authenticate(request)
+        rec, _ = await self._authenticate(request)
         return web.json_response(await self._public_record(rec))
 
     def _has_sensitive_sources(self, rec):
@@ -434,39 +490,18 @@ class MiniApp:
             "once": action["once"],
         }
 
-    async def _action(self, request):
-        initial, user = self._authenticate(request)
-        if request.content_type != "application/json":
-            raise ApiError(415, "Use JSON")
-        try:
-            body = await request.json()
-        except (ValueError, UnicodeError):
-            raise SpecError("Invalid JSON")
-        obj(
-            body,
-            "action",
-            ("key", "value", "request_id", "revision"),
-            ("key", "request_id", "revision"),
-        )
-        rid = body["request_id"]
-        if not isinstance(rid, str) or not re.fullmatch(r"[A-Za-z0-9_-]{8,80}", rid):
-            raise SpecError("Invalid request_id")
-        if type(body["revision"]) is not int:
-            raise SpecError("revision must be an integer")
-        id = initial["id"]
-        now = time.time()
+    def _claim_action(self, id, body, user, now):
+        """Atomically persist an action claim off the aiohttp event loop."""
         retry_record = None
         payload = None
-        # Persist a claim BEFORE delivery; parallel requests cannot produce two events.
+        act = None
+        rid = body["request_id"]
         with self.store.transaction() as data:
             rec = data.get(id)
             if not rec or rec["closed"] or rec["expires_at"] <= now:
                 raise ApiError(410, "This view is closed or expired.")
             if rec["revision"] != body["revision"]:
-                raise ApiError(
-                    409,
-                    "This view changed. Review the latest version before submitting.",
-                )
+                raise ApiError(409, "This view changed. Review the latest version before submitting.")
             restricted = self._has_sensitive_sources(rec)
             if rec.get("renderer", "json") == "openui" and restricted and "openui_allowed_values" not in rec:
                 raise ApiError(409, "This view must be reopened before submitting.")
@@ -476,12 +511,12 @@ class MiniApp:
                 else validate_action(rec["spec"], body["key"], body.get("value"))
             )
             act = self._sensitive_chat_action(rec, raw_action) if restricted else raw_action
-            fingerprint = json.dumps(
-                {"key": raw_action["key"], "value": raw_action["value"], "revision": rec["revision"]},
-                sort_keys=True,
-                separators=(",", ":"),
-                ensure_ascii=False,
-            )
+            fingerprint = hashlib.sha256(
+                json.dumps(
+                    {"key": act["key"], "value": act["value"], "revision": rec["revision"]},
+                    sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+                ).encode("utf-8")
+            ).hexdigest()
             previous = rec["receipts"].get(rid)
             if previous:
                 if previous["fingerprint"] != fingerprint:
@@ -489,93 +524,85 @@ class MiniApp:
                 if previous["status"] == "recorded":
                     retry_record = copy.deepcopy(rec)
                 elif previous["status"] in ("pending", "uncertain"):
-                    raise ApiError(
-                        409,
-                        "Submission delivery is pending or uncertain. Do not submit again; check the conversation.",
-                    )
+                    raise ApiError(409, "Submission delivery is pending or uncertain. Do not submit again; check the conversation.")
             if retry_record is None:
                 for result in rec["results"].values():
                     same = result["key"] == act["key"]
-                    grouped = (
-                        act.get("group_once", False) or result.get("group_once", False)
-                    ) and result["component_id"] == act["component_id"]
+                    grouped = (act.get("group_once", False) or result.get("group_once", False)) and result["component_id"] == act["component_id"]
                     if result["status"] in ("pending", "uncertain") and (same or grouped):
                         raise ApiError(409, "Submission is pending or uncertain; check the conversation.")
                     if result["status"] == "recorded" and ((same and (act["once"] or result.get("once"))) or grouped):
                         raise ApiError(409, "Already submitted.")
                 if len(rec["receipts"]) >= MAX_RESULTS and not previous:
                     raise ApiError(429, "Submission limit reached; ask for a new view.")
-                result = dict(
-                    act,
-                    status="pending",
-                    request_id=rid,
-                    at=now,
-                    event_id=previous["event_id"] if previous else secrets.token_hex(16),
-                )
+                result = dict(act, status="pending", request_id=rid, at=now, event_id=previous["event_id"] if previous else secrets.token_hex(16))
                 rec["results"][act["key"]] = result
-                rec["receipts"][rid] = {
-                    "fingerprint": fingerprint,
-                    "status": "pending",
-                    "event_id": result["event_id"],
-                }
-                payload = {
-                    k: rec[k]
-                    for k in (
-                        "id", "title", "chat_id", "thread_id", "user_id", "session_key", "message_id", "revision",
-                    )
-                }
+                rec["receipts"][rid] = {"fingerprint": fingerprint, "status": "pending", "event_id": result["event_id"]}
+                payload = {k: rec[k] for k in ("id", "title", "chat_id", "thread_id", "user_id", "session_key", "message_id", "revision")}
                 payload.update(
-                    action=copy.deepcopy(act),
-                    event_id=result["event_id"],
-                    request_id=rid,
-                    text=injection_text(
-                        rec,
-                        act,
-                        user.get("first_name") or "user",
-                        sensitive=restricted,
-                    ),
+                    action=copy.deepcopy(act), event_id=result["event_id"], request_id=rid,
+                    text=injection_text(rec, act, user.get("first_name") or "user", sensitive=restricted),
                 )
-        if retry_record is not None:
-            return web.json_response({"ok": True, "record": await self._public_record(retry_record)})
-        outcome = "uncertain"
-        try:
-            if inspect.iscoroutinefunction(self.deliver_action):
-                accepted = await asyncio.wait_for(self.deliver_action(payload), 12)
-            else:
-                accepted = await asyncio.wait_for(
-                    asyncio.to_thread(self.deliver_action, payload), 12
-                )
-                if inspect.isawaitable(accepted):
-                    accepted = await asyncio.wait_for(accepted, 12)
-            outcome = (
-                "recorded"
-                if accepted is True
-                else ("failed" if accepted is False else "uncertain")
-            )
-        except asyncio.CancelledError:
-            # Claim remains pending across shutdown; fail closed rather than duplicate delivery.
-            raise
-        except Exception:
-            LOG.warning(
-                "Mini App event %s delivery uncertain",
-                payload["event_id"],
-                exc_info=True,
-            )
+        return retry_record, payload, act
+
+    def _finish_action(self, id, action_key, request_id, outcome):
         with self.store.transaction() as data:
             rec = data.get(id)
             if rec is None:
                 raise ApiError(410, "View expired during submission")
-            rec["results"][act["key"]]["status"] = outcome
-            rec["receipts"][rid]["status"] = outcome
-            result_record = copy.deepcopy(rec)
+            rec["results"][action_key]["status"] = outcome
+            rec["receipts"][request_id]["status"] = outcome
+            return copy.deepcopy(rec)
+
+    async def _action(self, request):
+        initial, user = await self._authenticate(request)
+        if request.content_type != "application/json":
+            raise ApiError(415, "Use JSON")
+        try:
+            body = await request.json()
+        except (ValueError, UnicodeError):
+            raise SpecError("Invalid JSON")
+        obj(body, "action", ("key", "value", "request_id", "revision"), ("key", "request_id", "revision"))
+        rid = body["request_id"]
+        if not isinstance(rid, str) or not re.fullmatch(r"[A-Za-z0-9_-]{8,80}", rid):
+            raise SpecError("Invalid request_id")
+        if type(body["revision"]) is not int:
+            raise SpecError("revision must be an integer")
+        retry_record, payload, act = await asyncio.to_thread(
+            self._claim_action, initial["id"], body, user, time.time()
+        )
+        if retry_record is not None:
+            return web.json_response({
+                "ok": True,
+                "record": public_record(retry_record, include_openui=False),
+            })
+        if payload is None or act is None:
+            raise RuntimeError("action claim did not produce a delivery payload")
+        outcome = "uncertain"
+        try:
+            if inspect.iscoroutinefunction(self.deliver_action):
+                accepted = await asyncio.wait_for(self.deliver_action(payload), 10)
+            else:
+                accepted = await asyncio.wait_for(asyncio.to_thread(self.deliver_action, payload), 10)
+                if inspect.isawaitable(accepted):
+                    accepted = await asyncio.wait_for(accepted, 10)
+            outcome = "recorded" if accepted is True else ("failed" if accepted is False else "uncertain")
+        except asyncio.CancelledError:
+            # Claim remains pending across shutdown; fail closed rather than duplicate delivery.
+            raise
+        except Exception:
+            LOG.warning("Mini App event %s delivery uncertain", payload["event_id"], exc_info=True)
+        result_record = await asyncio.to_thread(
+            self._finish_action, initial["id"], act["key"], rid, outcome
+        )
         if outcome == "failed":
             raise ApiError(503, "Conversation delivery failed; retry this submission.")
         if outcome == "uncertain":
-            raise ApiError(
-                503,
-                "Conversation delivery is uncertain. Check the conversation; do not submit again.",
-            )
-        return web.json_response({"ok": True, "record": await self._public_record(result_record)})
+            raise ApiError(503, "Conversation delivery is uncertain. Check the conversation; do not submit again.")
+        return web.json_response({
+            "ok": True,
+            "record": public_record(result_record, include_openui=False),
+        })
 
     def create_app(self):
         @web.middleware
@@ -611,7 +638,11 @@ class MiniApp:
 
         async def shell(request):
             view_id = request.query.get("id", "")
-            record = self.store.get(view_id) if re.fullmatch(r"[A-Za-z0-9_-]{24}", view_id) else None
+            record = (
+                await asyncio.to_thread(self.store.get, view_id)
+                if re.fullmatch(r"[A-Za-z0-9_-]{24}", view_id)
+                else None
+            )
             response = web.Response(
                 body=(STATIC / "index.html").read_bytes(), content_type="text/html"
             )

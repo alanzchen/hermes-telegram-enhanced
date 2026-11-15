@@ -341,12 +341,15 @@ class PublicUrlTests(unittest.TestCase):
         script = (repo / "miniapp/static/app.js").read_text()
         page = "https://hte-ui.cool.zenan.ch/research/m"
         self.assertNotIn('"/m/static/', html)
-        for asset in ("style.css", "layout.js", "renderer.js", "openui.css", "openui.js", "app.js"):
+        for asset in ("layout.js", "renderer.js", "openui.js", "app.js"):
             self.assertIn(f'm/static/{asset}', html)
             self.assertEqual(
                 urljoin(page, f"m/static/{asset}"),
                 f"https://hte-ui.cool.zenan.ch/research/m/static/{asset}",
             )
+        self.assertIn("openui.css", script)
+        self.assertIn("style.css", script)
+        self.assertIn("m/static/", script)
         self.assertNotIn("request('/api/", script)
         self.assertIn("request('api/spec/", script)
         self.assertIn("request('api/action/", script)

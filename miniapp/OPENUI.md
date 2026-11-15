@@ -30,7 +30,7 @@
 | Form | Result |
 | --- | --- |
 | `{{rows|pluck:field}}` | An array of one declared field. |
-| `{{rows|table:name,amount@money:USD:2}}` | A table matrix. Per-field formatters use `@`. |
+| `{{rows|table:key,amount@money:USD:2}}` | A table matrix. Per-field formatters use `@`. |
 | `{{rows|items:id,merchant,date|date,amount@money:USD:2,card}}` | Checkbox/select items: `{value,label,description}`. The optional 1–3 description fields are joined with ` · `. `field|date` is accepted for the compact description form. |
 | `{{rows|list:title,due@date:MM/DD,balance@money:USD:2,status@map:...,status@map:...}}` | Mobile row objects: title, subtitle, trailing value, badge, and optional badge tone. |
 | `{{overview.data.cash|money}}` | USD with two decimals by default. |
@@ -54,7 +54,7 @@ cards = List({{cards.rows|list:
 
 ## Complete Chinese synthetic finance dashboard
 
-This example is intentionally synthetic. It is the shape used by the phone regression harness; it does not call `finance_sources.py` or expose account values. The `categories` binding is a synthetic source registered by the test harness.
+This example is intentionally synthetic. It is the shape used by the phone regression harness; it does not call `finance_sources.py` or expose account values.
 
 ```json
 {
@@ -62,7 +62,7 @@ This example is intentionally synthetic. It is the shape used by the phone regre
   "name": "finance-dashboard",
   "title": "财务总览",
   "renderer": "openui",
-  "openui": "root = Card([header, tabs])\nheader = CardHeader(\"财务总览\", \"合成演示数据\")\ncash = Stat(\"可用现金\", {{overview.data.cash|money}}, \"含待入账\", \"success\")\nbalance = Stat(\"信用卡余额\", {{overview.data.card_balance|money:USD:2}}, \"本期账单\", \"danger\")\ndue = Stat(\"14 天内待还\", {{overview.data.due_next_14d|money}}, \"下个到期日\", \"warning\")\nalerts = Stat(\"待确认\", {{overview.data.alerts}}, \"需要复核\", \"warning\")\nmetrics = Grid([cash, balance, due, alerts], 2)\nsync = Text({{overview.data.last_sync_local|date:MM/DD}}, \"small\")\ncards = List({{cards.rows|list:card,due@date:MM/DD,statement_balance@money:USD:2,status@map:paid_full=已还清,unpaid=未还,paid_partial=部分还款,no_balance=无欠款,status@map:paid_full=success,unpaid=warning,paid_partial=warning,no_balance=secondary}})\nchart = BarChart({{spending.rows|pluck:key}}, {{spending.rows|pluck:amount}}, \"近三月消费\", \"money\")\ncategories = Table([\"类别\", \"金额\", \"笔数\"], {{spending_by_category.rows|table:category,amount@money:USD:2,count}})\nreview = CheckboxGroup(\"transaction_ids\", {{review_queue.rows|items:transaction_id,merchant,date|date,amount@money:USD:2,card}})\nsubmit = Button(\"提交确认\", {type: \"submit_review\", fields: [\"transaction_ids\"]})\nreviewForm = Form(\"review\", [review, submit])\ntabs = Tabs([{value: \"overview\", trigger: \"概览\", content: [metrics, sync]}, {value: \"cards\", trigger: \"卡款\", content: [cards]}, {value: \"spending\", trigger: \"消费\", content: [chart, categories]}, {value: \"review\", trigger: \"待确认\", content: [reviewForm]}], \"overview\")",
+  "openui": "root = Card([header, tabs])\nheader = CardHeader(\"财务总览\", \"合成演示数据\")\ncash = Stat(\"可用现金\", {{overview.data.cash|money}}, \"含待入账\", \"success\")\nbalance = Stat(\"信用卡余额\", {{overview.data.card_balance|money:USD:2}}, \"本期账单\", \"danger\")\ndue = Stat(\"14 天内待还\", {{overview.data.due_next_14d|money}}, \"下个到期日\", \"warning\")\nalerts = Stat(\"待确认\", {{overview.data.alerts}}, \"需要复核\", \"warning\")\nmetrics = Grid([cash, balance, due, alerts], 2)\nsync = Text({{overview.data.last_sync_local|date:MM/DD}}, \"small\")\ncards = List({{cards.rows|list:card,due@date:MM/DD,statement_balance@money:USD:2,status@map:paid_full=已还清,unpaid=未还,paid_partial=部分还款,no_balance=无欠款,status@map:paid_full=success,unpaid=warning,paid_partial=warning,no_balance=secondary}})\nchart = BarChart({{spending.rows|pluck:key}}, {{spending.rows|pluck:amount}}, \"近三月消费\", \"money\")\ncategories = Table([\"类别\", \"金额\", \"笔数\"], {{spending_by_category.rows|table:key,amount@money:USD:2,count}})\nreview = CheckboxGroup(\"transaction_ids\", {{review_queue.rows|items:transaction_id,merchant,date|date,amount@money:USD:2,card}})\nsubmit = Button(\"提交确认\", {type: \"submit_review\", fields: [\"transaction_ids\"]})\nreviewForm = Form(\"review\", [review, submit])\ntabs = Tabs([{value: \"overview\", trigger: \"概览\", content: [metrics, sync]}, {value: \"cards\", trigger: \"卡款\", content: [cards]}, {value: \"spending\", trigger: \"消费\", content: [chart, categories]}, {value: \"review\", trigger: \"待确认\", content: [reviewForm]}], \"overview\")",
   "sources": [
     {"alias": "overview", "name": "finance.overview", "args": {}},
     {"alias": "cards", "name": "finance.cards", "args": {}},
@@ -107,7 +107,7 @@ For a sensitive view, `fields: ["transaction_ids"]` strips the emitted event dow
 
 ## Theme, CSP, and assets
 
-The vendored renderer is local: `openui.js` and `openui.css`. It loads no CDN assets and contains no `eval` or `new Function` calls. The host keeps Telegram theme values in non-rendering provided variables, then copies only values that pass foreground/surface/button contrast checks into `--openui-safe-*`; no inline script and no CSP relaxation are required.
+The host loads `openui.css` only for OpenUI views and `style.css` only for legacy views. OpenUI variables and base styles are scoped to the OpenUI container, so legacy theme variables remain untouched. Telegram theme values live in non-rendering provided variables, then only values that pass foreground/card-surface/button contrast checks are copied into `--openui-safe-*`; no inline script and no CSP relaxation are required.
 
 The stylesheet chooses light/dark mode from the host's `data-theme` attribute (including Tailwind's `dark:` variant) and falls back to its own accessible palettes when a Telegram color is absent or fails validation. Its system stack includes `PingFang SC`, `Hiragino Sans GB`, `Microsoft YaHei`, and `Noto Sans CJK SC` for readable Chinese typography.
 

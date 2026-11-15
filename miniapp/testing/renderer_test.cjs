@@ -39,6 +39,12 @@ const style={setProperty:(k,v)=>styleValues[k]=v,removeProperty:k=>delete styleV
 const doc={getElementById:id=>{if(!elements.has(id))elements.set(id,new Node('div'));return elements.get(id);},documentElement:{dataset:{},style},addEventListener(){}};
 const context={window:{Telegram:{WebApp:{initData:'',colorScheme:'light',themeParams:{bg_color:'#000000',text_color:'#ffffff',button_color:'#ffffff',button_text_color:'#ffffff'},ready(){},expand(){},onEvent(){}}}},document:doc,location:{search:''},URLSearchParams,matchMedia:()=>({matches:false}),getComputedStyle:()=>({getPropertyValue:k=>({'--surface':'#ffffff','--soft':'#e9f1ff','--muted':'#566477'}[k]||'')})};
 vm.runInNewContext(fs.readFileSync(require.resolve('../static/app.js'),'utf8'),context);
-assert.notEqual(styleValues['--text'],'#ffffff','do not create white text on fixed white surfaces');
-assert.equal(styleValues['--accent'],undefined,'white-on-white button theme must fall back');
-console.log('PASS: hostile theme colors retain contrasting fallback pairs.');
+assert.equal(styleValues['--openui-safe-background'],undefined,'hostile text must not be copied onto the fallback card surface');
+assert.equal(styleValues['--openui-safe-foreground'],undefined,'hostile text must not be copied onto the fallback card surface');
+assert.equal(styleValues['--openui-safe-primary'],undefined,'white-on-white button theme must fall back');
+const openuiCss=fs.readFileSync(require.resolve('../static/openui.css'),'utf8');
+const legacyCss=fs.readFileSync(require.resolve('../static/style.css'),'utf8');
+assert.ok(openuiCss.includes('.openui-miniapp'),'OpenUI CSS must be rooted at its container');
+assert.equal(openuiCss.includes(':root'),false,'OpenUI CSS must not mutate root variables');
+assert.ok(legacyCss.includes('--accent:#1b5cbd'),'legacy theme tokens stay in the legacy stylesheet');
+console.log('PASS: hostile theme colors use safe variables; OpenUI CSS is scoped and legacy tokens are isolated.');

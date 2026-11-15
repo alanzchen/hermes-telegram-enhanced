@@ -22,6 +22,7 @@ class SpecStore:
         self.max_records = max_records
         self.lock = threading.RLock()
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.path.parent.chmod(0o700)
 
     def _read(self):
         if not self.path.exists():
@@ -87,6 +88,7 @@ class SpecStore:
         sources=(),
         openui_actions=(),
         sensitive_sources=False,
+        static_allowed_values=None,
     ):
         if renderer == "json":
             spec = validate_spec(spec)
@@ -101,6 +103,15 @@ class SpecStore:
             openui_actions = validate_openui_actions(list(openui_actions))
             if type(sensitive_sources) is not bool:
                 raise SpecError("OpenUI source sensitivity must be boolean")
+            if static_allowed_values is None:
+                static_allowed_values = {}
+            if not isinstance(static_allowed_values, dict) or any(
+                not isinstance(name, str)
+                or not isinstance(items, list)
+                or any(type(item) not in (str, bool) for item in items)
+                for name, items in static_allowed_values.items()
+            ):
+                raise SpecError("OpenUI static action values are invalid")
         else:
             raise SpecError("Unknown Mini App renderer")
         text(title, "title", 200, False)
@@ -134,6 +145,8 @@ class SpecStore:
                 sources=sources,
                 openui_actions=openui_actions,
                 sensitive_sources=sensitive_sources,
+                openui_static_allowed_values=copy.deepcopy(static_allowed_values),
+                openui_hydration=0,
             )
         with self.transaction() as data:
             for k in [k for k, v in data.items() if v["expires_at"] <= now]:
@@ -145,19 +158,42 @@ class SpecStore:
             data[rec["id"]] = rec
         return copy.deepcopy(rec)
 
-    def set_openui_allowed_values(self, id, values):
+    def begin_openui_hydration(self, id):
+        with self.transaction() as data:
+            rec = data.get(id)
+            if rec is None or rec.get("renderer") != "openui":
+                raise SpecError("Mini App view is unavailable")
+            rec["openui_hydration"] = int(rec.get("openui_hydration", 0)) + 1
+            return rec["openui_hydration"]
+
+    def set_openui_allowed_values(self, id, values, hydration):
         if not isinstance(values, dict) or any(
             not isinstance(name, str)
             or not isinstance(items, list)
-            or any(type(item) is not str for item in items)
+            or any(type(item) not in (str, bool) for item in items)
             for name, items in values.items()
-        ):
+        ) or type(hydration) is not int or hydration < 1:
             raise SpecError("OpenUI action values are invalid")
         with self.transaction() as data:
             rec = data.get(id)
             if rec is None or rec.get("renderer") != "openui":
                 raise SpecError("Mini App view is unavailable")
-            rec["openui_allowed_values"] = copy.deepcopy(values)
+            if hydration != rec.get("openui_hydration"):
+                return False
+            static = rec.get("openui_static_allowed_values", {})
+            if not isinstance(static, dict):
+                raise SpecError("OpenUI action values are invalid")
+            merged: dict[str, list[str | bool]] = {}
+            for field in set(static).union(values):
+                current = list(static.get(field, [])) + list(values.get(field, []))
+                if any(type(item) not in (str, bool) for item in current):
+                    raise SpecError("OpenUI action values are invalid")
+                unique = {(type(item).__name__, item) for item in current}
+                merged[field] = [
+                    item for _, item in sorted(unique, key=lambda item: (item[0], str(item[1])))
+                ]
+            rec["openui_allowed_values"] = merged
+            return True
 
     def update(self, id, spec, target):
         spec = validate_spec(spec)
@@ -203,7 +239,7 @@ class SpecStore:
                 self._write(data)
 
 
-def public_record(rec, *, openui=None):
+def public_record(rec, *, openui=None, include_openui=True):
     record = {
         k: copy.deepcopy(rec[k])
         for k in ("id", "title", "revision", "closed", "expires_at", "results")
@@ -211,7 +247,8 @@ def public_record(rec, *, openui=None):
     renderer = rec.get("renderer", "json")
     record["renderer"] = renderer
     if renderer == "openui":
-        record["openui"] = copy.deepcopy(rec["openui"] if openui is None else openui)
+        if include_openui:
+            record["openui"] = copy.deepcopy(rec["openui"] if openui is None else openui)
     else:
         record["spec"] = copy.deepcopy(rec["spec"])
     return record

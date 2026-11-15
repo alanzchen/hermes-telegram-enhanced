@@ -185,7 +185,8 @@ class SourceRegistry:
             raise SourceError("Data source is temporarily unavailable") from exc
 
 
-def _run_json(command: list[str], *, timeout: int = 15) -> Any:
+def _run_json(command: list[str], *, timeout: int = 8) -> Any:
+    """Run a provider inside the 11-second OpenUI hydration window and reap it on timeout."""
     environment = {
         key: os.environ[key]
         for key in ("HOME", "PATH", "LANG", "TZ")
@@ -193,21 +194,25 @@ def _run_json(command: list[str], *, timeout: int = 15) -> Any:
     }
     environment["BASECAMP_NONINTERACTIVE"] = "1"
     try:
-        completed = subprocess.run(
+        process = subprocess.Popen(
             command,
-            check=False,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             text=True,
-            timeout=timeout,
             env=environment,
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
+        try:
+            stdout, _ = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
+            process.kill()
+            process.communicate()
+            raise SourceError("Data source is temporarily unavailable") from exc
+    except OSError as exc:
         raise SourceError("Data source is temporarily unavailable") from exc
-    if completed.returncode:
+    if process.returncode:
         raise SourceError("Data source is temporarily unavailable")
     try:
-        return json.loads(completed.stdout)
+        return json.loads(stdout)
     except (TypeError, ValueError) as exc:
         raise SourceError("Data source returned invalid JSON") from exc
 
@@ -288,7 +293,7 @@ def _basecamp_source() -> DataSource:
                         "type": "object",
                         "required": ["id", "name", "description", "status"],
                         "properties": {
-                            "id": {"type": "string"},
+                            "id": {"type": "string", "x-opaque-id": True},
                             "name": {"type": "string"},
                             "description": {"type": "string"},
                             "status": {"type": "string"},

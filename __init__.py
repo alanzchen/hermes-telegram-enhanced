@@ -111,7 +111,16 @@ def _int_or_str(value: str) -> Any:
     return int(value) if str(value).lstrip("-").isdigit() else value
 
 
-def _webhook_target() -> tuple[dict[str, str] | None, str | None]:
+def _guest_topic_marker(user_id: str, thread_id: str) -> bool:
+    """Return whether this is the private topic reserved for Guest Mode intake."""
+    try:
+        topics = (_state.get("meta").get("guest_topic") or {})
+    except Exception:
+        return False
+    return isinstance(topics, dict) and str(topics.get(str(user_id), "")) == str(thread_id or "")
+
+
+def _webhook_target() -> tuple[dict[str, Any] | None, str | None]:
     """A webhook run whose route delivers to a Telegram chat posts into that chat/topic.
 
     Button presses are injected into that topic's own Telegram session (the webhook run has
@@ -135,21 +144,24 @@ def _webhook_target() -> tuple[dict[str, str] | None, str | None]:
     key = f"agent:{profile}:telegram:{'dm' if is_dm else 'group'}:{chat_id}" + (f":{thread}" if thread else "")
     return {"chat_id": chat_id, "thread_id": thread, "session_key": key,
             "user_id": chat_id if is_dm else "", "chat_type": "dm" if is_dm else "group",
-            "message_id": "", "user_name": ""}, None
+            "message_id": "", "user_name": "", "origin": "webhook", "webhook": True}, None
 
 
-def _current_target() -> tuple[dict[str, str] | None, str | None]:
+def _current_target() -> tuple[dict[str, Any] | None, str | None]:
     platform = (_session("HERMES_SESSION_PLATFORM") or "").lower()
     chat_id = _session("HERMES_SESSION_CHAT_ID")
     if platform == "webhook":
         return _webhook_target()
     if platform != "telegram" or not chat_id:
         return None, "only works inside a Telegram conversation"
+    thread_id = _session("HERMES_SESSION_THREAD_ID")
+    user_id = _session("HERMES_SESSION_USER_ID")
     return {
-        "chat_id": chat_id, "thread_id": _session("HERMES_SESSION_THREAD_ID"),
-        "session_key": _session("HERMES_SESSION_KEY"), "user_id": _session("HERMES_SESSION_USER_ID"),
+        "chat_id": chat_id, "thread_id": thread_id,
+        "session_key": _session("HERMES_SESSION_KEY"), "user_id": user_id,
         "chat_type": _session("HERMES_SESSION_CHAT_TYPE"), "message_id": _session("HERMES_SESSION_MESSAGE_ID"),
-        "user_name": _session("HERMES_SESSION_USER_NAME"),
+        "user_name": _session("HERMES_SESSION_USER_NAME"), "origin": "telegram",
+        "guest_mode": _guest_topic_marker(user_id, thread_id),
     }, None
 
 
