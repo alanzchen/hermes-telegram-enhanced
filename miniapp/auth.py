@@ -46,18 +46,19 @@ def verify_init_data(
         if stamp > now + 30 or now - stamp > max_age:
             raise ValueError("stale auth_date")
         user = json.loads(fields["user"])
-        if (
+        if user_id is not None and (
             not isinstance(user, dict)
             or type(user.get("id")) is not int
             or user["id"] <= 0
             or str(user["id"]) != str(user_id)
         ):
             raise ValueError("wrong user")
-        if "start_param" in fields:
-            if fields["start_param"] != spec_id:
-                raise ValueError("wrong spec")
-        elif query_id != spec_id:
-            raise ValueError("missing spec binding")
+        if spec_id is not None:
+            if "start_param" in fields:
+                if fields["start_param"] != spec_id:
+                    raise ValueError("wrong spec")
+            elif query_id != spec_id:
+                raise ValueError("missing spec binding")
         return dict(fields, user=user)
     except (ValueError, TypeError, KeyError, UnicodeError) as exc:
         raise AuthError(

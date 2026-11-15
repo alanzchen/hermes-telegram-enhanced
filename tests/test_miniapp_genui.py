@@ -94,6 +94,8 @@ class OpenUIAssetTests(unittest.TestCase):
         app = (static / "app.js").read_text()
         self.assertIn("event.value??null", app)
         self.assertIn("record?.renderer!=='openui'", app)
+        self.assertIn("expiresAt:next.expires_at*1000", app)
+        self.assertIn("results:next.results||{}", app)
         for component in ("Stat", "Grid", "List", "CheckboxGroup"):
             self.assertIn(component, bundle)
         for affordance in ("bar-chart", "form-hint", "tab-list"):
@@ -102,9 +104,14 @@ class OpenUIAssetTests(unittest.TestCase):
         self.assertIn("sticky", bundle)
         css = (static / "openui.css").read_text()
         self.assertIn("PingFang SC", css)
-        self.assertIn("--tg-theme-bg-color", css)
+        self.assertIn("openui-safe-background", css)
+        self.assertNotIn("--tg-theme-", css)
+        self.assertIn("data-theme=dark", css)
         self.assertIn("safe-area-inset-left", css)
         self.assertIn("openui-stat-tone-success", css)
+        legacy_css = (static / "style.css").read_text()
+        self.assertIn("main ul:not(.checklist){list-style:disc}", legacy_css)
+        self.assertIn("main ol{list-style:decimal}", legacy_css)
 
 
 class SavedOpenUIViewTests(unittest.IsolatedAsyncioTestCase):
@@ -112,7 +119,7 @@ class SavedOpenUIViewTests(unittest.IsolatedAsyncioTestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.sent = []
         self.events = []
-        self.values = iter(("first synthetic value", "second synthetic value", "third synthetic value"))
+        self.values = iter(("first synthetic value", "second synthetic value", "third synthetic value", "fourth synthetic value"))
         self.fetches = 0
 
         def fetch(_args):
@@ -230,12 +237,34 @@ class SavedOpenUIViewTests(unittest.IsolatedAsyncioTestCase):
             },
         )
         self.assertEqual(response.status, 200, await response.text())
+        action_result = await response.json()
+        self.assertIn('"third synthetic value"', action_result["record"]["openui"])
+        retry = await self.client.post(
+            "/api/action/" + opened["id"],
+            headers=headers,
+            json={
+                "key": "refresh",
+                "value": {
+                    "params": {"source": "synthetic"},
+                    "form": {"profile": {"name": "Synthetic team"}},
+                    "form_name": "profile",
+                },
+                "request_id": "openui-refresh-123",
+                "revision": 1,
+            },
+        )
+        self.assertEqual(retry.status, 200, await retry.text())
+        self.assertIn('"fourth synthetic value"', (await retry.json())["record"]["openui"])
         self.assertEqual(len(self.events), 1)
-        self.assertEqual(self.events[0]["action"]["kind"], "openui")
-        self.assertEqual(self.events[0]["action"]["label"], "Refresh")
         self.assertEqual(
-            self.events[0]["action"]["value"]["form"]["profile"]["name"],
-            "Synthetic team",
+            self.events[0]["action"],
+            {
+                "key": "refresh",
+                "value": {"form": {}},
+                "component_id": "openui",
+                "kind": "openui",
+                "once": True,
+            },
         )
 
     async def test_source_placeholder_is_rejected_from_an_openui_action_value(self):
@@ -271,7 +300,7 @@ class SavedOpenUIViewTests(unittest.IsolatedAsyncioTestCase):
             )
         )
         self.assertFalse(result["success"])
-        self.assertIn("whole values", result["error"])
+        self.assertIn("whole component values", result["error"])
         self.assertEqual(self.fetches, 0)
 
     async def test_button_type_requires_an_allowlisted_action(self):

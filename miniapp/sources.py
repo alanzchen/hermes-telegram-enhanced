@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 import re
 import subprocess
+import sys
 from typing import Any, Callable
 
 
@@ -50,51 +51,73 @@ def _matches_type(value: Any, expected: str) -> bool:
     }.get(expected, False)
 
 
+def _bound(schema: dict[str, Any], name: str) -> int | float | None:
+    if name not in schema:
+        return None
+    value = schema[name]
+    if type(value) not in (int, float):
+        raise SourceError("Data source schema is invalid")
+    return value
+
+
 def validate_schema(value: Any, schema: dict[str, Any], path: str = "value") -> None:
     """Small JSON Schema subset used for source input/output contracts."""
     if not isinstance(schema, dict):
         raise SourceError("Data source schema is invalid")
-    if "enum" in schema and value not in schema["enum"]:
-        raise SourceError(f"{path} is not an allowed value")
+    if "enum" in schema:
+        enum = schema["enum"]
+        if not isinstance(enum, list) or not any(type(item) is type(value) and item == value for item in enum):
+            raise SourceError(f"{path} is not an allowed value")
     types = schema.get("type")
     if types is not None:
         types = [types] if isinstance(types, str) else types
-        if not isinstance(types, list) or not any(
-            isinstance(item, str) and _matches_type(value, item) for item in types
-        ):
+        if not isinstance(types, list) or not types or not all(isinstance(item, str) for item in types):
+            raise SourceError("Data source schema is invalid")
+        if not any(_matches_type(value, item) for item in types):
             raise SourceError(f"{path} has the wrong type")
     if isinstance(value, dict):
         properties = schema.get("properties", {})
         if not isinstance(properties, dict):
             raise SourceError("Data source schema is invalid")
         required = schema.get("required", [])
-        if not isinstance(required, list) or any(key not in value for key in required):
+        if not isinstance(required, list) or any(not isinstance(key, str) for key in required):
+            raise SourceError("Data source schema is invalid")
+        if any(key not in value for key in required):
             raise SourceError(f"{path} is missing a required field")
-        if schema.get("additionalProperties") is False:
-            extra = set(value) - set(properties)
-            if extra:
-                raise SourceError(f"{path} has unknown fields")
+        additional = schema.get("additionalProperties", True)
+        if additional is not True and additional is not False and not isinstance(additional, dict):
+            raise SourceError("Data source schema is invalid")
         for key, item in value.items():
             child = properties.get(key)
+            if child is None:
+                if additional is False:
+                    raise SourceError(f"{path} has unknown fields")
+                child = additional if isinstance(additional, dict) else None
             if child is not None:
                 validate_schema(item, child, f"{path}.{key}")
     elif isinstance(value, list):
-        if "maxItems" in schema and len(value) > schema["maxItems"]:
+        maximum = _bound(schema, "maxItems")
+        minimum = _bound(schema, "minItems")
+        if maximum is not None and len(value) > maximum:
             raise SourceError(f"{path} has too many items")
-        if "minItems" in schema and len(value) < schema["minItems"]:
+        if minimum is not None and len(value) < minimum:
             raise SourceError(f"{path} has too few items")
         if isinstance(schema.get("items"), dict):
             for i, item in enumerate(value):
                 validate_schema(item, schema["items"], f"{path}[{i}]")
     elif isinstance(value, str):
-        if "maxLength" in schema and len(value) > schema["maxLength"]:
+        maximum = _bound(schema, "maxLength")
+        minimum = _bound(schema, "minLength")
+        if maximum is not None and len(value) > maximum:
             raise SourceError(f"{path} is too long")
-        if "minLength" in schema and len(value) < schema["minLength"]:
+        if minimum is not None and len(value) < minimum:
             raise SourceError(f"{path} is too short")
     elif type(value) in (int, float):
-        if "minimum" in schema and value < schema["minimum"]:
+        minimum = _bound(schema, "minimum")
+        maximum = _bound(schema, "maximum")
+        if minimum is not None and value < minimum:
             raise SourceError(f"{path} is below the minimum")
-        if "maximum" in schema and value > schema["maximum"]:
+        if maximum is not None and value > maximum:
             raise SourceError(f"{path} is above the maximum")
 
 
@@ -163,8 +186,12 @@ class SourceRegistry:
 
 
 def _run_json(command: list[str], *, timeout: int = 15) -> Any:
-    environment = os.environ.copy()
-    environment.setdefault("BASECAMP_NONINTERACTIVE", "1")
+    environment = {
+        key: os.environ[key]
+        for key in ("HOME", "PATH", "LANG", "TZ")
+        if key in os.environ
+    }
+    environment["BASECAMP_NONINTERACTIVE"] = "1"
     try:
         completed = subprocess.run(
             command,
@@ -186,15 +213,15 @@ def _run_json(command: list[str], *, timeout: int = 15) -> Any:
 
 
 def _finance_query(name: str, args: dict[str, Any]) -> dict[str, Any]:
-    script = "/opt/data/tools/plaid-finance-export/finance_sources.py"
-    return _run_json(["python3", script, "query", name, json.dumps(args, ensure_ascii=False)])
+    script = os.environ.get("HTE_FINANCE_SOURCES_SCRIPT", "/opt/data/tools/plaid-finance-export/finance_sources.py")
+    return _run_json([sys.executable, script, "query", name, json.dumps(args, ensure_ascii=False)])
 
 
 @lru_cache(maxsize=1)
 def _finance_sources() -> tuple[DataSource, ...]:
     """Load only the finance provider's schema-only manifest, never account values."""
-    script = "/opt/data/tools/plaid-finance-export/finance_sources.py"
-    described = _run_json(["python3", script, "describe"])
+    script = os.environ.get("HTE_FINANCE_SOURCES_SCRIPT", "/opt/data/tools/plaid-finance-export/finance_sources.py")
+    described = _run_json([sys.executable, script, "describe"])
     entries = described.get("sources", []) if isinstance(described, dict) else []
     if not isinstance(entries, list):
         raise SourceError("Finance manifest is invalid")
@@ -274,15 +301,19 @@ def _basecamp_source() -> DataSource:
         },
         sensitivity="private",
         query=_basecamp_projects,
+        profiles=("default", "coordinator", "research"),
     )
 
 
-def default_registry() -> SourceRegistry:
-    """Built-in sources; an unavailable optional provider is omitted rather than faked."""
-    sources = [_basecamp_source()]
-    try:
-        sources.extend(_finance_sources())
-    except SourceError:
-        # Finance values are never substituted with a plausible fake; the source simply is unavailable.
-        pass
+def default_registry(profile: str | None = None) -> SourceRegistry:
+    """Built-in sources; finance never starts for profiles that cannot use it."""
+    sources = []
+    if profile in (None, "default", "coordinator", "research"):
+        sources.append(_basecamp_source())
+    if profile in (None, "default", "coordinator"):
+        try:
+            sources.extend(_finance_sources())
+        except SourceError:
+            # Finance values are never substituted with a plausible fake; the source simply is unavailable.
+            pass
     return SourceRegistry(sources)

@@ -145,6 +145,20 @@ class SpecStore:
             data[rec["id"]] = rec
         return copy.deepcopy(rec)
 
+    def set_openui_allowed_values(self, id, values):
+        if not isinstance(values, dict) or any(
+            not isinstance(name, str)
+            or not isinstance(items, list)
+            or any(type(item) is not str for item in items)
+            for name, items in values.items()
+        ):
+            raise SpecError("OpenUI action values are invalid")
+        with self.transaction() as data:
+            rec = data.get(id)
+            if rec is None or rec.get("renderer") != "openui":
+                raise SpecError("Mini App view is unavailable")
+            rec["openui_allowed_values"] = copy.deepcopy(values)
+
     def update(self, id, spec, target):
         spec = validate_spec(spec)
         with self.transaction() as data:

@@ -489,6 +489,19 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(shell.status, 200)
         self.assertNotIn("unsafe-inline", shell.headers["Content-Security-Policy"])
         self.assertIn("default-src 'self'", shell.headers["Content-Security-Policy"])
+        self.assertIn("img-src https: data:", shell.headers["Content-Security-Policy"])
+        openui = self.service.store.create(
+            None,
+            "OpenUI",
+            TARGET,
+            60,
+            renderer="openui",
+            openui='root = Card(Text("Synthetic"))',
+            sources=[],
+            openui_actions=[],
+        )
+        openui_shell = await self.client.get("/m?id=" + str(openui["id"]))
+        self.assertIn("img-src 'self' data:", openui_shell.headers["Content-Security-Policy"])
         self.assertEqual(
             (await self.client.get("/api/spec/" + self.rec["id"])).status, 401
         )

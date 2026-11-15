@@ -190,9 +190,7 @@ async def main():
                         assert not await page.evaluate("window.pwned||false")
                         assert await page.locator("#app img").count() == 0
                         service.store.close(rec["id"], TARGET)
-                        await page.get_by_text(
-                            "Closed · no further submissions", exact=True
-                        ).wait_for(timeout=8000)
+                        await page.get_by_text("Closed", exact=True).wait_for(timeout=8000)
                         assert (
                             await page.locator(
                                 "button[data-action]:not(:disabled)"

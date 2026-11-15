@@ -18,7 +18,7 @@
 }
 ```
 
-- `save` stores the template only and does **not** fetch source data.
+- `save` stores the template only and does **not** fetch source data. It is available only in the owner's private DM; names are capped and replacing an existing name requires `overwrite: true`.
 - `open_saved` creates a fresh expiring Mini App launch view from a saved name.
 - `send` creates a one-off view with the same fields.
 - Source placeholders are whole values: `{{alias.path}}`. The server inserts JSON literals only after Telegram `initData` authentication.
@@ -35,7 +35,7 @@
 | `{{rows|list:title,due@date:MM/DD,balance@money:USD:2,status@map:...,status@map:...}}` | Mobile row objects: title, subtitle, trailing value, badge, and optional badge tone. |
 | `{{overview.data.cash|money}}` | USD with two decimals by default. |
 | `{{row.date|date:MM/DD}}` | Month/day date. `date` is also accepted for item descriptions. |
-| `{{row.apr|percent:1}}` | A percentage; fractional and percent-point source values are both accepted. |
+| `{{row.apr|percent:1}}` | A percentage in percentage points (for example `7.5` → `7.5%`). Use `ratio` for fractions (for example `0.075` → `8%`). |
 | `{{row.status|map:paid_full=已还清,unpaid=未还,paid_partial=部分还款,no_balance=无欠款}}` | Maps a declared string enum to display text. |
 
 `map:` is deliberately strict: the source property must declare a string `enum`, and the map must cover **exactly** the declared enum values. Invalid, missing, or extra enum keys reject the view before it is saved. `money`, `percent`, and `date` render `null` as `—`.
@@ -62,12 +62,12 @@ This example is intentionally synthetic. It is the shape used by the phone regre
   "name": "finance-dashboard",
   "title": "财务总览",
   "renderer": "openui",
-  "openui": "root = Card([header, tabs])\nheader = CardHeader(\"财务总览\", \"合成演示数据\")\ncash = Stat(\"可用现金\", {{overview.data.cash|money}}, \"含待入账\", \"success\")\nbalance = Stat(\"信用卡余额\", {{overview.data.card_balance|money:USD:2}}, \"本期账单\", \"danger\")\ndue = Stat(\"14 天内待还\", {{overview.data.due_next_14d|money}}, \"下个到期日\", \"warning\")\nalerts = Stat(\"待确认\", {{overview.data.alerts}}, \"需要复核\", \"warning\")\nmetrics = Grid([cash, balance, due, alerts], 2)\nsync = Text({{overview.data.last_sync_local|date:MM/DD}}, \"small\")\ncards = List({{cards.rows|list:card,due@date:MM/DD,statement_balance@money:USD:2,status@map:paid_full=已还清,unpaid=未还,paid_partial=部分还款,no_balance=无欠款,status@map:paid_full=success,unpaid=warning,paid_partial=warning,no_balance=secondary}})\nchart = BarChart({{spending.rows|pluck:key}}, {{spending.rows|pluck:amount}}, \"近三月消费\", \"money\")\ncategories = Table([\"类别\", \"金额\", \"笔数\"], {{categories.rows|table:category,amount@money:USD:2,count}})\nreview = CheckboxGroup(\"transaction_ids\", {{review_queue.rows|items:transaction_id,merchant,date|date,amount@money:USD:2,card}})\nsubmit = Button(\"提交确认\", {type: \"submit_review\", fields: [\"transaction_ids\"]})\nreviewForm = Form(\"review\", [review, submit])\ntabs = Tabs([{value: \"overview\", trigger: \"概览\", content: [metrics, sync]}, {value: \"cards\", trigger: \"卡款\", content: [cards]}, {value: \"spending\", trigger: \"消费\", content: [chart, categories]}, {value: \"review\", trigger: \"待确认\", content: [reviewForm]}], \"overview\")",
+  "openui": "root = Card([header, tabs])\nheader = CardHeader(\"财务总览\", \"合成演示数据\")\ncash = Stat(\"可用现金\", {{overview.data.cash|money}}, \"含待入账\", \"success\")\nbalance = Stat(\"信用卡余额\", {{overview.data.card_balance|money:USD:2}}, \"本期账单\", \"danger\")\ndue = Stat(\"14 天内待还\", {{overview.data.due_next_14d|money}}, \"下个到期日\", \"warning\")\nalerts = Stat(\"待确认\", {{overview.data.alerts}}, \"需要复核\", \"warning\")\nmetrics = Grid([cash, balance, due, alerts], 2)\nsync = Text({{overview.data.last_sync_local|date:MM/DD}}, \"small\")\ncards = List({{cards.rows|list:card,due@date:MM/DD,statement_balance@money:USD:2,status@map:paid_full=已还清,unpaid=未还,paid_partial=部分还款,no_balance=无欠款,status@map:paid_full=success,unpaid=warning,paid_partial=warning,no_balance=secondary}})\nchart = BarChart({{spending.rows|pluck:key}}, {{spending.rows|pluck:amount}}, \"近三月消费\", \"money\")\ncategories = Table([\"类别\", \"金额\", \"笔数\"], {{spending_by_category.rows|table:category,amount@money:USD:2,count}})\nreview = CheckboxGroup(\"transaction_ids\", {{review_queue.rows|items:transaction_id,merchant,date|date,amount@money:USD:2,card}})\nsubmit = Button(\"提交确认\", {type: \"submit_review\", fields: [\"transaction_ids\"]})\nreviewForm = Form(\"review\", [review, submit])\ntabs = Tabs([{value: \"overview\", trigger: \"概览\", content: [metrics, sync]}, {value: \"cards\", trigger: \"卡款\", content: [cards]}, {value: \"spending\", trigger: \"消费\", content: [chart, categories]}, {value: \"review\", trigger: \"待确认\", content: [reviewForm]}], \"overview\")",
   "sources": [
     {"alias": "overview", "name": "finance.overview", "args": {}},
     {"alias": "cards", "name": "finance.cards", "args": {}},
     {"alias": "spending", "name": "finance.spending", "args": {"group_by": "month", "days": 120, "limit": 6}},
-    {"alias": "categories", "name": "finance.categories", "args": {"days": 120, "limit": 5}},
+    {"alias": "spending_by_category", "name": "finance.spending", "args": {"group_by": "category", "days": 120, "limit": 5}},
     {"alias": "review_queue", "name": "finance.review_queue", "args": {"days": 45}}
   ],
   "actions": [
@@ -76,7 +76,7 @@ This example is intentionally synthetic. It is the shape used by the phone regre
 }
 ```
 
-For a sensitive view, `fields: ["transaction_ids"]` strips the emitted event down to `form.transaction_ids`. `CheckboxGroup` stores an array of selected option values, so labels, descriptions, merchant names, card names, and UI-only fields never cross back to chat. A Button with `fields` is disabled with a short hint until every listed field has a value; a `CheckboxGroup` therefore needs at least one checked item.
+For a sensitive view, `fields: ["transaction_ids"]` strips the emitted event down to `form.transaction_ids`; static action parameters are stripped as well. `CheckboxGroup` stores an array of selected option values, so labels, descriptions, merchant names, card names, and UI-only fields never cross back to chat. A Button with `fields` is disabled with a short hint until every listed field has a value. To allow clearing a group such as autopay, pass `true` as `CheckboxGroup`’s fourth positional argument (`allowEmpty`); the empty array is then valid for its form button.
 
 ## Component subset
 
@@ -86,7 +86,7 @@ For a sensitive view, `fields: ["transaction_ids"]` strips the emitted event dow
 - `Stat(label, value, hint?, tone?)` — clear KPI hierarchy with tabular numbers. Tones: `success`, `warning`, `danger`, plus neutral tones; tinted states retain AA label/value contrast in light and dark themes.
 - `List(items)` — mobile row cards. Item shape: `{title, subtitle?, trailing?, badge?, badgeTone?}`.
 - `Text(text, size?)` — `small`, `default`, or `large`.
-- `Markdown(text)`
+- `Markdown(text)` — static display Markdown only; links and images are unwrapped rather than rendered.
 - `Alert(title, description, variant?)` — `default` or `destructive`.
 - `Badge(text, variantOrToneMap?)` — supports normal tones and a mapping such as `Badge(statusLabel, {\"已还清\": \"success\", \"未还\": \"warning\"})`.
 - `Separator()`
@@ -96,10 +96,10 @@ For a sensitive view, `fields: ["transaction_ids"]` strips the emitted event dow
 - `Accordion(items)` — item `{value, trigger, content}`.
 - `Tabs(items, defaultValue?)` — item `{value, trigger, content}`; the tab list remains at the top while long tab content scrolls.
 - `Form(name, fields)` — direct submit buttons expand to a usable full phone width.
-- `TextInput(name, placeholder?, type?)`
+- `TextInput(name, placeholder?, type?)` — updates its form value on every input event.
 - `Select(name, items, placeholder?)`
 - `Checkbox(name, label)`
-- `CheckboxGroup(name, items, checked?)` — multi-selects value IDs only; items may have a description line. It starts unchecked unless `checked` supplies selected IDs.
+- `CheckboxGroup(name, items, checked?, allowEmpty?)` — multi-selects value IDs only; items may have a description line. It starts unchecked unless `checked` supplies selected IDs. A fourth positional `true` permits its containing form button to submit an empty selection.
 - `RadioGroup(name, items)`
 - `DateInput(name, label?)`
 - `Button(label, {type, params?, fields?}, variant?)`
@@ -107,8 +107,8 @@ For a sensitive view, `fields: ["transaction_ids"]` strips the emitted event dow
 
 ## Theme, CSP, and assets
 
-The vendored renderer is local: `openui.js` and `openui.css`. It loads no CDN assets and contains no `eval` or `new Function` calls. The host maps `Telegram.WebApp.themeParams` to CSS variables (`bg`, `secondary_bg`, `text`, `hint`, and button colors) from external app code; no inline script and no CSP relaxation are required.
+The vendored renderer is local: `openui.js` and `openui.css`. It loads no CDN assets and contains no `eval` or `new Function` calls. The host keeps Telegram theme values in non-rendering provided variables, then copies only values that pass foreground/surface/button contrast checks into `--openui-safe-*`; no inline script and no CSP relaxation are required.
 
-The stylesheet follows Telegram variables when supplied and falls back to system light/dark colors. Its system stack includes `PingFang SC`, `Hiragino Sans GB`, `Microsoft YaHei`, and `Noto Sans CJK SC` for readable Chinese typography.
+The stylesheet chooses light/dark mode from the host's `data-theme` attribute (including Tailwind's `dark:` variant) and falls back to its own accessible palettes when a Telegram color is absent or fails validation. Its system stack includes `PingFang SC`, `Hiragino Sans GB`, `Microsoft YaHei`, and `Noto Sans CJK SC` for readable Chinese typography.
 
 Drawers, dialogs/popovers, mutations, queries, URL actions, raw code, `@` directives, `$` bindings, arbitrary components, and URL opening are rejected before a view can be stored.

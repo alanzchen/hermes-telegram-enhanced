@@ -35,6 +35,7 @@ CSP = (
     "img-src https: data:; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; "
     "frame-ancestors 'self' https://web.telegram.org https://*.telegram.org https://t.me"
 )
+OPENUI_CSP = CSP.replace("img-src https: data:", "img-src 'self' data:")
 TOOL_SCHEMA = {
     "name": "telegram_ui",
     "description": (
@@ -82,6 +83,10 @@ TOOL_SCHEMA = {
                 "minimum": 60,
                 "maximum": 86400,
                 "description": "send/open_saved: TTL seconds, default 3600.",
+            },
+            "overwrite": {
+                "type": "boolean",
+                "description": "save only: replace an existing private saved view with the same name.",
             },
         },
         "required": ["action"],
@@ -137,7 +142,7 @@ class MiniApp:
         self.store = SpecStore(state_dir / "miniapps.json")
         self.saved_views = SavedViewStore(state_dir / "miniapp-saved-views.json")
         self.profile_name = env.get("HTE_MINIAPP_PROFILE", "")
-        self.registry = registry if registry is not None else default_registry()
+        self._provided_registry = registry
         self.host = env.get("HTE_MINIAPP_HOST", "127.0.0.1")
         self.port = int(env.get("HTE_MINIAPP_PORT") or "8787")
         if not 1 <= self.port <= 65535:
@@ -147,6 +152,8 @@ class MiniApp:
         if not self.profile_name and self.public_url:
             inferred = urlsplit(self.public_url).path.lstrip("/")
             self.profile_name = inferred if inferred in ("default", "coordinator") else ""
+        self.registry = self._provided_registry if self._provided_registry is not None else default_registry(self.profile_name)
+        del self._provided_registry
         # Explicit port is opt-in, avoiding four independently loaded profiles racing for one default.
         self.enabled = bool(self.public_url and env.get("HTE_MINIAPP_PORT"))
         if self.public_url:
@@ -197,7 +204,7 @@ class MiniApp:
             "sources": bindings,
             "openui_actions": actions,
             "sensitive_sources": any(
-                self.registry.sensitivity(binding["name"], self.profile_name) == "sensitive"
+                self.registry.sensitivity(binding["name"], self.profile_name) in {"private", "sensitive"}
                 for binding in bindings
             ),
         }
@@ -212,10 +219,35 @@ class MiniApp:
             raise SpecError("Only available in a current Telegram conversation")
         return target
 
-    def _launch(self, template, target, expires_in):
-        private = target.get("chat_type") in ("dm", "private") or (
-            not target.get("chat_type") and str(target.get("chat_id", "")).isdigit()
+    @staticmethod
+    def _is_private_owner_target(target):
+        return (
+            target.get("chat_type") in ("dm", "private")
+            and str(target.get("chat_id", "")) == str(target.get("user_id", ""))
         )
+
+    def _validated_saved_template(self, saved):
+        if not isinstance(saved, dict):
+            raise SpecError("Saved view is invalid")
+        renderer = saved.get("renderer", "json")
+        if renderer == "json":
+            return self._template_from_args(
+                {"title": saved.get("title"), "renderer": "json", "spec": saved.get("spec")}
+            )
+        if renderer != "openui":
+            raise SpecError("Saved view is invalid")
+        return self._template_from_args(
+            {
+                "title": saved.get("title"),
+                "renderer": "openui",
+                "openui": saved.get("openui"),
+                "sources": saved.get("sources"),
+                "actions": saved.get("openui_actions"),
+            }
+        )
+
+    def _launch(self, template, target, expires_in):
+        private = self._is_private_owner_target(target)
         if not private and not self.direct_link:
             raise SpecError("Group chats need HTE_MINIAPP_DIRECT_LINK configured in BotFather")
         rec = self.store.create(
@@ -273,7 +305,7 @@ class MiniApp:
             obj(
                 args,
                 "arguments",
-                ("action", "title", "name", "renderer", "spec", "openui", "sources", "actions", "id", "expires_in"),
+                ("action", "title", "name", "renderer", "spec", "openui", "sources", "actions", "id", "expires_in", "overwrite"),
                 ("action",),
             )
             operation = args["action"]
@@ -292,9 +324,12 @@ class MiniApp:
             if operation == "list_saved":
                 return json.dumps({"success": True, "saved_views": self.saved_views.manifest()}, ensure_ascii=False)
             if operation == "save":
+                target = self._current_target()
+                if not self._is_private_owner_target(target):
+                    raise SpecError("Saving views is allowed only in the owner's private Telegram DM")
                 template = self._template_from_args(args)
                 name = args.get("name")
-                stored = self.saved_views.save(name, template)
+                stored = self.saved_views.save(name, template, overwrite=args.get("overwrite", False))
                 return json.dumps(
                     {"success": True, "name": stored["name"], "renderer": stored["renderer"], "title": stored["title"]},
                     ensure_ascii=False,
@@ -307,7 +342,8 @@ class MiniApp:
             if operation == "send":
                 return json.dumps(self._launch(self._template_from_args(args), target, args.get("expires_in", 3600)))
             if operation == "open_saved":
-                return json.dumps(self._launch(self.saved_views.get(args.get("name")), target, args.get("expires_in", 3600)))
+                saved = self.saved_views.get(args.get("name"))
+                return json.dumps(self._launch(self._validated_saved_template(saved), target, args.get("expires_in", 3600)))
             if operation not in ("update", "close"):
                 raise SpecError("Unknown action")
             text(args.get("id"), "id", 48, False)
@@ -323,11 +359,13 @@ class MiniApp:
         id = request.match_info["id"]
         if not re.fullmatch(r"[A-Za-z0-9_-]{24}", id):
             raise AuthError("Invalid view id")
+        header = request.headers.get("Authorization", "")
+        raw = header[4:] if header.startswith("tma ") else ""
+        # Verify the full Telegram HMAC before a potentially large state-store read.
+        verify_init_data(raw, self.bot_token_getter(), user_id=None, spec_id=None)
         rec = self.store.get(id)
         if rec is None:
             raise AuthError("View unavailable; reopen its Telegram launch button")
-        header = request.headers.get("Authorization", "")
-        raw = header[4:] if header.startswith("tma ") else ""
         auth = verify_init_data(
             raw,
             self.bot_token_getter(),
@@ -343,13 +381,16 @@ class MiniApp:
         if rec.get("renderer", "json") != "openui":
             return public_record(rec)
         try:
-            openui = await asyncio.to_thread(
+            openui, allowed_values = await asyncio.to_thread(
                 hydrate_openui,
                 rec["openui"],
                 rec.get("sources", []),
                 self.registry,
                 self.profile_name,
+                collect_allowed_values=True,
             )
+            if self._has_sensitive_sources(rec):
+                await asyncio.to_thread(self.store.set_openui_allowed_values, rec["id"], allowed_values)
         except SourceError as exc:
             raise ApiError(503, "Live view data is unavailable. Reopen to refresh.") from exc
         return public_record(rec, openui=openui)
@@ -361,13 +402,10 @@ class MiniApp:
     def _has_sensitive_sources(self, rec):
         if rec.get("renderer", "json") != "openui":
             return False
-        if "sensitive_sources" in rec:
-            return bool(rec["sensitive_sources"])
-        # Saved records from before the persisted flag fail closed if a source is
-        # no longer available to classify.
+        # Classification is live: saved views never retain authority after a source changes.
         try:
             return any(
-                self.registry.sensitivity(binding["name"], self.profile_name) == "sensitive"
+                self.registry.sensitivity(binding["name"], self.profile_name) in {"private", "sensitive"}
                 for binding in rec.get("sources", [])
             )
         except SourceError:
@@ -417,6 +455,8 @@ class MiniApp:
             raise SpecError("revision must be an integer")
         id = initial["id"]
         now = time.time()
+        retry_record = None
+        payload = None
         # Persist a claim BEFORE delivery; parallel requests cannot produce two events.
         with self.store.transaction() as data:
             rec = data.get(id)
@@ -427,13 +467,17 @@ class MiniApp:
                     409,
                     "This view changed. Review the latest version before submitting.",
                 )
-            act = (
+            restricted = self._has_sensitive_sources(rec)
+            if rec.get("renderer", "json") == "openui" and restricted and "openui_allowed_values" not in rec:
+                raise ApiError(409, "This view must be reopened before submitting.")
+            raw_action = (
                 validate_openui_action(rec, body["key"], body.get("value"))
                 if rec.get("renderer", "json") == "openui"
                 else validate_action(rec["spec"], body["key"], body.get("value"))
             )
+            act = self._sensitive_chat_action(rec, raw_action) if restricted else raw_action
             fingerprint = json.dumps(
-                {"key": act["key"], "value": act["value"], "revision": rec["revision"]},
+                {"key": raw_action["key"], "value": raw_action["value"], "revision": rec["revision"]},
                 sort_keys=True,
                 separators=(",", ":"),
                 ensure_ascii=False,
@@ -441,71 +485,58 @@ class MiniApp:
             previous = rec["receipts"].get(rid)
             if previous:
                 if previous["fingerprint"] != fingerprint:
-                    raise ApiError(
-                        409, "request_id already used for a different submission"
-                    )
+                    raise ApiError(409, "request_id already used for a different submission")
                 if previous["status"] == "recorded":
-                    return web.json_response({"ok": True, "record": public_record(rec)})
-                if previous["status"] in ("pending", "uncertain"):
+                    retry_record = copy.deepcopy(rec)
+                elif previous["status"] in ("pending", "uncertain"):
                     raise ApiError(
                         409,
                         "Submission delivery is pending or uncertain. Do not submit again; check the conversation.",
                     )
-            for result in rec["results"].values():
-                same = result["key"] == act["key"]
-                grouped = (
-                    act.get("group_once", False) or result.get("group_once", False)
-                ) and result["component_id"] == act["component_id"]
-                if result["status"] in ("pending", "uncertain") and (same or grouped):
-                    raise ApiError(
-                        409,
-                        "Submission is pending or uncertain; check the conversation.",
-                    )
-                if result["status"] == "recorded" and (
-                    (same and (act["once"] or result.get("once"))) or grouped
-                ):
-                    raise ApiError(409, "Already submitted.")
-            if len(rec["receipts"]) >= MAX_RESULTS and not previous:
-                raise ApiError(429, "Submission limit reached; ask for a new view.")
-            result = dict(
-                act,
-                status="pending",
-                request_id=rid,
-                at=now,
-                event_id=previous["event_id"] if previous else secrets.token_hex(16),
-            )
-            rec["results"][act["key"]] = result
-            rec["receipts"][rid] = {
-                "fingerprint": fingerprint,
-                "status": "pending",
-                "event_id": result["event_id"],
-            }
-            payload = {
-                k: rec[k]
-                for k in (
-                    "id",
-                    "title",
-                    "chat_id",
-                    "thread_id",
-                    "user_id",
-                    "session_key",
-                    "message_id",
-                    "revision",
+            if retry_record is None:
+                for result in rec["results"].values():
+                    same = result["key"] == act["key"]
+                    grouped = (
+                        act.get("group_once", False) or result.get("group_once", False)
+                    ) and result["component_id"] == act["component_id"]
+                    if result["status"] in ("pending", "uncertain") and (same or grouped):
+                        raise ApiError(409, "Submission is pending or uncertain; check the conversation.")
+                    if result["status"] == "recorded" and ((same and (act["once"] or result.get("once"))) or grouped):
+                        raise ApiError(409, "Already submitted.")
+                if len(rec["receipts"]) >= MAX_RESULTS and not previous:
+                    raise ApiError(429, "Submission limit reached; ask for a new view.")
+                result = dict(
+                    act,
+                    status="pending",
+                    request_id=rid,
+                    at=now,
+                    event_id=previous["event_id"] if previous else secrets.token_hex(16),
                 )
-            }
-            sensitive = self._has_sensitive_sources(rec)
-            chat_action = self._sensitive_chat_action(rec, act) if sensitive else act
-            payload.update(
-                action=copy.deepcopy(chat_action),
-                event_id=result["event_id"],
-                request_id=rid,
-                text=injection_text(
-                    rec,
-                    chat_action,
-                    user.get("first_name") or "user",
-                    sensitive=sensitive,
-                ),
-            )
+                rec["results"][act["key"]] = result
+                rec["receipts"][rid] = {
+                    "fingerprint": fingerprint,
+                    "status": "pending",
+                    "event_id": result["event_id"],
+                }
+                payload = {
+                    k: rec[k]
+                    for k in (
+                        "id", "title", "chat_id", "thread_id", "user_id", "session_key", "message_id", "revision",
+                    )
+                }
+                payload.update(
+                    action=copy.deepcopy(act),
+                    event_id=result["event_id"],
+                    request_id=rid,
+                    text=injection_text(
+                        rec,
+                        act,
+                        user.get("first_name") or "user",
+                        sensitive=restricted,
+                    ),
+                )
+        if retry_record is not None:
+            return web.json_response({"ok": True, "record": await self._public_record(retry_record)})
         outcome = "uncertain"
         try:
             if inspect.iscoroutinefunction(self.deliver_action):
@@ -567,9 +598,9 @@ class MiniApp:
                     },
                     status=500,
                 )
+            response.headers.setdefault("Content-Security-Policy", CSP)
             response.headers.update(
                 {
-                    "Content-Security-Policy": CSP,
                     "Cache-Control": "no-store",
                     "X-Content-Type-Options": "nosniff",
                     "Referrer-Policy": "no-referrer",
@@ -578,10 +609,15 @@ class MiniApp:
             )
             return response
 
-        async def shell(_request):
-            return web.Response(
+        async def shell(request):
+            view_id = request.query.get("id", "")
+            record = self.store.get(view_id) if re.fullmatch(r"[A-Za-z0-9_-]{24}", view_id) else None
+            response = web.Response(
                 body=(STATIC / "index.html").read_bytes(), content_type="text/html"
             )
+            if record and record.get("renderer") == "openui":
+                response.headers["Content-Security-Policy"] = OPENUI_CSP
+            return response
 
         async def static(request):
             name = request.match_info["name"]

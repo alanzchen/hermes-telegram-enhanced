@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -13,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from aiohttp.test_utils import TestClient, TestServer
 
 from miniapp import setup
+from miniapp.genui import validate_bindings, validate_button_action_types, validate_openui_actions, validate_template
 from miniapp.sources import DataSource, SourceRegistry
 from test_miniapp import TARGET, TOKEN, signed
 
@@ -234,7 +236,7 @@ def finance_registry():
                             "items": {
                                 "type": "object",
                                 "properties": {
-                                    "transaction_id": {"type": "string"},
+                                    "transaction_id": {"type": "string", "x-opaque-id": True},
                                     "date": {"type": "string"},
                                     "merchant": {"type": "string"},
                                     "amount": {"type": "number"},
@@ -340,7 +342,7 @@ class FinanceDashboardTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('BarChart(["Aug","Sep","Oct"], [840.25,910.5,775.0], "近三月消费", "money")', hydrated)
         self.assertIn('[["餐饮与咖啡","$426.80",14],["出行与通勤","$218.40",8],["订阅服务","$96.00",4]]', hydrated)
         self.assertIn('{"value":"txn-002","label":"Cafe Nimbus · Wicker Park","description":"11/12 · $87.65 · Chase Sapphire Reserve ···4821"}', hydrated)
-        self.assertEqual(
+        self.assertCountEqual(
             self.calls,
             [
                 "finance.overview",
@@ -435,6 +437,38 @@ class FinanceDashboardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.calls, [])
         catalog = json.loads(self.service.tool_handler({"action": "list_saved"}))
         self.assertEqual(catalog["saved_views"], [])
+    def test_live_saved_finance_dashboard_validates_against_schema_only_provider_manifest(self):
+        """This reads no ledger and never invokes finance_sources.py query."""
+        saved_path = Path("/opt/data/telegram-enhanced/miniapp-saved-views.json")
+        self.assertTrue(saved_path.is_file(), "the deployed finance-dashboard template must be present")
+        saved = json.loads(saved_path.read_text())
+        self.assertIn("finance-dashboard", saved)
+        view = saved["finance-dashboard"]
+        manifest = json.loads(
+            subprocess.check_output(
+                [sys.executable, "/opt/data/tools/plaid-finance-export/finance_sources.py", "describe"],
+                text=True,
+            )
+        )
+        calls: list[dict] = []
+        registry = SourceRegistry(
+            [
+                DataSource(
+                    name=entry["name"],
+                    title=entry["title"],
+                    args_schema=entry["args"],
+                    output_schema=entry["output"],
+                    sensitivity="sensitive",
+                    profiles=("default", "coordinator"),
+                    query=lambda args: calls.append(args) or {},
+                )
+                for entry in manifest["sources"]
+            ]
+        )
+        bindings = validate_bindings(view["sources"], registry, "coordinator")
+        template = validate_template(view["openui"], bindings, registry, "coordinator")
+        validate_button_action_types(template, validate_openui_actions(view.get("openui_actions", [])))
+        self.assertEqual(calls, [])
 
 
 if __name__ == "__main__":
