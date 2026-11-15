@@ -87,9 +87,11 @@ model-facing schema is in `miniapp/CATALOG.md`, with a complete synthetic `minia
 Enable only after wiring gateway lifecycle and an HTTPS reverse proxy. Each gateway profile
 must explicitly set its own `HTE_MINIAPP_PORT` and `HTE_MINIAPP_PUBLIC_URL`; otherwise the
 server stays disabled. Optional `HTE_MINIAPP_DIRECT_LINK` supports a BotFather app link.
-Serve `/m`, `/m/static/*`, `/api/spec/*` and `/api/action/*` unchanged through the proxy.
-This package's local tests and Chromium previews do not certify real Telegram-client or
-production gateway operation.
+Set each `HTE_MINIAPP_PUBLIC_URL` to one HTTPS domain-plus-path base such as
+`https://hte-ui.cool.zenan.ch/{coordinator,ea,research,health}`. The reverse proxy must route
+and strip the matching path prefix before forwarding, leaving the backend routes `/m`,
+`/m/static/*`, `/api/spec/*` and `/api/action/*` unchanged. This package's local tests and
+Chromium previews do not certify real Telegram-client or production gateway operation.
 
 ```bash
 python -m unittest discover -s tests -p 'test_miniapp*.py' -v

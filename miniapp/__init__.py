@@ -122,10 +122,10 @@ class MiniApp:
                 or u.password
                 or u.query
                 or u.fragment
-                or u.path not in ("", "/")
+                or not re.fullmatch(r"/[A-Za-z0-9][A-Za-z0-9_-]*", u.path)
             ):
                 raise ValueError(
-                    "HTE_MINIAPP_PUBLIC_URL must be an HTTPS origin without a path"
+                    "HTE_MINIAPP_PUBLIC_URL must be an HTTPS origin with one path prefix"
                 )
         if self.direct_link and not re.fullmatch(
             r"https://t\.me/[A-Za-z0-9_]+(?:/[A-Za-z0-9_]+)?", self.direct_link

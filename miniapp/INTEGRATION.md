@@ -92,17 +92,20 @@ view and issue a new one if needed. Updates never silently clear successful clai
 
 | Variable | Meaning |
 | --- | --- |
-| `HTE_MINIAPP_PUBLIC_URL` | Public HTTPS origin only, e.g. `https://hte-ui.cool.zenan.ch`; no path/query/fragment |
+| `HTE_MINIAPP_PUBLIC_URL` | Public HTTPS base URL with exactly one path prefix, e.g. `https://hte-ui.cool.zenan.ch/research`; no query/fragment or extra path segments |
 | `HTE_MINIAPP_PORT` | Explicit unique TCP port. Example 8787; **required to enable**. No auto-binding every profile to 8787. |
 | `HTE_MINIAPP_HOST` | Bind host, default `127.0.0.1`. Set `0.0.0.0` only if container routing requires it; firewall to proxy. |
 | `HTE_MINIAPP_DIRECT_LINK` | Optional BotFather app URL `https://t.me/BotName/AppName` or configured main app `https://t.me/BotName`. Adds `startapp=<id>`. |
 
-Leave PUBLIC_URL or PORT unset to disable. Example profile allocation: default 8787, ea 8788,
-health 8789, research 8790, each with a **different public hostname**, corresponding bot token,
-profile state path and BotFather URL. Never point every bot at one profile's service. These are
-examples only; this implementation changes no profile environment or gateway configuration.
+Leave PUBLIC_URL or PORT unset to disable. Example profile allocation: coordinator 8787 at
+`https://hte-ui.cool.zenan.ch/coordinator`, ea 8788 at `/ea`, research 8789 at `/research`,
+and health 8790 at `/health`; each keeps its own bot token and profile state path. Route each
+external path prefix to its matching local port and strip that prefix before proxying, so the
+backend still receives `/m`, `/m/static/*`, `/api/spec/*` and `/api/action/*`. Never point every
+bot at one profile's service. These are examples only; this implementation changes no profile
+environment or gateway configuration.
 
-Proxy the whole dedicated HTTPS origin to the chosen process/container port, preserving paths:
+Proxy each prefixed route over the dedicated HTTPS origin:
 
 - GET `/m` — static shell; no spec or credentials embedded.
 - GET `/m/static/{app.js,renderer.js,layout.js,style.css}`.
@@ -117,7 +120,9 @@ a 60-second sweep while `start()` is running. Closed views remain until TTL.
 
 TLS terminates at the coordinator's reverse proxy; do not expose the plain HTTP port publicly.
 Configure BotFather's Mini App URL to `<PUBLIC_URL>/m`; inline private-chat web_app buttons add
-`?id=...`. Direct-link mode uses signed `start_param` and Telegram's GET `tgWebAppStartParam`.
+`?id=...`. The shell's static assets and API calls use relative URLs, so a page opened at
+`/<prefix>/m` requests `/<prefix>/m/static/*` and `/<prefix>/api/*` before the proxy strips the
+prefix. Direct-link mode uses signed `start_param` and Telegram's GET `tgWebAppStartParam`.
 A signed start_param mismatch is rejected even if the query says something else. Inline mode
 normally has no signed start_param, so query id + unguessable stored id + signed owner identity
 bind the view. The query alone is never authentication. HMAC auth is fresh for one hour with

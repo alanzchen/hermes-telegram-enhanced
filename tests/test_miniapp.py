@@ -11,7 +11,7 @@ import unittest
 import subprocess
 import shutil
 from pathlib import Path
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urljoin
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from miniapp.spec import SpecError, validate_spec, validate_action
@@ -274,6 +274,88 @@ class AuthTests(unittest.TestCase):
         )
 
 
+class PublicUrlTests(unittest.TestCase):
+    def test_path_prefix_is_required_and_generated_link_preserves_it(self):
+        sent = []
+        with tempfile.TemporaryDirectory() as d:
+            service = setup(
+                None,
+                lambda: TOKEN,
+                lambda payload: True,
+                state_dir=d,
+                current_target=lambda: TARGET,
+                send_message=lambda payload: sent.append(payload)
+                or {"ok": True, "result": {"message_id": 101}},
+                env={
+                    "HTE_MINIAPP_PUBLIC_URL": "https://hte-ui.cool.zenan.ch/research",
+                    "HTE_MINIAPP_PORT": "8789",
+                },
+            )
+            service._serving = True
+            result = json.loads(
+                service.tool_handler(
+                    {"action": "send", "title": "Prefixed", "spec": ui(COMPONENTS[0])}
+                )
+            )
+        self.assertTrue(result["success"], result)
+        self.assertEqual(
+            result["url"],
+            "https://hte-ui.cool.zenan.ch/research/m?id=" + result["id"],
+        )
+        self.assertEqual(
+            sent[0]["reply_markup"]["inline_keyboard"][0][0]["web_app"]["url"],
+            result["url"],
+        )
+
+    def test_rejects_unprefixed_or_non_single_segment_public_urls(self):
+        invalid = (
+            "https://hte-ui.cool.zenan.ch",
+            "http://hte-ui.cool.zenan.ch/coordinator",
+            "https://hte-ui.cool.zenan.ch/coordinator/research",
+            "https://hte-ui.cool.zenan.ch/coordinator?x=1",
+            "https://hte-ui.cool.zenan.ch/coordinator#fragment",
+            "https://user@hte-ui.cool.zenan.ch/coordinator",
+            "https://hte-ui.cool.zenan.ch/coordinator%2Fresearch",
+        )
+        with tempfile.TemporaryDirectory() as d:
+            for public_url in invalid:
+                with self.subTest(public_url=public_url), self.assertRaisesRegex(
+                    ValueError, "one path prefix"
+                ):
+                    setup(
+                        None,
+                        lambda: TOKEN,
+                        lambda payload: True,
+                        state_dir=d,
+                        current_target=lambda: TARGET,
+                        send_message=lambda payload: None,
+                        env={
+                            "HTE_MINIAPP_PUBLIC_URL": public_url,
+                            "HTE_MINIAPP_PORT": "8787",
+                        },
+                    )
+
+    def test_static_assets_and_api_paths_resolve_below_public_prefix(self):
+        repo = Path(__file__).resolve().parents[1]
+        html = (repo / "miniapp/static/index.html").read_text()
+        script = (repo / "miniapp/static/app.js").read_text()
+        page = "https://hte-ui.cool.zenan.ch/research/m"
+        self.assertNotIn('"/m/static/', html)
+        for asset in ("style.css", "layout.js", "renderer.js", "app.js"):
+            self.assertIn(f'm/static/{asset}', html)
+            self.assertEqual(
+                urljoin(page, f"m/static/{asset}"),
+                f"https://hte-ui.cool.zenan.ch/research/m/static/{asset}",
+            )
+        self.assertNotIn("request('/api/", script)
+        self.assertIn("request('api/spec/", script)
+        self.assertIn("request('api/action/", script)
+        self.assertEqual(
+            urljoin(page, "api/spec/view-id"),
+            "https://hte-ui.cool.zenan.ch/research/api/spec/view-id",
+        )
+
+
 class StoreTests(unittest.TestCase):
     def test_persist_owner_ttl_revision_and_caps(self):
         with tempfile.TemporaryDirectory() as d:
@@ -322,7 +404,7 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
                 send_message=lambda p: None,
                 env={
                     "HTE_MINIAPP_PORT": str(port),
-                    "HTE_MINIAPP_PUBLIC_URL": "https://example.test",
+                    "HTE_MINIAPP_PUBLIC_URL": "https://example.test/coordinator",
                 },
             )
             try:
@@ -375,7 +457,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
             current_target=lambda: (TARGET, None),
             send_message=send,
             env={
-                "HTE_MINIAPP_PUBLIC_URL": "https://ui.example.test",
+                "HTE_MINIAPP_PUBLIC_URL": "https://ui.example.test/coordinator",
                 "HTE_MINIAPP_PORT": "8787",
             },
         )
