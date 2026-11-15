@@ -1,6 +1,6 @@
 # OpenUI Mini App contract
 
-`telegram_ui(action="catalog")` returns this contract together with only the data-source manifests available to the active profile. It never returns fetched source values.
+`telegram_ui(action="catalog")` returns this contract plus the source manifests available to the active profile. It never returns fetched values.
 
 ## Send or save an OpenUI view
 
@@ -8,85 +8,107 @@
 {
   "action": "save",
   "name": "finance-summary",
-  "title": "Finance summary",
+  "title": "财务总览",
   "renderer": "openui",
-  "openui": "root = Card([header, note, actions])\nheader = CardHeader(\"Finance summary\", \"Live data\")\nnote = Text({{overview.data.last_sync_local}})\nrefresh = Button(\"Refresh\", {type: \"refresh\"})\nactions = ButtonGroup([refresh])",
+  "openui": "root = Card([header, stats])\nheader = CardHeader(\"财务总览\", \"仅在打开后读取合成数据\")\ncash = Stat(\"可用现金\", {{overview.data.cash|money}}, \"含待入账\", \"success\")\nbalance = Stat(\"信用卡余额\", {{overview.data.card_balance|money}}, \"本期账单\", \"danger\")\nstats = Grid([cash, balance], 2)",
   "sources": [
     {"alias": "overview", "name": "finance.overview", "args": {}}
   ],
-  "actions": [{"key": "refresh", "label": "Refresh", "once": false}]
+  "actions": []
 }
 ```
 
-- `save` stores the generated template only. It does not fetch data.
-- `open_saved` creates a fresh expiring Mini App launch view from `name` without generating a new UI.
+- `save` stores the template only and does **not** fetch source data.
+- `open_saved` creates a fresh expiring Mini App launch view from a saved name.
 - `send` creates a one-off view with the same fields.
-- Data placeholders are **whole values** written as `{{alias.path}}`. The server replaces them with JSON literals only after Telegram `initData` authentication.
-- A placeholder may apply one safe projection or formatter: `{{cards.rows|pluck:card}}`, `{{cards.rows|table:card,due,status}}`, and `{{queue.rows|items:transaction_id,merchant}}`. Projection field names are checked against the declared source-output schema when the view is saved; a misspelling is rejected before anything is stored.
-- Per-field table/item formatting uses `@`: `{{cards.rows|table:card,due@date:MM/DD,statement_balance@money:USD:2,purchase_apr@percent:1,status}}`. Scalar `Text` values can use `{{overview.data.cash|money}}` (USD, 2 decimals by default), `money:USD:2`, `date:MM/DD`, or `percent:1`. `percent` accepts either a fractional value such as `0.249` or a percent-point value such as `24.9` and renders both as `24.9%`. Formatters render `null` as `—`; unformatted `Text` values also safely coerce numbers and `null`.
-- Every `Button` action `type` must occur in the top-level `actions` allowlist. Buttons and forms only inject a conversation event; the page never performs an operation.
-- Event values have the shape `{params, form, form_name}`. `params` is the declared Button parameter object and `form` contains the current input values. An action may declare `fields: ["transaction_ids"]`; the matching Button should include `fields: ["transaction_ids"]` too, and only those form entries are emitted. For any view using a `sensitive` source, the chat-bound event is further minimized to those declared field names and option values; it never contains labels or rendered source data.
+- Source placeholders are whole values: `{{alias.path}}`. The server inserts JSON literals only after Telegram `initData` authentication.
+- Each placeholder may use one safe projection or formatter. Source paths and projected fields are checked against the declared source-output schema before a template is saved.
+- Every `Button` action `type` must occur in the top-level `actions` allowlist. Buttons only emit conversation events; the page never invokes an operation itself.
 
-Only the component subset below is accepted. `@` directives, `$` bindings, arbitrary components, queries, mutations, URL opening and raw code are rejected before a view can be stored.
+## Safe data projections and formatters
 
-## Complete finance dashboard example
+| Form | Result |
+| --- | --- |
+| `{{rows|pluck:field}}` | An array of one declared field. |
+| `{{rows|table:name,amount@money:USD:2}}` | A table matrix. Per-field formatters use `@`. |
+| `{{rows|items:id,merchant,date|date,amount@money:USD:2,card}}` | Checkbox/select items: `{value,label,description}`. The optional 1–3 description fields are joined with ` · `. `field|date` is accepted for the compact description form. |
+| `{{rows|list:title,due@date:MM/DD,balance@money:USD:2,status@map:...,status@map:...}}` | Mobile row objects: title, subtitle, trailing value, badge, and optional badge tone. |
+| `{{overview.data.cash|money}}` | USD with two decimals by default. |
+| `{{row.date|date:MM/DD}}` | Month/day date. `date` is also accepted for item descriptions. |
+| `{{row.apr|percent:1}}` | A percentage; fractional and percent-point source values are both accepted. |
+| `{{row.status|map:paid_full=已还清,unpaid=未还,paid_partial=部分还款,no_balance=无欠款}}` | Maps a declared string enum to display text. |
 
-This saves a template only; the data sources are queried only when the authenticated Mini App opens. It is intentionally a source-contract example and contains no account values.
+`map:` is deliberately strict: the source property must declare a string `enum`, and the map must cover **exactly** the declared enum values. Invalid, missing, or extra enum keys reject the view before it is saved. `money`, `percent`, and `date` render `null` as `—`.
+
+For `List`, five projected fields become `{title, subtitle, trailing, badge, badgeTone}`. This keeps source values separate from display text and makes status-tone decisions explicit:
+
+```text
+cards = List({{cards.rows|list:
+  card,
+  due@date:MM/DD,
+  statement_balance@money:USD:2,
+  status@map:paid_full=已还清,unpaid=未还,paid_partial=部分还款,no_balance=无欠款,
+  status@map:paid_full=success,unpaid=warning,paid_partial=warning,no_balance=secondary
+}})
+```
+
+## Complete Chinese synthetic finance dashboard
+
+This example is intentionally synthetic. It is the shape used by the phone regression harness; it does not call `finance_sources.py` or expose account values. The `categories` binding is a synthetic source registered by the test harness.
 
 ```json
 {
   "action": "save",
   "name": "finance-dashboard",
-  "title": "Finance dashboard",
+  "title": "财务总览",
   "renderer": "openui",
-  "openui": "root = Card([header, tabs]\nheader = CardHeader(\"Finance dashboard\", \"Live data\")\ncash = Text({{overview.data.cash|money}})\ncardBalance = Text({{overview.data.card_balance|money:USD:2}})\nalerts = Text({{overview.data.alerts}})\nstatus = Badge(\"Live\", \"secondary\")\ncardsTable = Table([\"Card\", \"Due\", \"Balance\", \"APR\", \"Status\"], {{cards.rows|table:card,due@date:MM/DD,statement_balance@money:USD:2,purchase_apr@percent:1,status}})\nspendingChart = BarChart({{spending.rows|pluck:key}}, {{spending.rows|pluck:amount}}, \"Spending by month\")\nreviewSelect = Select(\"transaction_ids\", {{review_queue.rows|items:transaction_id,merchant}}, \"Choose a transaction\")\nreviewed = Checkbox(\"acknowledged\", \"I reviewed the selected transaction\")\nsubmitReview = Button(\"Submit review\", {type: \"submit_review\", fields: [\"transaction_ids\"]})\nreviewForm = Form(\"review\", [reviewSelect, reviewed, submitReview])\ntabs = Tabs([{value: \"overview\", trigger: \"Overview\", content: [status, cash, cardBalance, alerts]}, {value: \"cards\", trigger: \"Cards\", content: [cardsTable]}, {value: \"spending\", trigger: \"Spending\", content: [spendingChart]}, {value: \"review\", trigger: \"Review\", content: [reviewForm]}], \"overview\")",
+  "openui": "root = Card([header, tabs])\nheader = CardHeader(\"财务总览\", \"合成演示数据\")\ncash = Stat(\"可用现金\", {{overview.data.cash|money}}, \"含待入账\", \"success\")\nbalance = Stat(\"信用卡余额\", {{overview.data.card_balance|money:USD:2}}, \"本期账单\", \"danger\")\ndue = Stat(\"14 天内待还\", {{overview.data.due_next_14d|money}}, \"下个到期日\", \"warning\")\nalerts = Stat(\"待确认\", {{overview.data.alerts}}, \"需要复核\", \"warning\")\nmetrics = Grid([cash, balance, due, alerts], 2)\nsync = Text({{overview.data.last_sync_local|date:MM/DD}}, \"small\")\ncards = List({{cards.rows|list:card,due@date:MM/DD,statement_balance@money:USD:2,status@map:paid_full=已还清,unpaid=未还,paid_partial=部分还款,no_balance=无欠款,status@map:paid_full=success,unpaid=warning,paid_partial=warning,no_balance=secondary}})\nchart = BarChart({{spending.rows|pluck:key}}, {{spending.rows|pluck:amount}}, \"近三月消费\")\ncategories = Table([\"类别\", \"金额\", \"笔数\"], {{categories.rows|table:category,amount@money:USD:2,count}})\nreview = CheckboxGroup(\"transaction_ids\", {{review_queue.rows|items:transaction_id,merchant,date|date,amount@money:USD:2,card}})\nsubmit = Button(\"提交确认\", {type: \"submit_review\", fields: [\"transaction_ids\"]})\nreviewForm = Form(\"review\", [review, submit])\ntabs = Tabs([{value: \"overview\", trigger: \"概览\", content: [metrics, sync]}, {value: \"cards\", trigger: \"卡款\", content: [cards]}, {value: \"spending\", trigger: \"消费\", content: [chart, categories]}, {value: \"review\", trigger: \"待确认\", content: [reviewForm]}], \"overview\")",
   "sources": [
     {"alias": "overview", "name": "finance.overview", "args": {}},
     {"alias": "cards", "name": "finance.cards", "args": {}},
-    {
-      "alias": "spending",
-      "name": "finance.spending",
-      "args": {"group_by": "month", "days": 120, "limit": 6}
-    },
-    {
-      "alias": "review_queue",
-      "name": "finance.review_queue",
-      "args": {"days": 45}
-    }
+    {"alias": "spending", "name": "finance.spending", "args": {"group_by": "month", "days": 120, "limit": 6}},
+    {"alias": "categories", "name": "finance.categories", "args": {"days": 120, "limit": 5}},
+    {"alias": "review_queue", "name": "finance.review_queue", "args": {"days": 45}}
   ],
   "actions": [
-    {
-      "key": "submit_review",
-      "label": "Submit review",
-      "fields": ["transaction_ids"]
-    }
+    {"key": "submit_review", "label": "提交确认", "fields": ["transaction_ids"]}
   ]
 }
 ```
 
-The `reviewed` checkbox remains UI-only for this sensitive view: `fields` makes the chat-bound submit event contain only `form.transaction_ids` (the selected transaction ID), not its merchant label or any other rendered value.
+For a sensitive view, `fields: ["transaction_ids"]` strips the emitted event down to `form.transaction_ids`. `CheckboxGroup` stores an array of selected option values, so labels, descriptions, merchant names, card names, and UI-only fields never cross back to chat.
 
 ## Component subset
 
-- `Card(children)` — required root component; place content in an array.
+- `Card(children)` — required full-width page root. It deliberately does not create a nested surface.
 - `CardHeader(title, description?)`
-- `Text(text, size?)` — `size` is `small`, `default`, or `large`.
+- `Grid(children, columns?)` — responsive; two columns remain on a 375–390 px phone by default.
+- `Stat(label, value, hint?, tone?)` — clear KPI hierarchy with tabular numbers. Tones: `success`, `warning`, `danger`, plus neutral tones.
+- `List(items)` — mobile row cards. Item shape: `{title, subtitle?, trailing?, badge?, badgeTone?}`.
+- `Text(text, size?)` — `small`, `default`, or `large`.
 - `Markdown(text)`
 - `Alert(title, description, variant?)` — `default` or `destructive`.
-- `Badge(text, variant?)` — `default`, `secondary`, `outline`, or `destructive`.
+- `Badge(text, variantOrToneMap?)` — supports normal tones and a mapping such as `Badge(statusLabel, {\"已还清\": \"success\", \"未还\": \"warning\"})`.
 - `Separator()`
-- `Table(columns, rows)`
+- `Table(columns, rows)` — 4–5+ columns scroll horizontally inside their surface; the first column sticks and numeric columns right-align with tabular figures. Compact three-column tables remain full-width on a phone.
 - `BarChart(labels, values, label?)`
-- `Progress(value, label?)` — `value` is 0–100.
+- `Progress(value, label?)`
 - `Accordion(items)` — item `{value, trigger, content}`.
 - `Tabs(items, defaultValue?)` — item `{value, trigger, content}`.
-- `Form(name, fields)` — fields may contain `TextInput`, `Select`, `Checkbox`, `RadioGroup`, and `DateInput`.
-- `TextInput(name, placeholder?, type?)` — `type` is `text`, `email`, or `number`.
-- `Select(name, items, placeholder?)` — item `{value,label}`.
+- `Form(name, fields)` — direct submit buttons expand to a usable full phone width.
+- `TextInput(name, placeholder?, type?)`
+- `Select(name, items, placeholder?)`
 - `Checkbox(name, label)`
-- `RadioGroup(name, items)` — item `{value,label}`.
+- `CheckboxGroup(name, items)` — multi-selects value IDs only; items may have a description line.
+- `RadioGroup(name, items)`
 - `DateInput(name, label?)`
-- `Button(label, {type, params?}, variant?)` — variants are `default`, `secondary`, `outline`, `destructive`, `ghost`, or `link`.
+- `Button(label, {type, params?, fields?}, variant?)`
 - `ButtonGroup(buttons)`
 
-The vetted bundle is local (`openui.js` + `openui.css`), does not use a CDN, has no `eval`/`new Function`, and loads no network resources itself. It deliberately excludes Drawers, dialogs/popovers, mutations, queries and URL actions.
+## Theme, CSP, and assets
+
+The vendored renderer is local: `openui.js` and `openui.css`. It loads no CDN assets and contains no `eval` or `new Function` calls. The host maps `Telegram.WebApp.themeParams` to CSS variables (`bg`, `secondary_bg`, `text`, `hint`, and button colors) from external app code; no inline script and no CSP relaxation are required.
+
+The stylesheet follows Telegram variables when supplied and falls back to system light/dark colors. Its system stack includes `PingFang SC`, `Hiragino Sans GB`, `Microsoft YaHei`, and `Noto Sans CJK SC` for readable Chinese typography.
+
+Drawers, dialogs/popovers, mutations, queries, URL actions, raw code, `@` directives, `$` bindings, arbitrary components, and URL opening are rejected before a view can be stored.

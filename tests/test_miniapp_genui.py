@@ -94,6 +94,13 @@ class OpenUIAssetTests(unittest.TestCase):
         app = (static / "app.js").read_text()
         self.assertIn("event.value??null", app)
         self.assertIn("record?.renderer!=='openui'", app)
+        for component in ("Stat", "Grid", "List", "CheckboxGroup"):
+            self.assertIn(component, bundle)
+        self.assertIn("tabular-nums", bundle)
+        self.assertIn("sticky", bundle)
+        css = (static / "openui.css").read_text()
+        self.assertIn("PingFang SC", css)
+        self.assertIn("--tg-theme-bg-color", css)
 
 
 class SavedOpenUIViewTests(unittest.IsolatedAsyncioTestCase):

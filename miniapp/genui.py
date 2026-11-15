@@ -28,6 +28,9 @@ PATH = re.compile(r"^[A-Za-z0-9_-]{1,48}(?:\.[A-Za-z0-9_-]{1,48})*$")
 OPENUI_COMPONENTS = {
     "Card",
     "CardHeader",
+    "Grid",
+    "Stat",
+    "List",
     "Text",
     "Markdown",
     "Alert",
@@ -39,6 +42,7 @@ OPENUI_COMPONENTS = {
     "TextInput",
     "Select",
     "Checkbox",
+    "CheckboxGroup",
     "RadioGroup",
     "DateInput",
     "Tabs",
@@ -179,8 +183,8 @@ def _parse_formatter(name: str, argument: str | None) -> dict[str, Any]:
             raise SpecError("openui: money formatter must be money or money:USD:2")
         return {"kind": "money", "currency": "USD", "precision": int(parts[1])}
     if name == "date":
-        if argument != "MM/DD":
-            raise SpecError("openui: date formatter must be date:MM/DD")
+        if argument not in (None, "", "MM/DD"):
+            raise SpecError("openui: date formatter must be date or date:MM/DD")
         return {"kind": "date", "format": "MM/DD"}
     if name == "percent":
         if argument in (None, ""):
@@ -188,6 +192,18 @@ def _parse_formatter(name: str, argument: str | None) -> dict[str, Any]:
         if not re.fullmatch(r"[0-4]", argument):
             raise SpecError("openui: percent formatter precision must be 0–4")
         return {"kind": "percent", "precision": int(argument)}
+    if name == "map":
+        if not argument:
+            raise SpecError("openui: map formatter requires enum=value pairs")
+        values: dict[str, str] = {}
+        for item in argument.split(","):
+            source, separator, target = item.partition("=")
+            if not separator or not source or not target or source in values:
+                raise SpecError("openui: map formatter requires unique enum=value pairs")
+            if len(source) > 120 or len(target) > 120:
+                raise SpecError("openui: map formatter values are too long")
+            values[source] = target
+        return {"kind": "map", "values": values}
     raise SpecError("openui: unsupported placeholder projection or formatter")
 
 
@@ -195,41 +211,57 @@ def _parse_field_specs(raw: str) -> list[dict[str, Any]]:
     if not raw:
         raise SpecError("openui: projection requires one or more declared fields")
     fields = []
-    for item in raw.split(","):
-        if item.count("@") > 1:
+    parts = raw.split(",")
+    index = 0
+    while index < len(parts):
+        item = parts[index]
+        markers = [marker for marker in ("@", "|") if marker in item]
+        if len(markers) > 1:
             raise SpecError("openui: a projected field accepts at most one formatter")
-        field, separator, formatter_raw = item.partition("@")
+        field, separator, formatter_raw = item.partition(markers[0]) if markers else (item, "", "")
         if not PATH_SEGMENT.fullmatch(field):
             raise SpecError("openui: projection field names must be simple declared keys")
         formatter = None
         if separator:
             name, colon, argument = formatter_raw.partition(":")
+            if name == "map":
+                mapping = [argument] if colon else []
+                while (
+                    index + 1 < len(parts)
+                    and "=" in parts[index + 1]
+                    and not re.match(r"^[A-Za-z0-9_-]+(?:@|\|)map:", parts[index + 1])
+                ):
+                    index += 1
+                    mapping.append(parts[index])
+                argument = ",".join(mapping)
             formatter = _parse_formatter(name, argument if colon else None)
         fields.append({"name": field, "formatter": formatter})
+        index += 1
     return fields
 
 
 def _parse_placeholder(match: re.Match[str]) -> dict[str, Any]:
     expression = match.group("expression").strip()
-    parts = expression.split("|")
-    if len(parts) not in (1, 2) or not PATH.fullmatch(parts[0]):
+    path, separator, operation_raw = expression.partition("|")
+    if not PATH.fullmatch(path):
         raise SpecError("openui: invalid source placeholder")
-    path = parts[0]
     result: dict[str, Any] = {"path": path, "kind": "raw"}
-    if len(parts) == 1:
+    if not separator:
         return result
-    operation, colon, argument = parts[1].partition(":")
-    if operation in {"pluck", "table", "items"}:
+    operation, colon, argument = operation_raw.partition(":")
+    if operation in {"pluck", "table", "items", "list"}:
         if not colon:
             raise SpecError("openui: projection requires a field list")
         fields = _parse_field_specs(argument)
         if operation == "pluck" and len(fields) != 1:
             raise SpecError("openui: pluck requires exactly one field")
-        if operation == "items" and len(fields) != 2:
-            raise SpecError("openui: items requires value,label fields")
+        if operation == "items" and not 2 <= len(fields) <= 5:
+            raise SpecError("openui: items requires a value, label, and up to three description fields")
+        if operation == "list" and len(fields) not in (4, 5):
+            raise SpecError("openui: list requires title, subtitle, trailing, badge, and optional badge tone fields")
         result.update(kind=operation, fields=fields)
         return result
-    if operation in {"money", "date", "percent"}:
+    if operation in {"money", "date", "percent", "map"}:
         result.update(kind="formatter", formatter=_parse_formatter(operation, argument if colon else None))
         return result
     raise SpecError("openui: unsupported placeholder projection or formatter")
@@ -274,39 +306,57 @@ def _require_types(schema: dict[str, Any], allowed: set[str], context: str) -> N
         raise SpecError(f"openui: {context} has an incompatible declared source type")
 
 
+def _validate_map_schema(schema: dict[str, Any], formatter: dict[str, Any], context: str) -> None:
+    _require_types(schema, {"string"}, context)
+    enum = schema.get("enum")
+    if not isinstance(enum, list) or not enum or any(not isinstance(value, str) for value in enum):
+        raise SpecError(f"openui: {context} must declare a string enum for map")
+    if set(formatter["values"]) != set(enum):
+        raise SpecError(f"openui: {context} map must cover exactly its declared enum values")
+
+
+def _validate_field_formatter(field_schema: dict[str, Any], formatter: dict[str, Any], context: str) -> None:
+    if formatter["kind"] in {"money", "percent"}:
+        _require_types(field_schema, {"number", "integer", "null"}, context)
+    elif formatter["kind"] == "map":
+        _validate_map_schema(field_schema, formatter, context)
+    else:
+        _require_types(field_schema, {"string", "null"}, context)
+
+
 def _validate_placeholder_schema(spec: dict[str, Any], schema: dict[str, Any]) -> None:
     context = "placeholder " + spec["path"]
     if spec["kind"] == "raw":
         return
     if spec["kind"] == "formatter":
-        formatter = spec["formatter"]
-        if formatter["kind"] in {"money", "percent"}:
-            _require_types(schema, {"number", "integer", "null"}, context)
-        else:
-            _require_types(schema, {"string", "null"}, context)
+        _validate_field_formatter(schema, spec["formatter"], context)
         return
     item = _array_item_schema(schema, context)
     fields = spec["fields"]
     for field in fields:
         field_schema = _schema_property(item, field["name"], context)
         formatter = field["formatter"]
-        if formatter is None:
-            continue
-        if formatter["kind"] in {"money", "percent"}:
-            _require_types(field_schema, {"number", "integer", "null"}, context + "." + field["name"])
-        else:
-            _require_types(field_schema, {"string", "null"}, context + "." + field["name"])
+        if formatter is not None:
+            _validate_field_formatter(field_schema, formatter, context + "." + field["name"])
     if spec["kind"] == "items":
         _require_types(
             _schema_property(item, fields[0]["name"], context),
             {"string"},
             context + "." + fields[0]["name"],
         )
-        _require_types(
-            _schema_property(item, fields[1]["name"], context),
-            {"string", "number", "integer", "boolean", "null"},
-            context + "." + fields[1]["name"],
-        )
+        for field in fields[1:]:
+            _require_types(
+                _schema_property(item, field["name"], context),
+                {"string", "number", "integer", "boolean", "null"},
+                context + "." + field["name"],
+            )
+    if spec["kind"] == "list":
+        for field in fields:
+            _require_types(
+                _schema_property(item, field["name"], context),
+                {"string", "number", "integer", "boolean", "null"},
+                context + "." + field["name"],
+            )
 
 
 def validate_template(
@@ -464,6 +514,10 @@ def _format_value(value: Any, formatter: dict[str, Any]) -> str:
             except ValueError as exc:
                 raise SourceError("Saved view data no longer matches its source contract") from exc
         return f"{date_value.month:02d}/{date_value.day:02d}"
+    if kind == "map":
+        if not isinstance(value, str) or value not in formatter["values"]:
+            raise SourceError("Saved view data no longer matches its source contract")
+        return formatter["values"][value]
     raise SourceError("Saved view data no longer matches its source contract")
 
 
@@ -477,6 +531,11 @@ def _option_text(value: Any) -> str:
     return str(value)
 
 
+def _project_field(row: Any, field: dict[str, Any]) -> Any:
+    value = _project_row_value(row, field["name"])
+    return _format_value(value, field["formatter"]) if field["formatter"] else value
+
+
 def _project_value(value: Any, spec: dict[str, Any]) -> Any:
     kind = spec["kind"]
     if kind == "raw":
@@ -487,34 +546,37 @@ def _project_value(value: Any, spec: dict[str, Any]) -> Any:
         raise SourceError("Saved view data no longer matches its source contract")
     fields = spec["fields"]
     if kind == "pluck":
-        field = fields[0]
-        return [
-            _format_value(_project_row_value(row, field["name"]), field["formatter"])
-            if field["formatter"]
-            else _project_row_value(row, field["name"])
-            for row in value
-        ]
+        return [_project_field(row, fields[0]) for row in value]
     if kind == "table":
-        return [
-            [
-                _format_value(_project_row_value(row, field["name"]), field["formatter"])
-                if field["formatter"]
-                else _project_row_value(row, field["name"])
-                for field in fields
-            ]
-            for row in value
-        ]
+        return [[_project_field(row, field) for field in fields] for row in value]
     if kind == "items":
-        value_field, label_field = fields
-        return [
-            {
-                "value": _option_text(_project_row_value(row, value_field["name"])),
-                "label": _format_value(_project_row_value(row, label_field["name"]), label_field["formatter"])
-                if label_field["formatter"]
-                else _option_text(_project_row_value(row, label_field["name"])),
+        value_field, label_field, *description_fields = fields
+        result = []
+        for row in value:
+            item = {
+                "value": _option_text(_project_field(row, value_field)),
+                "label": _option_text(_project_field(row, label_field)),
             }
-            for row in value
-        ]
+            if description_fields:
+                item["description"] = " · ".join(
+                    _option_text(_project_field(row, field)) for field in description_fields
+                )
+            result.append(item)
+        return result
+    if kind == "list":
+        title, subtitle, trailing, badge, *badge_tone = fields
+        result = []
+        for row in value:
+            item = {
+                "title": _option_text(_project_field(row, title)),
+                "subtitle": _option_text(_project_field(row, subtitle)),
+                "trailing": _option_text(_project_field(row, trailing)),
+                "badge": _option_text(_project_field(row, badge)),
+            }
+            if badge_tone:
+                item["badgeTone"] = _option_text(_project_field(row, badge_tone[0]))
+            result.append(item)
+        return result
     raise SourceError("Saved view data no longer matches its source contract")
 
 
