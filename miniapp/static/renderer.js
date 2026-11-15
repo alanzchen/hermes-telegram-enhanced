@@ -55,7 +55,7 @@ function flow(c){const g=L.flowLayout(c.nodes,c.edges),n=drawing(g.width,g.heigh
 function render(root,record,onAction,uiState={}){
  const results=record.results||{};const disabled=record.closed||Date.now()/1000>=record.expires_at;
  function status(a,c){const r=results[a.key];if(r&&['pending','uncertain'].includes(r.status))return r;if(r?.status==='recorded'&&(a.once!==false||r.once))return r;if(c.type==='buttons')return Object.values(results).find(x=>x.component_id===c.id&&x.status==='recorded'&&(c.once!==false||x.group_once));return null;}
- function submitButton(a,c,value,parent,controls=[]){const b=el('button',a.label,'primary');b.type='button';b.dataset.action=a.key;const used=status(a,c);b.disabled=!!disabled||!!used;controls.forEach(x=>x.disabled=b.disabled);if(used){const label=used.status==='recorded'?'Recorded':'Delivery pending / uncertain';const note=el('p',label+(used.selection_labels?' · '+used.selection_labels.join(', '):''),'recorded');note.setAttribute('role','status');parent.append(note);}
+ function submitButton(a,c,value,parent,controls=[]){const b=el('button',a.label,'primary');b.type='button';b.dataset.action=a.key;const used=status(a,c);b.disabled=!!disabled||!!used;controls.forEach(x=>x.disabled=b.disabled);if(used&&c.type==='buttons'){const mine=results[a.key]&&results[a.key].status==='recorded';b.classList.add(mine?'chosen':'dim');if(mine)b.textContent='✓ '+a.label;}else if(used){const zh=/[\u3400-\u9fff]/.test((record.title||'')+a.label);const label=used.status==='recorded'?(zh?'已提交':'Recorded'):(zh?'正在发送…':'Delivery pending / uncertain');const note=el('p',label+(used.selection_labels?' · '+used.selection_labels.join(', '):''),'recorded');note.setAttribute('role','status');parent.append(note);}
  b.addEventListener('click',async()=>{if(b.disabled)return;let v;try{v=value();}catch(e){const note=el('p',e.message,'error');note.setAttribute('role','alert');parent.append(note);return;}b.disabled=true;try{await onAction(a.key,v);}finally{if(!status(a,c)&&!disabled)b.disabled=false;}});parent.append(b);return b;}
  function component(c){let n;
  switch(c.type){
@@ -95,7 +95,7 @@ function render(root,record,onAction,uiState={}){
     input.addEventListener('input',()=>{const next={...(uiState[c.id]||draft)};next[f.key]=f.type==='toggle'?input.checked:input.value;uiState[c.id]=next;});fields[f.key]=input;label.append(input);n.append(label);});
    submitButton(c.action,c,()=>{const values={};for(const f of c.fields){const input=fields[f.key];if(f.type==='toggle'){values[f.key]=input.checked;continue;}if(!input.checkValidity()){input.reportValidity();throw Error('Check '+f.label+'.');}if(!input.value&&!f.required)continue;values[f.key]=f.type==='number'?Number(input.value):input.value;}return values;},n,Object.values(fields));return n;
  }
- case 'buttons':n=el('div',undefined,'actions');c.actions.forEach(a=>submitButton(a,c,()=>null,n));return n;
+ case 'buttons':n=el('div',undefined,'actions');c.actions.forEach((a,i)=>{const b=submitButton(a,c,()=>null,n);if(i>0)b.classList.add('secondary');});return n;
  default:return el('p','Unsupported component','error');
  }
  }
