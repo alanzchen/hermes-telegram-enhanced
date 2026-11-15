@@ -96,11 +96,15 @@ class OpenUIAssetTests(unittest.TestCase):
         self.assertIn("record?.renderer!=='openui'", app)
         for component in ("Stat", "Grid", "List", "CheckboxGroup"):
             self.assertIn(component, bundle)
+        for affordance in ("bar-chart", "form-hint", "tab-list"):
+            self.assertIn(affordance, bundle)
         self.assertIn("tabular-nums", bundle)
         self.assertIn("sticky", bundle)
         css = (static / "openui.css").read_text()
         self.assertIn("PingFang SC", css)
         self.assertIn("--tg-theme-bg-color", css)
+        self.assertIn("safe-area-inset-left", css)
+        self.assertIn("openui-stat-tone-success", css)
 
 
 class SavedOpenUIViewTests(unittest.IsolatedAsyncioTestCase):

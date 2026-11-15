@@ -26,7 +26,7 @@ alerts = Stat("待确认", {{overview.data.alerts}}, "需要复核", "warning")
 metrics = Grid([cash, balance, due, alerts], 2)
 sync = Text({{overview.data.last_sync_local|date:MM/DD}}, "small")
 cardsList = List({{cards.rows|list:card,due@date:MM/DD,statement_balance@money:USD:2,status@map:paid_full=已还清,unpaid=未还,paid_partial=部分还款,no_balance=无欠款,status@map:paid_full=success,unpaid=warning,paid_partial=warning,no_balance=secondary}})
-spendingChart = BarChart({{spending.rows|pluck:key}}, {{spending.rows|pluck:amount}}, "近三月消费")
+spendingChart = BarChart({{spending.rows|pluck:key}}, {{spending.rows|pluck:amount}}, "近三月消费", "money")
 categoriesTable = Table(["类别", "金额", "笔数"], {{categories.rows|table:category,amount@money:USD:2,count}})
 reviewGroup = CheckboxGroup("transaction_ids", {{review_queue.rows|items:transaction_id,merchant,date|date,amount@money:USD:2,card}})
 submitReview = Button("提交确认", {type: "submit_review", fields: ["transaction_ids"]})
@@ -337,7 +337,7 @@ class FinanceDashboardTests(unittest.IsolatedAsyncioTestCase):
             '[{"title":"Chase Sapphire Reserve ···4821","subtitle":"11/21","trailing":"$1,234.50","badge":"未还","badgeTone":"warning"}',
             hydrated,
         )
-        self.assertIn('BarChart(["Aug","Sep","Oct"], [840.25,910.5,775.0]', hydrated)
+        self.assertIn('BarChart(["Aug","Sep","Oct"], [840.25,910.5,775.0], "近三月消费", "money")', hydrated)
         self.assertIn('[["餐饮与咖啡","$426.80",14],["出行与通勤","$218.40",8],["订阅服务","$96.00",4]]', hydrated)
         self.assertIn('{"value":"txn-002","label":"Cafe Nimbus · Wicker Park","description":"11/12 · $87.65 · Chase Sapphire Reserve ···4821"}', hydrated)
         self.assertEqual(
