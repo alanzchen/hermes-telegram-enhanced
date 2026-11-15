@@ -234,16 +234,43 @@ _CRON_WRAP = re.compile(r"\ACronjob Response: (?P<name>[^\n]*)\n\(job_id: (?P<id
                         r"(?P<body>.*?)\n\nTo stop or manage this job, send me a new message[^\n]*\Z", re.S)
 
 
-def pretty_cron(text: str, rich: bool = True) -> str:
-    """Replace core's English cron wrapper (header, job_id, dashes, footer) with a quiet title line; the
-    management hint goes into a folded <details> block (rich) or one italic line (plain fallback).
+CRON_PREFIX = "hc:"
+
+
+def cron_job_id(text: str) -> str:
+    m = _CRON_WRAP.match(text or "")
+    return m["id"].strip() if m else ""
+
+
+def cron_buttons(job_id: str, state: str) -> list[tuple[str, str, str]]:
+    """(label, callback_data, style) for a cron delivery; state: scheduled | paused | confirm | gone."""
+    if not job_id or state == "gone":
+        return []
+    if state == "confirm":
+        return [("确认删除", f"{CRON_PREFIX}R:{job_id}", "danger"), ("取消", f"{CRON_PREFIX}c:{job_id}", "")]
+    first = ("恢复", f"{CRON_PREFIX}u:{job_id}", "") if state == "paused" else ("暂停", f"{CRON_PREFIX}p:{job_id}", "")
+    return [first, ("删除", f"{CRON_PREFIX}r:{job_id}", "danger")]
+
+
+def parse_cron_button(data: str) -> tuple[str, str]:
+    if not (data or "").startswith(CRON_PREFIX):
+        return "", ""
+    act, _, jid = data[len(CRON_PREFIX):].partition(":")
+    return (act, jid) if act in ("p", "u", "r", "R", "c") and re.fullmatch(r"[A-Za-z0-9_-]{1,40}", jid) else ("", "")
+
+
+def pretty_cron(text: str, rich: bool = True, state: str = "gone") -> str:
+    """Replace core's English cron wrapper (header, job_id, dashes, footer) with a quiet title line.
+    Rich: recurring jobs get 暂停/删除 buttons (state from the job store); plain fallback drops the hint.
     Anything not matching the exact wrapper is returned unchanged."""
     m = _CRON_WRAP.match(text or "")
     if not m:
         return text
     name, jid, body = " ".join(m["name"].split()), m["id"].strip(), m["body"].strip()
-    head = f"⏰ **{name}**\n\n{body}" if name else body
-    hint = f"任务 ID `{jid}`。要暂停、修改或停止，直接发消息告诉我" + (f"，比如「停止 {name}」" if name else "")
-    if rich:
-        return f"{head}\n\n<details>\n<summary>管理这个定时任务</summary>\n\n{hint}\n\n</details>"
-    return f"{head}\n\n_{hint}_"
+    out = f"⏰ **{name}**\n\n{body}" if name else body
+    btns = cron_buttons(jid, state) if rich else []
+    if btns:
+        row = "\n".join(f'<tg-button type="callback_data"{f' style="{st}"' if st else ''} data="{d}">{l}</tg-button>'
+                        for l, d, st in btns)
+        out += f"\n\n<tg-button-row>\n{row}\n</tg-button-row>"
+    return out

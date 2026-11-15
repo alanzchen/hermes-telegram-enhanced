@@ -1175,9 +1175,11 @@ async def _route_new_updates(update: Any, context: Any) -> None:
                     getattr(msg, "message_id", "?"), time.time() - msg.date.timestamp())
     query = getattr(update, "callback_query", None)
     data = str(getattr(query, "data", "") or "") if query is not None else ""
-    if data.startswith((fu.SNOOZE_PREFIX, fu.DECISION_PREFIX, CALLBACK_PREFIX, sx.PREFIX)):
+    if data.startswith((fu.SNOOZE_PREFIX, fu.DECISION_PREFIX, CALLBACK_PREFIX, sx.PREFIX, fu.CRON_PREFIX)):
         try:
-            if data.startswith(sx.PREFIX):
+            if data.startswith(fu.CRON_PREFIX):
+                await _on_cron_button(query, data)
+            elif data.startswith(sx.PREFIX):
                 await _on_secret_button(query, data)
             elif data.startswith(CALLBACK_PREFIX):
                 # Choice buttons: the rb: handler wired at adapter start belongs to the plugin generation that
@@ -2693,8 +2695,68 @@ def _format_plain(content: str) -> str:
     return bulletize_plain(fu.pretty_cron(content, rich=False))
 
 
+def _cron_state(job_id: str) -> str:
+    try:
+        from cron.jobs import get_job
+        job = get_job(job_id)
+    except Exception:
+        return "gone"
+    if not job or job.get("state") == "completed":
+        return "gone"
+    rep = job.get("repeat")
+    if isinstance(rep, dict) and rep.get("times") == 1:
+        return "gone"  # one-shot: nothing left to manage
+    return "paused" if (job.get("state") == "paused" or job.get("enabled") is False) else "scheduled"
+
+
+def _cron_pretty_rich(content: str) -> str:
+    jid = fu.cron_job_id(content)
+    return fu.pretty_cron(content, state=_cron_state(jid) if jid else "gone")
+
+
+async def _on_cron_button(query: Any, data: str) -> None:
+    import asyncio
+    msg = getattr(query, "message", None)
+    if not _press_allowed(query):
+        await query.answer(text=i18n.t("not_yours", _lang(str(getattr(msg, "chat_id", "")), "")))
+        return
+    act, jid = fu.parse_cron_button(data)
+    if not act:
+        await query.answer()
+        return
+
+    def run() -> tuple[str, str]:
+        from cron import jobs as cj
+        if cj.get_job(jid) is None:
+            return "这个定时任务已经不存在了", "gone"
+        if act == "p":
+            cj.pause_job(jid, reason="paused from Telegram button")
+            return "已暂停", "paused"
+        if act == "u":
+            cj.resume_job(jid)
+            return "已恢复", "scheduled"
+        if act == "r":
+            return "再点一次「确认删除」", "confirm"
+        if act == "R":
+            return ("已删除" if cj.remove_job(jid) else "删除失败"), "gone"
+        return "已取消", _cron_state(jid)
+
+    try:
+        text, state = await asyncio.to_thread(run)
+    except Exception:
+        logger.warning("telegram-enhanced: cron button %s failed", data, exc_info=True)
+        text, state = "操作失败，请直接发消息告诉我", ""
+    await query.answer(text=text)
+    if state and msg is not None:
+        kb = [[{"text": l, "callback_data": d, **({"style": st} if st else {})} for l, d, st in fu.cron_buttons(jid, state)]]
+        res = await asyncio.to_thread(_api, "editMessageReplyMarkup", {
+            "chat_id": msg.chat_id, "message_id": msg.message_id,
+            "reply_markup": {"inline_keyboard": kb if kb[0] else []}})
+        logger.info("telegram-enhanced: cron button %s -> %s (markup ok=%s)", data, state, res.get("ok"))
+
+
 sys._hte_list_helpers = (_list_needs_rich_or_cron, _format_plain)
-sys._hte_cron_pretty = fu.pretty_cron
+sys._hte_cron_pretty = _cron_pretty_rich
 
 
 def _patch_telegram_lists() -> None:

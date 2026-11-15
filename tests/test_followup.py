@@ -116,14 +116,26 @@ class ClarifyCardTest(unittest.TestCase):
 
 
 class CronPrettyTest(unittest.TestCase):
-    def test_wrapper_becomes_title(self):
-        raw = ("Cronjob Response: 交接 · X\n(job_id: b041c9395344)\n-------------\n\n**Body** line\n\nmore\n\n"
-               "To stop or manage this job, send me a new message (e.g. \"stop reminder 交接 · X\").")
-        out = fu.pretty_cron(raw)
-        self.assertTrue(out.startswith("⏰ **交接 · X**\n\n**Body** line\n\nmore\n\n<details>"))
-        self.assertIn("b041c9395344", out)
+    RAW = ("Cronjob Response: 交接 · X\n(job_id: b041c9395344)\n-------------\n\n**Body** line\n\nmore\n\n"
+           "To stop or manage this job, send me a new message (e.g. \"stop reminder 交接 · X\").")
+
+    def test_wrapper_becomes_title_with_buttons(self):
+        out = fu.pretty_cron(self.RAW, state="scheduled")
+        self.assertTrue(out.startswith("⏰ **交接 · X**\n\n**Body** line\n\nmore\n\n<tg-button-row>"))
+        self.assertIn('data="hc:p:b041c9395344">暂停', out)
+        self.assertIn('data="hc:r:b041c9395344">删除', out)
         self.assertNotIn("Cronjob Response", out)
-        self.assertNotIn("<details>", fu.pretty_cron(raw, rich=False))
+        self.assertNotIn("To stop", out)
+
+    def test_one_shot_and_plain_have_no_buttons(self):
+        self.assertEqual(fu.pretty_cron(self.RAW), "⏰ **交接 · X**\n\n**Body** line\n\nmore")
+        self.assertNotIn("tg-button", fu.pretty_cron(self.RAW, rich=False, state="scheduled"))
+
+    def test_paused_and_confirm(self):
+        self.assertEqual([b[0] for b in fu.cron_buttons("a1", "paused")], ["恢复", "删除"])
+        self.assertEqual([b[0] for b in fu.cron_buttons("a1", "confirm")], ["确认删除", "取消"])
+        self.assertEqual(fu.parse_cron_button("hc:R:a1"), ("R", "a1"))
+        self.assertEqual(fu.parse_cron_button("hc:x:a1"), ("", ""))
 
     def test_other_text_untouched(self):
         self.assertEqual(fu.pretty_cron("hello\nCronjob Response: x"), "hello\nCronjob Response: x")
