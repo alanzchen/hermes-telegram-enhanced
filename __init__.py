@@ -2685,7 +2685,15 @@ def _list_needs_rich(content: Any) -> bool:
     return bool(_setting("rich_lists", True)) and has_markdown_list(content)
 
 
-sys._hte_list_helpers = (_list_needs_rich, bulletize_plain)
+def _list_needs_rich_or_cron(content: Any) -> bool:
+    return bool(_list_needs_rich(content) or (isinstance(content, str) and fu.pretty_cron(content) != content))
+
+
+def _format_plain(content: str) -> str:
+    return bulletize_plain(fu.pretty_cron(content))
+
+
+sys._hte_list_helpers = (_list_needs_rich_or_cron, _format_plain)
 
 
 def _patch_telegram_lists() -> None:

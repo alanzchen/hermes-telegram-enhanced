@@ -226,3 +226,19 @@ def clarify_markdown(question: str, choices: list[Any], clarify_id: str, other_l
                  f"{html.escape(other_label, quote=False)}</tg-button>"])
     buttons = "\n".join("<tg-button-row>\n" + "\n".join(r) + "\n</tg-button-row>" for r in rows)
     return "\n\n".join(body) + "\n\n" + buttons
+
+
+# ---------------------------------------------------------------- cron delivery header
+
+_CRON_WRAP = re.compile(r"\ACronjob Response: (?P<name>[^\n]*)\n\(job_id: (?P<id>[^)\n]*)\)\n-{3,}\n\n"
+                        r"(?P<body>.*?)\n\nTo stop or manage this job, send me a new message[^\n]*\Z", re.S)
+
+
+def pretty_cron(text: str) -> str:
+    """Replace core's English cron wrapper (header, job_id, dashes, footer) with one quiet title line.
+    Anything not matching the exact wrapper is returned unchanged."""
+    m = _CRON_WRAP.match(text or "")
+    if not m:
+        return text
+    name, body = " ".join(m["name"].split()), m["body"].strip()
+    return f"⏰ **{name}**\n\n{body}" if name else body
